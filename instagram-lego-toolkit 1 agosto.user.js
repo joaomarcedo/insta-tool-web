@@ -1,0 +1,6657 @@
+// ==UserScript==
+// @name         Instagram Lego Toolkit
+// @namespace    https://node-builder.local/
+// @version      1.0.0
+// @description  Compiled by Node Builder -- 23 block(s): Quick Message Recorder, Sidebar Plugin Manager, Recorder Studio, Audio Library, Dual Sidebar UI Shell, menuCollapseModule, Menu Panel Switcher Module, Menu Card Pop-out Module, Header Toolbar Organizer Module, Workspace Profile & Visibility Manager, Instagram Resizer Feature, Sidebar-to-Resizer Sync, Quick Chat Box, Text Library Module (Saved Snippets), image manager, Highlighter, Commands, Reorder Module, text sync Google Sheets, ManyChat Integration, ManyChat Username Detector, Text Library Height Fix (v1), Reset menus
+// @author       You
+// @match        https://www.instagram.com/*
+// @grant        GM_xmlhttpRequest
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+/* ============================================================
+   CORE ENGINE
+   ============================================================ */
+/* ================================================================
+   CORE ENGINE: Instagram Soundboard & Chat Infrastructure
+   Handles IndexedDB storage, audio recording, silence trimming,
+   hotkey configurations, and chat injection bridges.
+================================================================ */
+const LegoCore = (function () {
+    let db;
+    let mediaRecorder;
+    let audioChunks = [];
+    let currentBlob = null;
+    let originalBlobBackup = null;
+    let selectedForStitchId = null;
+
+    let quickMediaRecorder;
+    let quickAudioChunks = [];
+    let quickCurrentBlob = null;
+    let quickOriginalBlobBackup = null;
+    let isQuickRecording = false;
+
+    const DB_NAME = 'IG_Soundboard_Fresh_Core_DB';
+    const DB_VERSION = 2;
+
+    const listeners = {};
+    function on(event, fn) { (listeners[event] = listeners[event] || []).push(fn); }
+    function emit(event, payload) {
+        (listeners[event] || []).forEach(fn => {
+            try { fn(payload); } catch (e) { console.error('[LegoCore] listener error:', e); }
+        });
+    }
+
+    // 1. Initialize IndexedDB Database
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    request.onerror = e => console.error("Fresh DB Error:", e);
+    request.onupgradeneeded = e => {
+        db = e.target.result;
+        if (!db.objectStoreNames.contains('clips')) {
+            const clipStore = db.createObjectStore('clips', { keyPath: 'id', autoIncrement: true });
+            clipStore.createIndex('order', 'order', { unique: false });
+        }
+        if (!db.objectStoreNames.contains('folders')) {
+            const folderStore = db.createObjectStore('folders', { keyPath: 'name' });
+            folderStore.put({ name: "General" });
+        }
+    };
+
+    request.onsuccess = e => {
+        db = e.target.result;
+        db.onversionchange = () => { db.close(); window.location.reload(); };
+        emit('db:ready', db);
+    };
+
+    // 2. Shortcut Configurations
+    const getShortcutConfig = (action, defaultKey, defaultMod) => {
+        return {
+            key: localStorage.getItem(`sb_sc_${action}_key`) || defaultKey,
+            mod: localStorage.getItem(`sb_sc_${action}_mod`) || defaultMod
+        };
+    };
+
+    // 3. Chat Injection Bridges
+    function injectClipToChat(blob, name) {
+        const audioFile = new Blob([blob], { type: 'audio/mp4' });
+        const fileObj = new File([audioFile], `${name}.m4a`, { type: 'audio/mp4' });
+        const dataTransfer = new DataTransfer();
+        dataTransfer.items.add(fileObj);
+
+        const chatZone = document.querySelector('div[contenteditable="true"]') || document.querySelector('form');
+
+        if (chatZone) {
+            ['dragenter', 'dragover', 'drop'].forEach(eventType => {
+                const event = new DragEvent(eventType, {
+                    bubbles: true,
+                    cancelable: true,
+                    dataTransfer: dataTransfer
+                });
+                chatZone.dispatchEvent(event);
+            });
+
+            const autoSendEnabled = document.getElementById('sb-auto-send-chk')?.checked || document.getElementById('sb-quick-auto-send-chk')?.checked;
+            if (autoSendEnabled) {
+                setTimeout(() => {
+                    const enterEvent = new KeyboardEvent('keydown', {
+                        key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true
+                    });
+                    chatZone.dispatchEvent(enterEvent);
+                }, 400);
+            }
+        } else {
+            alert("Open an active Instagram chat window first.");
+        }
+    }
+
+    function injectImageToChat(blob, name) {
+        const fileObj = new File([blob], `${name}.jpg`, { type: blob.type || 'image/jpeg' });
+        const dataTransfer = new DataTransfer();
+        dataTransfer.items.add(fileObj);
+
+        const chatZone = document.querySelector('div[contenteditable="true"]') || document.querySelector('form');
+        if (chatZone) {
+            ['dragenter', 'dragover', 'drop'].forEach(eventType => {
+                chatZone.dispatchEvent(new DragEvent(eventType, {
+                    bubbles: true, cancelable: true, dataTransfer: dataTransfer
+                }));
+            });
+        } else {
+            alert("Open an active Instagram chat window first.");
+        }
+    }
+
+    function injectTextToChat(text) {
+        const chatZone = document.querySelector('div[contenteditable="true"]');
+        if (chatZone) {
+            chatZone.focus();
+            document.execCommand('insertText', false, text);
+            setTimeout(() => {
+                const enterEvent = new KeyboardEvent('keydown', {
+                    key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true
+                });
+                chatZone.dispatchEvent(enterEvent);
+            }, 300);
+        } else {
+            alert("Open an active Instagram chat window first.");
+        }
+    }
+
+    // 4. Window Draggable Helpers
+    function makeDraggable(panelElement, headerElement, storageKey) {
+        let isDragging = false;
+        let startX, startY, initialLeft, initialTop;
+
+        headerElement.onmousedown = e => {
+            if (e.button !== 0) return;
+            isDragging = true;
+            headerElement.style.cursor = "grabbing";
+            startX = e.clientX;
+            startY = e.clientY;
+            const rect = panelElement.getBoundingClientRect();
+            initialLeft = rect.left;
+            initialTop = rect.top;
+            panelElement.style.bottom = "auto";
+            panelElement.style.right = "auto";
+            panelElement.style.left = `${initialLeft}px`;
+            panelElement.style.top = `${initialTop}px`;
+
+            document.addEventListener('mousemove', onMouseMove);
+            document.addEventListener('mouseup', onMouseUp);
+            e.preventDefault();
+        };
+
+        function onMouseMove(e) {
+            if (!isDragging) return;
+            panelElement.style.left = `${initialLeft + (e.clientX - startX)}px`;
+            panelElement.style.top = `${initialTop + (e.clientY - startY)}px`;
+        }
+
+        function onMouseUp() {
+            if (!isDragging) return;
+            isDragging = false;
+            headerElement.style.cursor = "grab";
+            document.removeEventListener('mousemove', onMouseMove);
+            document.removeEventListener('mouseup', onMouseUp);
+            const rect = panelElement.getBoundingClientRect();
+            localStorage.setItem(storageKey, JSON.stringify({ bottom: 'auto', left: `${rect.left}px`, top: `${rect.top}px` }));
+        }
+    }
+
+    function makeIsolatedDraggable(panel, header, storageKey) {
+        let dragging = false, startX, startY, initL, initT;
+        header.onmousedown = e => {
+            if (e.button !== 0) return;
+            dragging = true;
+            header.style.cursor = "grabbing";
+            startX = e.clientX; startY = e.clientY;
+            const rect = panel.getBoundingClientRect();
+            initL = rect.left; initT = rect.top;
+            panel.style.bottom = "auto"; panel.style.right = "auto";
+            panel.style.left = `${initL}px`; panel.style.top = `${initT}px`;
+
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup', onUp);
+            e.preventDefault();
+        };
+        function onMove(e) {
+            if (!dragging) return;
+            panel.style.left = `${initL + (e.clientX - startX)}px`;
+            panel.style.top = `${initT + (e.clientY - startY)}px`;
+        }
+        function onUp() {
+            if (!dragging) return;
+            dragging = false;
+            header.style.cursor = "grab";
+            document.removeEventListener('mousemove', onMouseMove);
+            document.removeEventListener('mouseup', onUp);
+            const rect = panel.getBoundingClientRect();
+            localStorage.setItem(storageKey, JSON.stringify({ bottom: 'auto', left: `${rect.left}px`, top: `${rect.top}px` }));
+        }
+    }
+
+    // Block Registry
+    const registeredBlocks = [];
+    function registerBlock(block) {
+        registeredBlocks.push(block);
+    }
+
+    function boot() {
+        registeredBlocks.forEach(b => {
+            try { b.init(api); } catch (e) { console.error('[LegoCore] Block init error:', b.id, e); }
+        });
+    }
+
+    const api = {
+        on, emit, registerBlock,
+        getDb: () => db,
+        getShortcutConfig,
+        injectClipToChat,
+        injectImageToChat,
+        injectTextToChat,
+        makeDraggable,
+        makeIsolatedDraggable,
+        boot
+    };
+
+    return api;
+})();
+
+/* ============================================================
+   BLOCK: Quick Message Recorder (v1)
+   ============================================================ */
+/* ================================================================
+   BLOCK: Audio Quick Record (Standalone Plugin)
+   Handles the mini rapid-fire recorder, auto-trim, and auto-send.
+================================================================ */
+LegoCore.registerBlock({
+  id: 'audioQuickRecord',
+  init(core) {
+    let quickMediaRecorder;
+    let quickAudioChunks = [];
+    let quickCurrentBlob = null;
+    let isQuickRecording = false;
+
+    const quickAutoTrimStartPref = localStorage.getItem('sb_quick_autotrim_start') === 'true';
+    const quickAutoTrimEndPref = localStorage.getItem('sb_quick_autotrim_end') === 'true';
+    const quickAutoSendPref = localStorage.getItem('sb_quick_autosend') === 'true';
+    const quickSavedThreshold = localStorage.getItem('sb_quick_silence_threshold') || "0.035";
+    const quickSavedLag = localStorage.getItem('sb_quick_trailing_lag') || "800";
+
+    const quickUI = document.createElement('div');
+    quickUI.style.cssText = 'display:flex; flex-direction:column; gap:8px; font-size:10px; color:#fff;';
+    quickUI.innerHTML = `
+      <div style="background:#18181b; padding:6px; border-radius:4px; display:flex; flex-direction:column; gap:6px; border:1px solid #334155;">
+          <div style="display:flex; gap:6px; justify-content:space-between;">
+              <label style="cursor:pointer; display:flex; align-items:center; gap:2px;"><input type="checkbox" id="sb-quick-trim-start-chk" ${quickAutoTrimStartPref ? 'checked' : ''}> Trim Start</label>
+              <label style="cursor:pointer; display:flex; align-items:center; gap:2px;"><input type="checkbox" id="sb-quick-trim-end-chk" ${quickAutoTrimEndPref ? 'checked' : ''}> Trim End</label>
+              <label style="cursor:pointer; color:#ffb703; display:flex; align-items:center; gap:2px;"><input type="checkbox" id="sb-quick-auto-send-chk" ${quickAutoSendPref ? 'checked' : ''}> Auto Send</label>
+          </div>
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+              <span style="color:#94a3b8;">Sensitivity:</span>
+              <select id="sb-quick-threshold-select" style="background:#0f172a; color:#fff; border:1px solid #334155; border-radius:3px; padding:2px; font-size:9px;">
+                  <option value="0.015">Low</option><option value="0.035" ${quickSavedThreshold === "0.035" ? 'selected' : ''}>Medium</option><option value="0.060" ${quickSavedThreshold === "0.060" ? 'selected' : ''}>High</option><option value="0.100" ${quickSavedThreshold === "0.100" ? 'selected' : ''}>Very High</option>
+              </select>
+          </div>
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+              <span style="color:#94a3b8;">Delay (ms):</span>
+              <input type="number" id="sb-quick-trailing-lag-input" value="${quickSavedLag}" step="100" style="width:50px; background:#0f172a; color:#fff; border:1px solid #334155; border-radius:3px; padding:2px; font-size:9px; text-align:center;">
+          </div>
+      </div>
+      <button id="sb-quick-rec-btn" class="ig-base-btn" style="background:#0284c7; padding:8px; font-size:11px; width:100%; border:none; border-radius:4px; color:white; font-weight:bold; cursor:pointer;">🔴 Quick Record</button>
+      <audio id="sb-quick-preview" controls style="width:100%; height:25px; display:none;"></audio>
+      <div id="sb-quick-action-container" style="display:none; gap:4px;">
+          <button id="sb-quick-send-btn" class="ig-base-btn" style="flex:1; background:#10b981; border:none; border-radius:4px; color:white; padding:6px; font-weight:bold; cursor:pointer;">📤 Send Now</button>
+          <button id="sb-quick-delete-btn" class="ig-base-btn" style="width:30px; background:#dc2626; border:none; border-radius:4px; color:white; padding:6px; cursor:pointer;">🗑️</button>
+      </div>
+    `;
+
+    function mountCards() {
+      if (typeof core.registerMenu === 'function') {
+        core.registerMenu('left', '💬 Quick Message', quickUI, '⠿', 'audio-quick');
+      } else {
+        setTimeout(mountCards, 200);
+      }
+    }
+    mountCards();
+
+    quickUI.querySelector('#sb-quick-trim-start-chk').onchange = e => localStorage.setItem('sb_quick_autotrim_start', e.target.checked);
+    quickUI.querySelector('#sb-quick-trim-end-chk').onchange = e => localStorage.setItem('sb_quick_autotrim_end', e.target.checked);
+    quickUI.querySelector('#sb-quick-auto-send-chk').onchange = e => localStorage.setItem('sb_quick_autosend', e.target.checked);
+    quickUI.querySelector('#sb-quick-threshold-select').onchange = e => localStorage.setItem('sb_quick_silence_threshold', e.target.value);
+    quickUI.querySelector('#sb-quick-trailing-lag-input').onchange = e => localStorage.setItem('sb_quick_trailing_lag', e.target.value);
+
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+        quickMediaRecorder = new MediaRecorder(stream);
+        quickMediaRecorder.ondataavailable = e => quickAudioChunks.push(e.data);
+        quickMediaRecorder.onstop = async () => {
+            quickCurrentBlob = new Blob(quickAudioChunks, { type: 'audio/mp4' });
+            quickAudioChunks = [];
+            const trimStart = quickUI.querySelector('#sb-quick-trim-start-chk').checked;
+            const trimEnd = quickUI.querySelector('#sb-quick-trim-end-chk').checked;
+            if (trimStart || trimEnd) {
+                quickCurrentBlob = await detectAndTrimSilence(quickCurrentBlob, trimStart, trimEnd, quickUI.querySelector('#sb-quick-threshold-select').value);
+            }
+            showQuickActionControls();
+        };
+    }).catch(err => console.warn("Mic error:", err));
+
+    const quickRecBtn = quickUI.querySelector('#sb-quick-rec-btn');
+    quickRecBtn.onclick = () => {
+        if (!quickMediaRecorder) return alert("Mic not initialized.");
+        if (!isQuickRecording) {
+            quickAudioChunks = [];
+            quickUI.querySelector('#sb-quick-preview').style.display = "none";
+            quickUI.querySelector('#sb-quick-action-container').style.display = "none";
+            quickMediaRecorder.start();
+            isQuickRecording = true;
+            quickRecBtn.innerText = "⏹️ Stop Quick Rec";
+            quickRecBtn.style.background = "#dc2626";
+        } else {
+            const lagMs = parseInt(quickUI.querySelector('#sb-quick-trailing-lag-input').value) || 800;
+            quickRecBtn.innerText = "⏳ Finishing...";
+            quickRecBtn.style.background = "#555";
+            setTimeout(() => {
+                if (quickMediaRecorder.state === "recording") quickMediaRecorder.stop();
+                isQuickRecording = false;
+                quickRecBtn.innerText = "🔴 Quick Record";
+                quickRecBtn.style.background = "#0284c7";
+            }, lagMs);
+        }
+    };
+
+    function showQuickActionControls() {
+        const preview = quickUI.querySelector('#sb-quick-preview');
+        if (preview.src) URL.revokeObjectURL(preview.src);
+        preview.src = URL.createObjectURL(quickCurrentBlob);
+        preview.style.display = "block";
+        quickUI.querySelector('#sb-quick-action-container').style.display = "flex";
+        if (quickUI.querySelector('#sb-quick-auto-send-chk').checked) {
+            core.injectClipToChat(quickCurrentBlob, "quick_audio");
+        }
+    }
+
+    quickUI.querySelector('#sb-quick-send-btn').onclick = () => { if (quickCurrentBlob) core.injectClipToChat(quickCurrentBlob, "quick_audio"); };
+    quickUI.querySelector('#sb-quick-delete-btn').onclick = () => {
+        quickCurrentBlob = null; quickUI.querySelector('#sb-quick-preview').style.display = "none"; quickUI.querySelector('#sb-quick-action-container').style.display = "none";
+    };
+
+    async function detectAndTrimSilence(blob, cutStart, cutEnd, customThreshold) {
+        try {
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const audioBuffer = await audioCtx.decodeAudioData(await blob.arrayBuffer());
+            const channelData = audioBuffer.getChannelData(0);
+            const sr = audioBuffer.sampleRate;
+            const threshold = parseFloat(customThreshold) || 0.035;
+            let startIdx = 0, endIdx = channelData.length;
+            if (cutStart) { for (let i = 0; i < channelData.length; i++) { if (Math.abs(channelData[i]) > threshold) { startIdx = Math.max(0, i - Math.floor(sr * 0.05)); break; } } }
+            if (cutEnd) { for (let i = channelData.length - 1; i >= 0; i--) { if (Math.abs(channelData[i]) > threshold) { endIdx = Math.min(channelData.length, i + Math.floor(sr * 0.15)); break; } } }
+            if (startIdx >= endIdx) return blob;
+            const trimmed = audioCtx.createBuffer(audioBuffer.numberOfChannels, endIdx - startIdx, sr);
+            for (let c = 0; c < audioBuffer.numberOfChannels; c++) trimmed.getChannelData(c).set(audioBuffer.getChannelData(c).subarray(startIdx, endIdx));
+            return new Blob([audioBufferToWav(trimmed)], { type: 'audio/mp4' });
+        } catch (e) { return blob; }
+    }
+
+    function audioBufferToWav(buffer) {
+        const numChannels = buffer.numberOfChannels, sr = buffer.sampleRate, format = 1, bitDepth = 16;
+        const result = numChannels === 2 ? (function(l, r){ const res = new Float32Array(l.length + r.length); for(let i=0, j=0; i<l.length; i++){ res[j++] = l[i]; res[j++] = r[i]; } return res; })(buffer.getChannelData(0), buffer.getChannelData(1)) : buffer.getChannelData(0);
+        const dataLength = result.length * (bitDepth / 8);
+        const wav = new Uint8Array(44 + dataLength);
+        const view = new DataView(wav.buffer);
+        const ws = (v, o, s) => { for(let i=0; i<s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+        ws(view, 0, 'RIFF'); view.setUint32(4, 36 + dataLength, true);
+        ws(view, 8, 'WAVE'); ws(view, 12, 'fmt ');
+        view.setUint32(16, 16, true); view.setUint16(20, format, true);
+        view.setUint16(22, numChannels, true); view.setUint32(24, sr, true);
+        view.setUint32(28, sr * numChannels * (bitDepth / 8), true);
+        view.setUint16(32, numChannels * (bitDepth / 8), true);
+        view.setUint16(34, bitDepth, true); ws(view, 36, 'data');
+        view.setUint32(40, dataLength, true);
+        for (let i = 0, offset = 44; i < result.length; i++, offset += 2) {
+            let s = Math.max(-1, Math.min(1, result[i]));
+            view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+        }
+        return wav;
+    }
+
+    core.emit('block:ready', { id: 'audioQuickRecord' });
+  }
+});
+
+/* ============================================================
+   BLOCK: Sidebar Plugin Manager (v1)
+   ============================================================ */
+/* ================================================================
+   BLOCK: Sidebar Plugin Manager (Layout Registry)
+   Provides a universal helper (LegoCore.registerMenu) so any future
+   module can instantly plug its UI into your left or right sidebar.
+
+   PATCHED:
+   - Cards now get a data-key, so drag-reorder position persists
+   - Re-registering the same key replaces the old card instead of
+     stacking duplicates
+   - Waits/retries for the sidebar container instead of silently
+     dumping into document.body
+   - Removed inline style overrides so plugin cards match the
+     refined preset-card look exactly
+================================================================ */
+LegoCore.registerBlock({
+  id: 'sidebarPluginManager',
+  init(core) {
+    function slugify(str) {
+      return String(str).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/(^-|-$)/g, '') || 'menu';
+    }
+
+    core.registerMenu = function (targetSide, title, contentElement, iconHTML = '⠿', menuKey = null) {
+      const containerId = targetSide === 'right' ? 'ig-right-menu-container' : 'ig-left-menu-container';
+      const key = menuKey || ('plugin-' + slugify(title));
+
+      function mount(attemptsLeft) {
+        const container = document.getElementById(containerId);
+
+        if (!container) {
+          if (attemptsLeft <= 0) {
+            console.warn('[SidebarPluginManager] Could not find "' + containerId + '" -- the UI Module may not be loaded. Menu "' + title + '" was not mounted.');
+            return;
+          }
+          setTimeout(() => mount(attemptsLeft - 1), 200);
+          return;
+        }
+
+        // Re-registering the same key replaces the old card instead of stacking a duplicate
+        const existing = container.querySelector('[data-key="' + key + '"]');
+        if (existing) existing.remove();
+
+        const card = document.createElement('div');
+        card.className = 'ig-draggable-menu';
+        card.dataset.key = key;
+        card.innerHTML = `
+          <div class="ig-menu-header">
+            <span>${title}</span>
+            <span class="ig-drag-handle">${iconHTML}</span>
+          </div>
+          <div class="ig-menu-content"></div>
+        `;
+        card.querySelector('.ig-menu-content').appendChild(contentElement);
+        container.appendChild(card);
+      }
+
+      mount(10); // retry for up to ~2s if the UI Module hasn't built its containers yet
+    };
+
+    console.log('[SidebarPluginManager] Registry initialized. Ready for plugins.');
+    core.emit('block:ready', { id: 'sidebarPluginManager' });
+  }
+});
+
+/* ============================================================
+   BLOCK: Recorder Studio (v1)
+   ============================================================ */
+/* ================================================================
+   BLOCK: Audio Recorder Studio (Standalone Plugin)
+   Handles main recording, shortcuts, stitching logic, and saves to DB.
+================================================================ */
+LegoCore.registerBlock({
+  id: 'audioRecorderStudio',
+  init(core) {
+    let db;
+    let mediaRecorder;
+    let audioChunks = [];
+    let currentBlob = null;
+    let originalBlobBackup = null;
+    let selectedForStitchId = null;
+    let isRecording = false;
+    let selectedColorTag = "#0095f6";
+
+    const request = indexedDB.open('IG_Soundboard_Fresh_Core_DB', 2);
+    request.onerror = e => console.error("DB Error:", e);
+    request.onupgradeneeded = e => {
+      db = e.target.result;
+      if (!db.objectStoreNames.contains('clips')) db.createObjectStore('clips', { keyPath: 'id', autoIncrement: true }).createIndex('order', 'order', { unique: false });
+      if (!db.objectStoreNames.contains('folders')) db.createObjectStore('folders', { keyPath: 'name' }).put({ name: "General" });
+    };
+    request.onsuccess = e => {
+      db = e.target.result;
+      loadFolders();
+    };
+
+    const autoTrimStartPref = localStorage.getItem('sb_autotrim_start') === 'true';
+    const autoTrimEndPref = localStorage.getItem('sb_autotrim_end') === 'true';
+    const autoSendPref = localStorage.getItem('sb_autosend') === 'true';
+    const savedThreshold = localStorage.getItem('sb_silence_threshold') || "0.035";
+    const savedLag = localStorage.getItem('sb_trailing_lag') || "800";
+
+    const getShortcutConfig = (action, defaultKey, defaultMod) => {
+      return { key: localStorage.getItem(`sb_sc_${action}_key`) || defaultKey, mod: localStorage.getItem(`sb_sc_${action}_mod`) || defaultMod };
+    };
+    const scRec = getShortcutConfig('rec', 'r', 'ctrl'), scSend = getShortcutConfig('send', 's', 'ctrl'), scPlay = getShortcutConfig('play', 'p', 'ctrl');
+
+    const recUI = document.createElement('div');
+    recUI.style.cssText = 'display:flex; flex-direction:column; gap:8px; font-size:10px; color:#fff;';
+    recUI.innerHTML = `
+      <div id="sb-stitch-banner" style="display:none; background:#005f73; padding:6px; border-radius:4px; font-weight:bold; justify-content:space-between; align-items:center;">
+          <span id="sb-stitch-text">🔗 Chained: None</span>
+          <button id="sb-undo-stitch" style="background:#9d0208; border:none; color:#fff; padding:2px 4px; border-radius:3px; cursor:pointer;">Undo</button>
+      </div>
+      <div style="background:#18181b; padding:6px; border-radius:4px; display:flex; flex-direction:column; gap:6px; border:1px solid #334155;">
+          <div style="display:flex; gap:6px; justify-content:space-between;">
+              <label style="cursor:pointer; display:flex; align-items:center; gap:2px;"><input type="checkbox" id="sb-auto-trim-start-chk" ${autoTrimStartPref ? 'checked' : ''}> Cut Start</label>
+              <label style="cursor:pointer; display:flex; align-items:center; gap:2px;"><input type="checkbox" id="sb-auto-trim-end-chk" ${autoTrimEndPref ? 'checked' : ''}> Cut End</label>
+              <label style="cursor:pointer; color:#ffb703; display:flex; align-items:center; gap:2px;"><input type="checkbox" id="sb-auto-send-chk" ${autoSendPref ? 'checked' : ''}> Auto Send</label>
+          </div>
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+              <span style="color:#94a3b8;">Sensitivity:</span>
+              <select id="sb-threshold-select" style="background:#0f172a; color:#fff; border:1px solid #334155; border-radius:3px; padding:2px; font-size:9px;">
+                  <option value="0.015">Low</option><option value="0.035" ${savedThreshold === "0.035" ? 'selected' : ''}>Medium</option><option value="0.060" ${savedThreshold === "0.060" ? 'selected' : ''}>High</option><option value="0.100" ${savedThreshold === "0.100" ? 'selected' : ''}>Very High</option>
+              </select>
+          </div>
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+              <span style="color:#94a3b8;">Delay (ms):</span>
+              <input type="number" id="sb-trailing-lag-input" value="${savedLag}" step="100" style="width:50px; background:#0f172a; color:#fff; border:1px solid #334155; border-radius:3px; padding:2px; font-size:9px; text-align:center;">
+          </div>
+      </div>
+      <div style="display:flex; gap:4px;">
+          <button id="sb-rec-btn" class="ig-base-btn" style="flex:1; background:#0284c7; border:none; border-radius:4px; color:white; padding:8px; font-weight:bold; cursor:pointer;">🔴 Record Intro</button>
+          <button id="sb-upload-btn" class="ig-base-btn" style="width:30px; background:#334155; border:none; border-radius:4px; color:white; cursor:pointer;">📂</button>
+          <button id="sb-open-sc-btn" class="ig-base-btn" style="width:30px; background:#334155; border:none; border-radius:4px; color:white; cursor:pointer;">⚙️</button>
+          <input type="file" id="sb-file-input" accept="audio/*" style="display:none;">
+      </div>
+      <audio id="sb-preview" controls style="width:100%; height:25px; display:none;"></audio>
+      <div id="sb-action-container" style="display:none; flex-direction:column; gap:6px; background:#18181b; padding:6px; border-radius:4px; border:1px solid #334155;">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+              <button id="sb-undo-trim-btn" style="display:none; background:#43281c; color:#ffb703; border:none; border-radius:3px; padding:2px 4px; font-size:9px; cursor:pointer;">↩️ Undo Trim</button>
+          </div>
+          <div style="display:flex; gap:4px;">
+              <button id="sb-send-chat-btn" class="ig-base-btn" style="flex:1; background:#0284c7; border:none; border-radius:4px; color:white; padding:6px; font-weight:bold; cursor:pointer;">📤 Send Intro</button>
+              <button id="sb-send-stitched-btn" class="ig-base-btn" style="flex:1; background:#2a9d8f; display:none; border:none; border-radius:4px; color:white; padding:6px; font-weight:bold; cursor:pointer;">✨ Send Chained</button>
+              <button id="sb-delete-rec-btn" class="ig-base-btn" style="width:30px; background:#dc2626; border:none; border-radius:4px; color:white; cursor:pointer;">🗑️</button>
+          </div>
+          <div style="display:flex; gap:4px;">
+              <input type="text" id="sb-name-input" placeholder="Clip name..." style="flex:1; background:#0f172a; color:#fff; border:1px solid #334155; border-radius:3px; padding:4px; font-size:10px;">
+              <select id="sb-folder-select" style="width:70px; background:#0f172a; color:#fff; border:1px solid #334155; border-radius:3px; padding:4px; font-size:10px;"></select>
+          </div>
+          <div style="display:flex; justify-content:space-between; align-items:center; background:#0f172a; padding:4px; border-radius:3px;">
+              <span style="color:#94a3b8; font-size:9px;">Tag Color:</span>
+              <div style="display:flex; gap:4px;" id="sb-color-picker">
+                  <div class="sb-color-dot" data-color="#0095f6" style="width:14px; height:14px; border-radius:50%; background:#0095f6; cursor:pointer; border:2px solid #fff;"></div>
+                  <div class="sb-color-dot" data-color="#2e7d32" style="width:14px; height:14px; border-radius:50%; background:#2e7d32; cursor:pointer; border:2px solid transparent;"></div>
+                  <div class="sb-color-dot" data-color="#f77f00" style="width:14px; height:14px; border-radius:50%; background:#f77f00; cursor:pointer; border:2px solid transparent;"></div>
+                  <div class="sb-color-dot" data-color="#9d0208" style="width:14px; height:14px; border-radius:50%; background:#9d0208; cursor:pointer; border:2px solid transparent;"></div>
+                  <div class="sb-color-dot" data-color="#7209b7" style="width:14px; height:14px; border-radius:50%; background:#7209b7; cursor:pointer; border:2px solid transparent;"></div>
+              </div>
+          </div>
+          <button id="sb-save-btn" class="ig-base-btn" style="background:#334155; border:none; border-radius:4px; color:white; padding:6px; font-weight:bold; cursor:pointer;">💾 Save to Library</button>
+      </div>
+    `;
+
+    function mountCards() {
+      if (typeof core.registerMenu === 'function') {
+        core.registerMenu('left', '🔴 Recorder Studio', recUI, '⠿', 'audio-rec');
+      } else {
+        setTimeout(mountCards, 200);
+      }
+    }
+    mountCards();
+
+    // Event Bus Triggers from Library Block
+    core.on('folders:refresh', () => loadFolders());
+    core.on('stitch:select', async data => {
+        selectedForStitchId = data.id;
+        recUI.querySelector('#sb-stitch-text').innerText = `🔗 Chained: ${data.name}`;
+        recUI.querySelector('#sb-stitch-banner').style.display = "flex";
+        if (currentBlob) await showActionControls(recUI.querySelector('#sb-name-input').value);
+    });
+
+    const scModal = document.createElement('div');
+    scModal.style.cssText = "display:none; position:fixed; top:50%; left:50%; transform:translate(-50%, -50%); z-index:2147483647; background:#0f172a; color:#fff; padding:16px; border-radius:8px; box-shadow:0 10px 30px rgba(0,0,0,0.6); width:300px; font-family:-apple-system, sans-serif; border:1px solid #334155;";
+    const modOptions = `<option value="ctrl">Ctrl</option><option value="shift">Shift</option><option value="alt">Alt</option><option value="ctrl+shift">Ctrl+Shift</option><option value="ctrl+alt">Ctrl+Alt</option><option value="shift+alt">Shift+Alt</option><option value="none">None</option>`;
+    scModal.innerHTML = `
+        <div style="font-size:14px; font-weight:bold; margin-bottom:12px; display:flex; justify-content:space-between;">
+            <span>⌨️ Shortcuts Manager</span>
+            <button id="sb-close-sc-modal" style="background:none; border:none; color:#aaa; cursor:pointer;">✕</button>
+        </div>
+        <div style="display:flex; flex-direction:column; gap:8px; font-size:11px;">
+            <div style="display:flex; justify-content:space-between;"><span>Record:</span><div style="display:flex; gap:4px;"><select id="sb-mod-rec" style="background:#1e293b; color:#fff; border:1px solid #334155;">${modOptions}</select><input type="text" id="sb-key-rec" value="${scRec.key}" maxlength="4" style="width:30px; text-align:center; background:#1e293b; color:#fff; border:1px solid #334155;"></div></div>
+            <div style="display:flex; justify-content:space-between;"><span>Send:</span><div style="display:flex; gap:4px;"><select id="sb-mod-send" style="background:#1e293b; color:#fff; border:1px solid #334155;">${modOptions}</select><input type="text" id="sb-key-send" value="${scSend.key}" maxlength="4" style="width:30px; text-align:center; background:#1e293b; color:#fff; border:1px solid #334155;"></div></div>
+            <div style="display:flex; justify-content:space-between;"><span>Play:</span><div style="display:flex; gap:4px;"><select id="sb-mod-play" style="background:#1e293b; color:#fff; border:1px solid #334155;">${modOptions}</select><input type="text" id="sb-key-play" value="${scPlay.key}" maxlength="4" style="width:30px; text-align:center; background:#1e293b; color:#fff; border:1px solid #334155;"></div></div>
+        </div>
+        <button id="sb-save-shortcuts" class="ig-base-btn" style="width:100%; margin-top:12px; background:#0284c7; border:none; padding:6px; color:white; border-radius:4px; cursor:pointer; font-weight:bold;">Save Shortcuts</button>
+    `;
+    document.body.appendChild(scModal);
+
+    document.getElementById('sb-mod-rec').value = scRec.mod;
+    document.getElementById('sb-mod-send').value = scSend.mod;
+    document.getElementById('sb-mod-play').value = scPlay.mod;
+    recUI.querySelector('#sb-open-sc-btn').onclick = () => scModal.style.display = "block";
+    scModal.querySelector('#sb-close-sc-modal').onclick = () => scModal.style.display = "none";
+    scModal.querySelector('#sb-save-shortcuts').onclick = () => {
+        localStorage.setItem('sb_sc_rec_mod', document.getElementById('sb-mod-rec').value);
+        localStorage.setItem('sb_sc_rec_key', document.getElementById('sb-key-rec').value.toLowerCase());
+        localStorage.setItem('sb_sc_send_mod', document.getElementById('sb-mod-send').value);
+        localStorage.setItem('sb_sc_send_key', document.getElementById('sb-key-send').value.toLowerCase());
+        localStorage.setItem('sb_sc_play_mod', document.getElementById('sb-mod-play').value);
+        localStorage.setItem('sb_sc_play_key', document.getElementById('sb-key-play').value.toLowerCase());
+        scModal.style.display = "none";
+        alert("Shortcuts updated!");
+    };
+
+    recUI.querySelector('#sb-auto-trim-start-chk').onchange = e => localStorage.setItem('sb_autotrim_start', e.target.checked);
+    recUI.querySelector('#sb-auto-trim-end-chk').onchange = e => localStorage.setItem('sb_autotrim_end', e.target.checked);
+    recUI.querySelector('#sb-auto-send-chk').onchange = e => localStorage.setItem('sb_autosend', e.target.checked);
+    recUI.querySelector('#sb-threshold-select').onchange = e => localStorage.setItem('sb_silence_threshold', e.target.value);
+    recUI.querySelector('#sb-trailing-lag-input').onchange = e => localStorage.setItem('sb_trailing_lag', e.target.value);
+
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+        mediaRecorder = new MediaRecorder(stream);
+        mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+        mediaRecorder.onstop = async () => {
+            currentBlob = new Blob(audioChunks, { type: 'audio/mp4' });
+            audioChunks = [];
+            originalBlobBackup = currentBlob;
+            const trimStart = recUI.querySelector('#sb-auto-trim-start-chk').checked;
+            const trimEnd = recUI.querySelector('#sb-auto-trim-end-chk').checked;
+            if (trimStart || trimEnd) {
+                currentBlob = await detectAndTrimSilence(currentBlob, trimStart, trimEnd, recUI.querySelector('#sb-threshold-select').value);
+                recUI.querySelector('#sb-undo-trim-btn').style.display = "inline-block";
+            }
+            await showActionControls("voice_note");
+        };
+    }).catch(err => console.warn("Mic error:", err));
+
+    const recBtn = recUI.querySelector('#sb-rec-btn');
+    function triggerRecordingToggle() {
+        if (!mediaRecorder) return alert("Mic not initialized.");
+        if (!isRecording) {
+            audioChunks = [];
+            recUI.querySelector('#sb-preview').style.display = "none";
+            recUI.querySelector('#sb-action-container').style.display = "none";
+            mediaRecorder.start();
+            isRecording = true;
+            recBtn.innerText = "⏹️ Stop Recording";
+            recBtn.style.background = "#dc2626";
+        } else {
+            const lagMs = parseInt(recUI.querySelector('#sb-trailing-lag-input').value) || 800;
+            recBtn.innerText = "⏳ Finishing...";
+            recBtn.style.background = "#555";
+            setTimeout(() => {
+                if (mediaRecorder.state === "recording") mediaRecorder.stop();
+                isRecording = false;
+                recBtn.innerText = "🔴 Record Intro";
+                recBtn.style.background = "#0284c7";
+            }, lagMs);
+        }
+    }
+    recBtn.onclick = triggerRecordingToggle;
+
+    async function showActionControls(defaultName) {
+        recUI.querySelector('#sb-name-input').value = defaultName;
+        const preview = recUI.querySelector('#sb-preview');
+        let playbackBlob = currentBlob;
+        const sendChatBtn = recUI.querySelector('#sb-send-chat-btn');
+        const stitchBtn = recUI.querySelector('#sb-send-stitched-btn');
+
+        if (selectedForStitchId) {
+            const pitchObj = await getPitchClip(selectedForStitchId);
+            if (pitchObj && pitchObj.blob) {
+                let trimmedPitch = pitchObj.blob;
+                if (pitchObj.trimStart || pitchObj.trimEnd) {
+                    trimmedPitch = await trimAudioBlobByMs(pitchObj.blob, pitchObj.trimStart || 0, pitchObj.trimEnd || 0);
+                }
+                playbackBlob = await mergeAudioBlobs(currentBlob, trimmedPitch);
+            }
+            sendChatBtn.style.display = "none";
+            stitchBtn.style.display = "block";
+        } else {
+            sendChatBtn.style.display = "block";
+            stitchBtn.style.display = "none";
+        }
+
+        if (preview.src) URL.revokeObjectURL(preview.src);
+        preview.src = URL.createObjectURL(playbackBlob);
+        preview.style.display = "block";
+        recUI.querySelector('#sb-action-container').style.display = "flex";
+    }
+
+    async function getPitchClip(id) {
+        return new Promise(resolve => {
+            const tx = db.transaction(['clips'], 'readonly');
+            const req = tx.objectStore('clips').get(id);
+            req.onsuccess = () => resolve(req.result || null);
+            req.onerror = () => resolve(null);
+        });
+    }
+
+    recUI.querySelector('#sb-undo-trim-btn').onclick = async () => {
+        if (!originalBlobBackup) return;
+        currentBlob = originalBlobBackup;
+        recUI.querySelector('#sb-undo-trim-btn').style.display = "none";
+        await showActionControls(recUI.querySelector('#sb-name-input').value);
+    };
+
+    recUI.querySelector('#sb-send-chat-btn').onclick = () => {
+        if (currentBlob) core.injectClipToChat(currentBlob, recUI.querySelector('#sb-name-input').value.trim() || "voice_note");
+    };
+
+    recUI.querySelector('#sb-send-stitched-btn').onclick = async () => {
+        if (!currentBlob || !selectedForStitchId) return;
+        const pitchObj = await getPitchClip(selectedForStitchId);
+        let trimmedPitch = pitchObj.blob;
+        if (pitchObj.trimStart || pitchObj.trimEnd) {
+            trimmedPitch = await trimAudioBlobByMs(pitchObj.blob, pitchObj.trimStart || 0, pitchObj.trimEnd || 0);
+        }
+        core.injectClipToChat(await mergeAudioBlobs(currentBlob, trimmedPitch), recUI.querySelector('#sb-name-input').value.trim() || "pitch");
+    };
+
+    recUI.querySelector('#sb-delete-rec-btn').onclick = () => {
+        currentBlob = originalBlobBackup = null;
+        recUI.querySelector('#sb-preview').style.display = "none";
+        recUI.querySelector('#sb-action-container').style.display = "none";
+    };
+
+    recUI.querySelector('#sb-undo-stitch').onclick = async () => {
+        selectedForStitchId = null;
+        recUI.querySelector('#sb-stitch-banner').style.display = "none";
+        if (currentBlob) await showActionControls(recUI.querySelector('#sb-name-input').value);
+    };
+
+    // Audio Processors
+    async function detectAndTrimSilence(blob, cutStart, cutEnd, customThreshold) {
+        try {
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const audioBuffer = await audioCtx.decodeAudioData(await blob.arrayBuffer());
+            const channelData = audioBuffer.getChannelData(0);
+            const sr = audioBuffer.sampleRate;
+            const threshold = parseFloat(customThreshold) || 0.035;
+            let startIdx = 0, endIdx = channelData.length;
+
+            if (cutStart) { for (let i = 0; i < channelData.length; i++) { if (Math.abs(channelData[i]) > threshold) { startIdx = Math.max(0, i - Math.floor(sr * 0.05)); break; } } }
+            if (cutEnd) { for (let i = channelData.length - 1; i >= 0; i--) { if (Math.abs(channelData[i]) > threshold) { endIdx = Math.min(channelData.length, i + Math.floor(sr * 0.15)); break; } } }
+            if (startIdx >= endIdx) return blob;
+            const trimmed = audioCtx.createBuffer(audioBuffer.numberOfChannels, endIdx - startIdx, sr);
+            for (let c = 0; c < audioBuffer.numberOfChannels; c++) trimmed.getChannelData(c).set(audioBuffer.getChannelData(c).subarray(startIdx, endIdx));
+            return new Blob([audioBufferToWav(trimmed)], { type: 'audio/mp4' });
+        } catch (e) { return blob; }
+    }
+
+    async function trimAudioBlobByMs(blob, startMs, endMs) {
+        try {
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const audioBuffer = await audioCtx.decodeAudioData(await blob.arrayBuffer());
+            const sr = audioBuffer.sampleRate;
+            const start = Math.max(0, Math.floor((startMs / 1000) * sr));
+            const end = Math.max(start + 1, audioBuffer.length - Math.floor((endMs / 1000) * sr));
+            const trimmed = audioCtx.createBuffer(audioBuffer.numberOfChannels, end - start, sr);
+            for (let c = 0; c < audioBuffer.numberOfChannels; c++) trimmed.getChannelData(c).set(audioBuffer.getChannelData(c).subarray(start, end));
+            return new Blob([audioBufferToWav(trimmed)], { type: 'audio/mp4' });
+        } catch (e) { return blob; }
+    }
+
+    async function mergeAudioBlobs(b1, b2) {
+        try {
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const buf1 = await audioCtx.decodeAudioData(await b1.arrayBuffer());
+            const buf2 = await audioCtx.decodeAudioData(await b2.arrayBuffer());
+            const sr = buf1.sampleRate;
+            const channels = Math.max(buf1.numberOfChannels, buf2.numberOfChannels);
+            const merged = audioCtx.createBuffer(channels, buf1.length + buf2.length, sr);
+            for (let c = 0; c < channels; c++) {
+                const out = merged.getChannelData(c);
+                out.set(buf1.getChannelData(c < buf1.numberOfChannels ? c : 0), 0);
+                out.set(buf2.getChannelData(c < buf2.numberOfChannels ? c : 0), buf1.length);
+            }
+            return new Blob([audioBufferToWav(merged)], { type: 'audio/mp4' });
+        } catch (e) { return new Blob([b1, b2], { type: 'audio/mp4' }); }
+    }
+
+    function audioBufferToWav(buffer) {
+        const numChannels = buffer.numberOfChannels, sr = buffer.sampleRate, format = 1, bitDepth = 16;
+        const result = numChannels === 2 ? (function(l, r){ const res = new Float32Array(l.length + r.length); for(let i=0, j=0; i<l.length; i++){ res[j++] = l[i]; res[j++] = r[i]; } return res; })(buffer.getChannelData(0), buffer.getChannelData(1)) : buffer.getChannelData(0);
+        const dataLength = result.length * (bitDepth / 8);
+        const wav = new Uint8Array(44 + dataLength);
+        const view = new DataView(wav.buffer);
+        const ws = (v, o, s) => { for(let i=0; i<s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+        ws(view, 0, 'RIFF'); view.setUint32(4, 36 + dataLength, true);
+        ws(view, 8, 'WAVE'); ws(view, 12, 'fmt ');
+        view.setUint32(16, 16, true); view.setUint16(20, format, true);
+        view.setUint16(22, numChannels, true); view.setUint32(24, sr, true);
+        view.setUint32(28, sr * numChannels * (bitDepth / 8), true);
+        view.setUint16(32, numChannels * (bitDepth / 8), true);
+        view.setUint16(34, bitDepth, true); ws(view, 36, 'data');
+        view.setUint32(40, dataLength, true);
+        for (let i = 0, offset = 44; i < result.length; i++, offset += 2) {
+            let s = Math.max(-1, Math.min(1, result[i]));
+            view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+        }
+        return wav;
+    }
+
+    // Global Hotkeys
+    document.addEventListener('keydown', e => {
+        if (['INPUT', 'TEXTAREA'].includes(document.activeElement.tagName) && document.activeElement.id !== 'sb-name-input') return;
+        const checkMatch = (action) => {
+            const cfg = getShortcutConfig(action, '', 'ctrl');
+            if (!cfg.key) return false;
+            const targetKey = cfg.key.toLowerCase(), eventKey = e.key.toLowerCase(), eventCode = e.code.toLowerCase();
+            if (eventKey !== targetKey && eventCode !== targetKey) return false;
+            const mod = cfg.mod, hasCtrl = e.ctrlKey, hasShift = e.shiftKey, hasAlt = e.altKey;
+            if (mod === 'ctrl' && (!hasCtrl || hasShift || hasAlt)) return false;
+            if (mod === 'shift' && (!hasShift || hasCtrl || hasAlt)) return false;
+            if (mod === 'alt' && (!hasAlt || hasCtrl || hasShift)) return false;
+            if (mod === 'ctrl+shift' && (!hasCtrl || !hasShift || hasAlt)) return false;
+            if (mod === 'ctrl+alt' && (!hasCtrl || !hasAlt || hasShift)) return false;
+            if (mod === 'shift+alt' && (!hasShift || !hasAlt || hasCtrl)) return false;
+            if (mod === 'none' && (hasCtrl || hasShift || hasAlt)) return false;
+            return true;
+        };
+
+        if (checkMatch('rec')) { e.preventDefault(); triggerRecordingToggle(); }
+        else if (checkMatch('send') && currentBlob) { e.preventDefault(); core.injectClipToChat(currentBlob, recUI.querySelector('#sb-name-input').value.trim() || "voice_note"); }
+        else if (checkMatch('play')) {
+            e.preventDefault();
+            const preview = recUI.querySelector('#sb-preview');
+            if (preview.style.display !== "none") { if (preview.paused) preview.play(); else preview.pause(); }
+        }
+    });
+
+    const fileInput = recUI.querySelector('#sb-file-input');
+    recUI.querySelector('#sb-upload-btn').onclick = () => fileInput.click();
+    fileInput.onchange = async e => {
+        const file = e.target.files[0];
+        if (!file) return;
+        currentBlob = new Blob([file], { type: 'audio/mp4' });
+        originalBlobBackup = currentBlob;
+        await showActionControls(file.name.replace(/\.[^/.]+$/, ""));
+        fileInput.value = "";
+    };
+
+    recUI.querySelectorAll('.sb-color-dot').forEach(dot => {
+        dot.onclick = e => {
+            recUI.querySelectorAll('.sb-color-dot').forEach(d => d.style.border = "2px solid transparent");
+            e.target.style.border = "2px solid #fff";
+            selectedColorTag = e.target.getAttribute('data-color');
+        };
+    });
+
+    recUI.querySelector('#sb-save-btn').onclick = () => {
+        const name = recUI.querySelector('#sb-name-input').value.trim() || `clip_${Date.now()}`;
+        const folder = recUI.querySelector('#sb-folder-select').value || "General";
+        if (!currentBlob) return;
+        const tx = db.transaction(['clips'], 'readwrite');
+        const store = tx.objectStore('clips');
+        const countReq = store.count();
+        countReq.onsuccess = () => { store.add({ name, folder, color: selectedColorTag, order: countReq.result, blob: currentBlob }); };
+        tx.oncomplete = () => {
+            recUI.querySelector('#sb-name-input').value = "";
+            recUI.querySelector('#sb-action-container').style.display = "none";
+            recUI.querySelector('#sb-preview').style.display = "none";
+            core.emit('library:refresh'); // Sync with library
+        };
+    };
+
+    function loadFolders() {
+        if (!db) return;
+        const fSelect = recUI.querySelector('#sb-folder-select');
+        const curFolder = fSelect.value || "General";
+        fSelect.innerHTML = "";
+        const tx = db.transaction(['folders'], 'readonly');
+        tx.objectStore('folders').openCursor().onsuccess = e => {
+            const cursor = e.target.result;
+            if (cursor) {
+                fSelect.add(new Option(cursor.value.name, cursor.value.name));
+                cursor.continue();
+            } else {
+                fSelect.value = curFolder;
+            }
+        };
+    }
+
+    core.emit('block:ready', { id: 'audioRecorderStudio' });
+  }
+});
+
+/* ============================================================
+   BLOCK: Audio Library (v6)
+   ============================================================ */
+/* ============================================================
+   BLOCK: Audio Library (v5) — Resizable Names, Edit Modal, Search,
+   Custom Command field, Play button restored, folder drag-reorder
+   ============================================================ */
+LegoCore.registerBlock({
+  id: 'audioLibrary',
+  init(core) {
+    let db;
+    let activeFolderFilter = 'All';
+    let activeTagFilter = 'All';
+    let collapsedFolders = new Set();
+    let searchTerm = '';
+    const COL_PREF_KEY = 'ig_audio_lib_col_width_v1';
+    let colWidths = JSON.parse(localStorage.getItem(COL_PREF_KEY)) || { nameWidth: 60 };
+
+    const request = indexedDB.open('IG_Soundboard_Fresh_Core_DB', 2);
+    request.onerror = e => console.error("DB Error:", e);
+    request.onupgradeneeded = e => {
+      db = e.target.result;
+      if (!db.objectStoreNames.contains('clips')) db.createObjectStore('clips', { keyPath: 'id', autoIncrement: true }).createIndex('order', 'order', { unique: false });
+      if (!db.objectStoreNames.contains('folders')) db.createObjectStore('folders', { keyPath: 'name' }).put({ name: "General" });
+    };
+    request.onsuccess = e => {
+      db = e.target.result;
+      loadFolders();
+      renderClips();
+    };
+
+    // Styles
+    const style = document.createElement('style');
+    style.id = 'ig-audio-lib-v3-styles';
+    style.innerHTML = `
+      .ig-audio-lib-wrap { display: flex; flex-direction: column; gap: 8px; font-size: 11px; flex: 1; min-height: 0; }
+
+      .ig-audio-lib-header { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
+      .ig-audio-lib-header span { font-weight: bold; opacity: 0.8; }
+      .ig-audio-lib-new-btn { background: none; border: none; color: var(--ig-accent, #0095f6); cursor: pointer; font-weight: bold; font-size: 10px; }
+
+      .ig-audio-search { width: 100%; box-sizing: border-box; padding: 7px 8px; border-radius: 6px; border: 1px solid var(--ig-border, #333); background: var(--ig-input-bg, #111); color: #fff; font-size: 11px; font-weight: bold; outline: none; transition: border 0.2s; }
+      .ig-audio-search:focus { border-color: var(--igls-accent, #c9a876); }
+
+      .ig-audio-lib-filters { display: flex; gap: 6px; }
+      .ig-audio-lib-filters select { flex: 1; padding: 6px; border-radius: 6px; border: 1px solid var(--ig-border, #333); background: var(--ig-input-bg, #111); color: inherit; font-size: 10px; cursor: pointer; }
+
+      .ig-audio-lib-tree { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 0; padding-right: 2px; }
+      .ig-audio-lib-tree::-webkit-scrollbar { width: 4px; }
+      .ig-audio-lib-tree::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 4px; }
+
+      .ig-audio-folder-header { display: flex; align-items: center; gap: 6px; font-weight: bold; font-size: 11px; color: #94a3b8; padding: 8px 6px; background: rgba(0,0,0,0.2); border-bottom: 1px solid rgba(255,255,255,0.05); cursor: grab; user-select: none; }
+      .ig-audio-folder-header:active { cursor: grabbing; }
+      .ig-audio-folder-header.ig-audio-folder-drop-top { box-shadow: inset 0 3px 0 0 #10b981; }
+      .ig-audio-folder-header.ig-audio-folder-drop-bottom { box-shadow: inset 0 -3px 0 0 #10b981; }
+      .ig-audio-caret { font-size: 9px; cursor: pointer; padding: 2px; width: 14px; text-align: center; transition: transform 0.2s; }
+      .ig-audio-caret.collapsed { transform: rotate(-90deg); }
+
+      .ig-audio-folder-content { display: flex; flex-direction: column; }
+      .ig-audio-folder-content.collapsed { display: none; }
+
+      .ig-audio-clip-row { display: flex; align-items: center; padding: 6px 8px; border-bottom: 1px solid rgba(255,255,255,0.03); background: rgba(255,255,255,0.01); cursor: grab; transition: background 0.2s; }
+      .ig-audio-clip-row:hover { background: rgba(255,255,255,0.05); }
+      .ig-audio-clip-row.alt { background: rgba(255,255,255,0.02); }
+      .ig-audio-clip-row:active { cursor: grabbing; }
+      .ig-audio-clip-row.ig-audio-hidden { display: none; }
+
+      .ig-audio-grip { color: #475569; font-size: 10px; cursor: grab; margin-right: 6px; flex-shrink: 0; }
+      .ig-audio-grip:active { cursor: grabbing; }
+
+      .ig-audio-name { font-size: 11px; color: #f8fafc; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; flex-shrink: 0; }
+
+      .ig-audio-col-resizer { width: 6px; height: 18px; cursor: col-resize; background: rgba(255,255,255,0.05); border-radius: 3px; margin: 0 6px; transition: background 0.1s; flex-shrink: 0; }
+      .ig-audio-col-resizer:hover, .ig-audio-col-resizer.active { background: #6366f1; }
+
+      .ig-audio-color-dot { width: 10px; height: 10px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.2); flex-shrink: 0; margin-right: 8px; }
+
+      .ig-audio-cmd-badge { font-size: 9px; background: rgba(255,255,255,0.1); color: #c9a876; padding: 1px 6px; border-radius: 8px; font-weight: bold; margin-right: 8px; flex-shrink: 0; }
+
+      .ig-audio-actions { display: flex; gap: 4px; align-items: center; margin-left: auto; flex-shrink: 0; }
+      .ig-audio-btn { background: transparent; border: none; color: #64748b; cursor: pointer; font-size: 11px; padding: 3px 6px; border-radius: 4px; transition: 0.2s; }
+      .ig-audio-btn:hover { background: rgba(255,255,255,0.1); color: #fff; }
+      .ig-audio-send-btn { background: #10b981; color: #fff; border-radius: 4px; padding: 4px 8px; font-weight: bold; font-size: 10px; }
+      .ig-audio-send-btn:hover { background: #059669; color: #fff; opacity: 0.9; }
+
+      .ig-audio-footer { display: flex; gap: 6px; margin-top: 4px; }
+      .ig-audio-footer button { flex: 1; padding: 7px; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 10px; transition: opacity 0.2s; }
+      .ig-audio-footer button:hover { opacity: 0.9; }
+      .ig-audio-dl-btn { background: #2e7d32; }
+      .ig-audio-ul-btn { background: #4527a0; }
+
+      .ig-audio-modal-overlay { position: fixed; top:0; left:0; right:0; bottom:0; background: rgba(0,0,0,0.6); z-index: 2147483647; display: flex; justify-content: center; align-items: center; }
+      .ig-audio-modal { background: #0f172a; border: 1px solid #334155; border-radius: 8px; width: 320px; padding: 16px; display: flex; flex-direction: column; gap: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
+      .ig-audio-modal h3 { margin: 0; font-size: 14px; color: #fff; }
+      .ig-audio-modal-input { width: 100%; background: #1e293b; border: 1px solid #475569; color: #fff; padding: 8px; border-radius: 4px; font-size: 12px; box-sizing: border-box; outline: none; }
+      .ig-audio-modal-input:focus { border-color: #6366f1; }
+      .ig-audio-modal-label { font-size: 11px; font-weight: bold; color: #94a3b8; margin-top: 4px; }
+      .ig-audio-modal-colors { display: flex; gap: 8px; }
+      .ig-audio-modal-color-dot { width: 22px; height: 22px; border-radius: 50%; cursor: pointer; transition: transform 0.1s; }
+      .ig-audio-modal-color-dot:hover { transform: scale(1.1); }
+      .ig-audio-modal-play-btn { background: #334155; color: #fff; border: none; border-radius: 6px; padding: 8px; font-weight: bold; cursor: pointer; }
+      .ig-audio-modal-play-btn:hover { background: #475569; }
+    `;
+    document.head.appendChild(style);
+
+    // Build UI
+    const libUI = document.createElement('div');
+    libUI.className = 'ig-audio-lib-wrap';
+    libUI.innerHTML = `
+      <div class="ig-audio-lib-header">
+        <span>Filters:</span>
+        <button id="ig-audio-new-folder-btn" class="ig-audio-lib-new-btn">+ New Folder</button>
+      </div>
+      <input type="text" id="ig-audio-search-input" class="ig-audio-search" placeholder="🔍 Search clips... (Enter to send)">
+      <div class="ig-audio-lib-filters">
+        <select id="ig-audio-folder-filter" style="flex: 1;">
+          <option value="All">📂 All Folders</option>
+        </select>
+        <select id="ig-audio-tag-filter" style="width: 90px;">
+          <option value="All">🏷️ All Tags</option>
+          <option value="#0095f6">Blue</option>
+          <option value="#2e7d32">Green</option>
+          <option value="#f77f00">Orange</option>
+          <option value="#9d0208">Red</option>
+          <option value="#7209b7">Purple</option>
+        </select>
+      </div>
+      <div id="ig-audio-lib-tree" class="ig-audio-lib-tree"></div>
+      <div class="ig-audio-footer">
+        <button id="ig-audio-dl-btn" class="ig-audio-dl-btn">📥 Download</button>
+        <button id="ig-audio-ul-btn" class="ig-audio-ul-btn">📤 Batch Upload</button>
+        <input type="file" id="ig-audio-batch-input" accept="audio/*" multiple style="display: none;">
+      </div>
+    `;
+
+    // Mount
+    function mountCards() {
+      if (typeof core.registerMenu === 'function') {
+        core.registerMenu('left', '📚 Audio Library', libUI, '⠿', 'audio-lib');
+      } else {
+        setTimeout(mountCards, 200);
+      }
+    }
+    mountCards();
+
+    // Event syncing
+    core.on('library:refresh', () => renderClips());
+    core.on('folders:refresh', () => loadFolders());
+
+    // Filter changes
+    libUI.querySelector('#ig-audio-folder-filter').onchange = () => renderClips();
+    libUI.querySelector('#ig-audio-tag-filter').onchange = () => renderClips();
+
+    // Search: filter as you type, Enter sends the first visible match
+    const searchInput = libUI.querySelector('#ig-audio-search-input');
+    searchInput.addEventListener('input', () => {
+      searchTerm = searchInput.value.toLowerCase();
+      renderClips(true);
+    });
+    searchInput.addEventListener('keydown', (e) => {
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      const tree = libUI.querySelector('#ig-audio-lib-tree');
+      const firstVisible = tree.querySelector('.ig-audio-clip-row:not(.ig-audio-hidden)');
+      if (firstVisible) {
+        const sendBtn = firstVisible.querySelector('.ig-audio-send-btn');
+        if (sendBtn) {
+          sendBtn.click();
+          searchInput.value = '';
+          searchTerm = '';
+          renderClips(true);
+        }
+      }
+    });
+
+    // New folder
+    libUI.querySelector('#ig-audio-new-folder-btn').onclick = () => {
+      const fName = prompt("New folder name:");
+      if (!fName || !fName.trim()) return;
+      const tx = db.transaction(['folders'], 'readwrite');
+      tx.objectStore('folders').put({ name: fName.trim(), order: Date.now() });
+      tx.oncomplete = () => {
+        loadFolders();
+        core.emit('folders:refresh');
+      };
+    };
+
+    function reorderFolders(dragName, targetName, dropBefore) {
+      if (!db || dragName === targetName) return;
+      const tx = db.transaction(['folders'], 'readwrite');
+      const store = tx.objectStore('folders');
+      store.getAll().onsuccess = e => {
+        const folderRecords = (e.target.result || []).sort((a, b) => (a.order || 0) - (b.order || 0));
+        const dragIdx = folderRecords.findIndex(f => f.name === dragName);
+        if (dragIdx === -1) return;
+        const [moved] = folderRecords.splice(dragIdx, 1);
+        let insertIdx = folderRecords.findIndex(f => f.name === targetName);
+        if (insertIdx === -1) insertIdx = folderRecords.length;
+        else if (!dropBefore) insertIdx++;
+        folderRecords.splice(insertIdx, 0, moved);
+        folderRecords.forEach((f, i) => { f.order = i; store.put(f); });
+      };
+      tx.oncomplete = () => { renderClips(); };
+    }
+
+    function loadFolders() {
+      if (!db) return;
+      const folderSelect = libUI.querySelector('#ig-audio-folder-filter');
+      const curVal = folderSelect.value || "All";
+      folderSelect.innerHTML = '<option value="All">📂 All Folders</option>';
+
+      const tx = db.transaction(['folders'], 'readonly');
+      tx.objectStore('folders').openCursor().onsuccess = e => {
+        const cursor = e.target.result;
+        if (cursor) {
+          folderSelect.add(new Option(cursor.value.name, cursor.value.name));
+          cursor.continue();
+        } else {
+          folderSelect.value = curVal;
+        }
+      };
+    }
+
+    let draggedClip = null;
+    let draggedFolder = null;
+    let activeColResizer = null;
+
+    window.addEventListener('mousemove', (e) => {
+      if (!activeColResizer) return;
+      const containerRect = activeColResizer.container.getBoundingClientRect();
+      const newWidthPercent = ((e.clientX - containerRect.left) / containerRect.width) * 100;
+      colWidths.nameWidth = Math.min(85, Math.max(15, newWidthPercent));
+      libUI.querySelectorAll('.ig-audio-name').forEach(el => el.style.width = colWidths.nameWidth + '%');
+    });
+    window.addEventListener('mouseup', () => {
+      if (activeColResizer) {
+        activeColResizer.el.classList.remove('active');
+        activeColResizer = null;
+        localStorage.setItem(COL_PREF_KEY, JSON.stringify(colWidths));
+      }
+    });
+
+    function openEditModal(clip) {
+      let selectedColor = clip.color || '#0095f6';
+
+      const overlay = document.createElement('div');
+      overlay.className = 'ig-audio-modal-overlay';
+
+      const colorDotsHtml = ['#0095f6', '#2e7d32', '#f77f00', '#9d0208', '#7209b7'].map(hex =>
+        `<div class="ig-audio-modal-color-dot" data-color="${hex}" style="background:${hex}; border:${hex === selectedColor ? '3px solid #fff' : '3px solid transparent'};"></div>`
+      ).join('');
+
+      overlay.innerHTML = `
+        <div class="ig-audio-modal">
+          <h3>✏️ Edit Clip</h3>
+
+          <div class="ig-audio-modal-label">Name:</div>
+          <input type="text" id="ig-audio-modal-name" class="ig-audio-modal-input" value="${clip.name}">
+
+          <div class="ig-audio-modal-label">Folder:</div>
+          <select id="ig-audio-modal-folder" class="ig-audio-modal-input"></select>
+
+          <div class="ig-audio-modal-label">Custom Command (used by Quick Command Bar):</div>
+          <div style="display:flex; align-items:center; gap:4px;">
+            <span style="color:#94a3b8; font-weight:bold;">/</span>
+            <input type="text" id="ig-audio-modal-command" class="ig-audio-modal-input" placeholder="e.g. hola" value="${clip.customCommand || ''}">
+          </div>
+
+          <div class="ig-audio-modal-label">Tag Color:</div>
+          <div class="ig-audio-modal-colors" id="ig-audio-modal-colors">${colorDotsHtml}</div>
+
+          <button id="ig-audio-modal-play" class="ig-audio-modal-play-btn">▶️ Preview</button>
+
+          <div style="display:flex; justify-content:space-between; margin-top:8px;">
+            <div style="display:flex; gap:8px;">
+              <button id="ig-audio-modal-del" style="background:#dc2626; color:#fff; border:none; padding:6px 12px; border-radius:4px; font-weight:bold; cursor:pointer;">🗑️ Delete</button>
+              <button id="ig-audio-modal-dl" style="background:#2e7d32; color:#fff; border:none; padding:6px 12px; border-radius:4px; font-weight:bold; cursor:pointer;">📥 Download</button>
+            </div>
+            <div style="display:flex; gap:8px;">
+              <button id="ig-audio-modal-cancel" style="background:transparent; color:#94a3b8; border:none; cursor:pointer; font-weight:bold;">Cancel</button>
+              <button id="ig-audio-modal-save" style="background:#6366f1; color:#fff; border:none; padding:6px 12px; border-radius:4px; font-weight:bold; cursor:pointer;">💾 Save</button>
+            </div>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(overlay);
+
+      // Populate folder select
+      const folderSel = overlay.querySelector('#ig-audio-modal-folder');
+      const tx0 = db.transaction(['folders'], 'readonly');
+      tx0.objectStore('folders').openCursor().onsuccess = e => {
+        const cursor = e.target.result;
+        if (cursor) {
+          const opt = document.createElement('option');
+          opt.value = cursor.value.name; opt.innerText = cursor.value.name;
+          if (cursor.value.name === (clip.folder || 'General')) opt.selected = true;
+          folderSel.appendChild(opt);
+          cursor.continue();
+        }
+      };
+
+      overlay.querySelectorAll('.ig-audio-modal-color-dot').forEach(dot => {
+        dot.onclick = () => {
+          selectedColor = dot.dataset.color;
+          overlay.querySelectorAll('.ig-audio-modal-color-dot').forEach(d => {
+            d.style.border = d.dataset.color === selectedColor ? '3px solid #fff' : '3px solid transparent';
+          });
+        };
+      });
+
+      let previewPlayer = null;
+      overlay.querySelector('#ig-audio-modal-play').onclick = (e) => {
+        const btn = e.target;
+        if (!previewPlayer) {
+          previewPlayer = new Audio(URL.createObjectURL(clip.blob));
+          btn.innerText = '⏹️ Stop';
+          previewPlayer.play();
+          previewPlayer.onended = () => { btn.innerText = '▶️ Preview'; previewPlayer = null; };
+        } else {
+          previewPlayer.pause();
+          btn.innerText = '▶️ Preview';
+          previewPlayer = null;
+        }
+      };
+
+      overlay.querySelector('#ig-audio-modal-dl').onclick = () => {
+        const url = URL.createObjectURL(clip.blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `${clip.folder || 'General'}.${clip.color || '#0095f6'}.${clip.name}.m4a`;
+        document.body.appendChild(a); a.click(); a.remove();
+        URL.revokeObjectURL(url);
+      };
+
+      overlay.querySelector('#ig-audio-modal-del').onclick = () => {
+        if (!confirm('Permanently delete this clip?')) return;
+        const tx = db.transaction(['clips'], 'readwrite');
+        tx.objectStore('clips').delete(clip.id);
+        tx.oncomplete = () => { renderClips(); overlay.remove(); };
+      };
+
+      overlay.querySelector('#ig-audio-modal-cancel').onclick = () => overlay.remove();
+
+      overlay.querySelector('#ig-audio-modal-save').onclick = () => {
+        const newName = overlay.querySelector('#ig-audio-modal-name').value.trim() || clip.name;
+        const newFolder = folderSel.value || 'General';
+        const newCommand = overlay.querySelector('#ig-audio-modal-command').value.trim().replace(/^\/+/, '');
+        const tx = db.transaction(['clips'], 'readwrite');
+        const store = tx.objectStore('clips');
+        store.get(clip.id).onsuccess = e => {
+          const c = e.target.result;
+          if (c) {
+            c.name = newName;
+            c.folder = newFolder;
+            c.color = selectedColor;
+            c.customCommand = newCommand;
+            store.put(c);
+          }
+        };
+        tx.oncomplete = () => { renderClips(); overlay.remove(); };
+      };
+    }
+
+    function renderClips(isFilterOnly) {
+      if (!db) return;
+      const tree = libUI.querySelector('#ig-audio-lib-tree');
+      const folderFilter = libUI.querySelector('#ig-audio-folder-filter').value || 'All';
+      const tagFilter = libUI.querySelector('#ig-audio-tag-filter').value || 'All';
+
+      if (isFilterOnly) {
+        // Just toggle visibility for search without a full rebuild
+        tree.querySelectorAll('.ig-audio-clip-row').forEach(row => {
+          const name = row.querySelector('.ig-audio-name').innerText.toLowerCase();
+          row.classList.toggle('ig-audio-hidden', searchTerm && !name.includes(searchTerm));
+        });
+        tree.querySelectorAll('.ig-audio-folder-header').forEach(header => {
+          const content = header.nextElementSibling;
+          const anyVisible = content && content.querySelector('.ig-audio-clip-row:not(.ig-audio-hidden)');
+          header.parentElement.style.display = (searchTerm && !anyVisible) ? 'none' : '';
+        });
+        return;
+      }
+
+      tree.innerHTML = '';
+
+      const tx = db.transaction(['clips'], 'readonly');
+      tx.objectStore('clips').getAll().onsuccess = e => {
+        const allClips = (e.target.result || []).sort((a, b) => (a.order || 0) - (b.order || 0));
+
+        if (!allClips.length) {
+          tree.innerHTML = '<div style="padding:12px; color:#94a3b8; font-size:10px;">No audio clips yet.</div>';
+          return;
+        }
+
+        const folders = {};
+        allClips.forEach(clip => {
+          const folder = clip.folder || 'General';
+          if (!folders[folder]) folders[folder] = [];
+          folders[folder].push(clip);
+        });
+
+        // Sort folder groups by their saved order (drag-reorderable),
+        // falling back to alphabetical for any folder missing an order.
+        const ftx = db.transaction(['folders'], 'readonly');
+        const folderOrderMap = {};
+        ftx.objectStore('folders').openCursor().onsuccess = fe => {
+          const cursor = fe.target.result;
+          if (cursor) {
+            folderOrderMap[cursor.value.name] = typeof cursor.value.order === 'number' ? cursor.value.order : null;
+            cursor.continue();
+          } else {
+            const sortedFolderNames = Object.keys(folders).sort((a, b) => {
+              const oa = folderOrderMap[a];
+              const ob = folderOrderMap[b];
+              if (oa !== null && oa !== undefined && ob !== null && ob !== undefined && oa !== ob) return oa - ob;
+              if (oa !== null && oa !== undefined && (ob === null || ob === undefined)) return -1;
+              if (ob !== null && ob !== undefined && (oa === null || oa === undefined)) return 1;
+              return a.localeCompare(b);
+            });
+            renderFolderGroups(sortedFolderNames);
+          }
+        };
+
+        function renderFolderGroups(sortedFolderNames) {
+        let clipCounter = 0;
+        sortedFolderNames.forEach(folderName => {
+          if (folderFilter !== 'All' && folderFilter !== folderName) return;
+
+          const folderEl = document.createElement('div');
+          const isCollapsed = collapsedFolders.has(folderName);
+
+          const headerEl = document.createElement('div');
+          headerEl.className = 'ig-audio-folder-header';
+          headerEl.draggable = true;
+          headerEl.innerHTML = `
+            <span class="ig-audio-caret ${isCollapsed ? 'collapsed' : ''}">▼</span>
+            <span>📁 ${folderName}</span>
+            <span style="margin-left:auto; font-size:9px; opacity:0.6;">${folders[folderName].length} clips</span>
+          `;
+
+          headerEl.querySelector('.ig-audio-caret').onclick = (ev) => {
+            ev.stopPropagation();
+            if (collapsedFolders.has(folderName)) collapsedFolders.delete(folderName);
+            else collapsedFolders.add(folderName);
+            renderClips();
+          };
+
+          // Drag-to-reorder folders
+          headerEl.ondragstart = (ev) => {
+            ev.stopPropagation();
+            draggedFolder = folderName;
+            headerEl.style.opacity = '0.4';
+          };
+          headerEl.ondragend = () => { draggedFolder = null; headerEl.style.opacity = '1'; };
+          headerEl.ondragover = (ev) => {
+            if (!draggedFolder || draggedFolder === folderName) return;
+            ev.preventDefault(); ev.stopPropagation();
+            const rect = headerEl.getBoundingClientRect();
+            const isTop = (ev.clientY - rect.top) < rect.height / 2;
+            headerEl.classList.toggle('ig-audio-folder-drop-top', isTop);
+            headerEl.classList.toggle('ig-audio-folder-drop-bottom', !isTop);
+          };
+          headerEl.ondragleave = () => {
+            headerEl.classList.remove('ig-audio-folder-drop-top', 'ig-audio-folder-drop-bottom');
+          };
+          headerEl.ondrop = (ev) => {
+            if (!draggedFolder || draggedFolder === folderName) return;
+            ev.preventDefault(); ev.stopPropagation();
+            const rect = headerEl.getBoundingClientRect();
+            const isTop = (ev.clientY - rect.top) < rect.height / 2;
+            headerEl.classList.remove('ig-audio-folder-drop-top', 'ig-audio-folder-drop-bottom');
+            reorderFolders(draggedFolder, folderName, isTop);
+            draggedFolder = null;
+          };
+
+          folderEl.appendChild(headerEl);
+
+          const contentEl = document.createElement('div');
+          contentEl.className = `ig-audio-folder-content ${isCollapsed ? 'collapsed' : ''}`;
+
+          folders[folderName].forEach((clip) => {
+            if (tagFilter !== 'All' && clip.color !== tagFilter) return;
+
+            clipCounter++;
+            const rowEl = document.createElement('div');
+            rowEl.className = `ig-audio-clip-row ${clipCounter % 2 === 0 ? 'alt' : ''}`;
+            rowEl.draggable = true;
+            rowEl.dataset.clipId = clip.id;
+
+            if (searchTerm && !clip.name.toLowerCase().includes(searchTerm)) {
+              rowEl.classList.add('ig-audio-hidden');
+            }
+
+            const cmdBadgeHtml = clip.customCommand ? `<span class="ig-audio-cmd-badge">/${clip.customCommand}</span>` : '';
+
+            rowEl.innerHTML = `
+              <span class="ig-audio-grip">⠿</span>
+              <span class="ig-audio-name" style="width: ${colWidths.nameWidth}%;" title="${clip.name}">${clip.name}</span>
+              <div class="ig-audio-col-resizer" title="Drag to resize name column"></div>
+              ${cmdBadgeHtml}
+              <div class="ig-audio-color-dot" style="background: ${clip.color || '#0095f6'};"></div>
+              <div class="ig-audio-actions">
+                <button class="ig-audio-btn play-btn" title="Play">▶️</button>
+                <button class="ig-audio-btn ig-audio-send-btn" title="Send to chat">📤 Send</button>
+                <button class="ig-audio-btn edit-btn" title="Edit">✏️</button>
+              </div>
+            `;
+
+            // Column resizer
+            const resizer = rowEl.querySelector('.ig-audio-col-resizer');
+            resizer.addEventListener('mousedown', (e) => {
+              e.stopPropagation(); e.preventDefault();
+              resizer.classList.add('active');
+              activeColResizer = { el: resizer, container: rowEl };
+            });
+
+            // Drag-to-reorder
+            rowEl.ondragstart = (e) => {
+              if (e.target.closest('.ig-audio-col-resizer')) { e.preventDefault(); return; }
+              draggedClip = clip; rowEl.style.opacity = '0.4';
+            };
+            rowEl.ondragend = () => { draggedClip = null; rowEl.style.opacity = '1'; };
+            rowEl.ondragover = e => { e.preventDefault(); rowEl.style.borderTop = '2px solid #10b981'; };
+            rowEl.ondragleave = () => { rowEl.style.borderTop = ''; };
+            rowEl.ondrop = async (e) => {
+              e.preventDefault();
+              rowEl.style.borderTop = '';
+              if (draggedClip && draggedClip.id !== clip.id) {
+                const tx2 = db.transaction(['clips'], 'readwrite');
+                const store = tx2.objectStore('clips');
+                store.getAll().onsuccess = ev => {
+                  const clips = ev.target.result.sort((a, b) => (a.order || 0) - (b.order || 0));
+                  const dragIdx = clips.findIndex(c => c.id === draggedClip.id);
+                  const targetIdx = clips.findIndex(c => c.id === clip.id);
+                  if (dragIdx > -1 && targetIdx > -1) {
+                    const [moved] = clips.splice(dragIdx, 1);
+                    clips.splice(targetIdx, 0, moved);
+                    clips.forEach((c, i) => { c.order = i; store.put(c); });
+                  }
+                };
+                tx2.oncomplete = () => renderClips();
+              }
+            };
+
+            // Play button
+            let rowPlayer = null;
+            rowEl.querySelector('.play-btn').onclick = (e) => {
+              e.stopPropagation();
+              const btn = e.target;
+              if (!rowPlayer) {
+                rowPlayer = new Audio(URL.createObjectURL(clip.blob));
+                btn.innerText = '⏹️';
+                rowPlayer.play();
+                rowPlayer.onended = () => { btn.innerText = '▶️'; rowPlayer = null; };
+              } else {
+                rowPlayer.pause();
+                rowPlayer = null;
+                btn.innerText = '▶️';
+              }
+            };
+
+            // Send button
+            rowEl.querySelector('.ig-audio-send-btn').onclick = (e) => {
+              e.stopPropagation();
+              core.injectClipToChat(clip.blob, clip.name);
+              const btn = e.target;
+              const originalText = btn.innerText;
+              btn.innerText = '✅ Sent';
+              setTimeout(() => btn.innerText = originalText, 1000);
+            };
+
+            // Edit button
+            rowEl.querySelector('.edit-btn').onclick = (e) => {
+              e.stopPropagation();
+              openEditModal(clip);
+            };
+
+            contentEl.appendChild(rowEl);
+          });
+
+          folderEl.appendChild(contentEl);
+          tree.appendChild(folderEl);
+        });
+        }
+      };
+    }
+
+    // Download all
+    libUI.querySelector('#ig-audio-dl-btn').onclick = async () => {
+      const btn = libUI.querySelector('#ig-audio-dl-btn');
+      btn.innerText = '⏳ Wait...';
+      const tx = db.transaction(['clips'], 'readonly');
+      tx.objectStore('clips').getAll().onsuccess = async e => {
+        const clips = e.target.result || [];
+        for (let clip of clips) {
+          const url = URL.createObjectURL(clip.blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = `${clip.folder || 'General'}.${clip.color || '#0095f6'}.${clip.name}.m4a`;
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          URL.revokeObjectURL(url);
+          await new Promise(r => setTimeout(r, 150));
+        }
+        btn.innerText = '📥 Download';
+      };
+    };
+
+    // Batch upload
+    const batchBtn = libUI.querySelector('#ig-audio-ul-btn');
+    const batchInput = libUI.querySelector('#ig-audio-batch-input');
+    batchBtn.onclick = () => batchInput.click();
+    batchInput.onchange = e => {
+      const files = e.target.files;
+      if (!files.length) return;
+      batchBtn.innerText = '⏳ Sorting...';
+      const tx = db.transaction(['folders', 'clips'], 'readwrite');
+      const fStore = tx.objectStore('folders'), cStore = tx.objectStore('clips');
+      const folders = new Set(['General']);
+
+      for (let i = 0; i < files.length; i++) {
+        const parts = files[i].name.replace(/\.[^/.]+$/, '').split('.');
+        let folder = 'General', color = '#0095f6', name = files[i].name;
+        if (parts.length >= 3 && parts[1].startsWith('#')) {
+          folder = parts[0].trim();
+          color = parts[1].trim();
+          name = parts.slice(2).join('.').trim();
+        } else if (parts.length >= 2) {
+          folder = parts[0].trim();
+          name = parts.slice(1).join('.').trim();
+        }
+        folders.add(folder);
+        cStore.add({ name, folder, color, order: i, blob: new Blob([files[i]], { type: 'audio/mp4' }) });
+      }
+      folders.forEach(f => fStore.put({ name: f }));
+      tx.oncomplete = () => {
+        batchBtn.innerText = '📤 Batch Upload';
+        loadFolders();
+        renderClips();
+        core.emit('folders:refresh');
+      };
+      batchInput.value = '';
+    };
+
+    core.emit('block:ready', { id: 'audioLibrary' });
+  }
+});
+
+/* ============================================================
+   BLOCK: Dual Sidebar UI Shell (v4)
+   ============================================================ */
+/* ============================================================
+   BLOCK: Dual Sidebar UI Shell (Panels Only)
+   ============================================================ */
+LegoCore.registerBlock({
+  id: 'igDualSidebarUI',
+  init(core) {
+    const PREF_KEY = 'ig_modular_dual_sidebar_prefs_v22';
+    let prefs = JSON.parse(localStorage.getItem(PREF_KEY)) || {
+      leftWidth: 80,
+      rightWidth: 280,
+      uiScale: 100,
+      leftHidden: false,
+      rightHidden: false,
+      leftMenus: [],
+      rightMenus: [],
+      cardHeights: {}
+    };
+
+    if (!prefs.cardHeights) prefs.cardHeights = {};
+
+    const stylesheet = document.createElement('style');
+    stylesheet.id = 'ig-modular-dual-styles';
+
+    function updateStyles() {
+      const uiScaleVal = prefs.uiScale / 100;
+
+      stylesheet.innerHTML = `
+        :root {
+          --igls-bg: #131318;
+          --igls-surface: #17171d;
+          --igls-surface-2: #1c1c23;
+          --igls-border: rgba(255,255,255,0.07);
+          --igls-border-strong: rgba(255,255,255,0.14);
+          --igls-text: #ece9e4;
+          --igls-text-dim: #96949c;
+          --igls-accent: #c9a876;
+          --igls-accent-soft: rgba(201,168,118,0.14);
+          --igls-shadow: rgba(0,0,0,0.5);
+        }
+
+        #ig-modular-left-panel, #ig-modular-right-panel {
+          position: fixed; top: 0; height: 100vh;
+          background: var(--igls-bg); color: var(--igls-text);
+          z-index: 2147483647; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+          display: none; flex-direction: column; overflow-x: hidden;
+          zoom: ${uiScaleVal} !important;
+        }
+
+        #ig-modular-left-panel {
+          left: ${prefs.leftHidden ? `-${prefs.leftWidth}px` : '0'};
+          width: ${prefs.leftWidth}px; border-right: 1px solid var(--igls-border);
+          box-shadow: 24px 0 60px var(--igls-shadow);
+          transition: left 0.28s cubic-bezier(0.22, 0.61, 0.36, 1);
+        }
+
+        #ig-modular-right-panel {
+          right: ${prefs.rightHidden ? `-${prefs.rightWidth}px` : '0'};
+          width: ${prefs.rightWidth}px; border-left: 1px solid var(--igls-border);
+          box-shadow: -24px 0 60px var(--igls-shadow);
+          transition: right 0.28s cubic-bezier(0.22, 0.61, 0.36, 1);
+        }
+
+        body.ig-modular-active #ig-modular-left-panel,
+        body.ig-modular-active #ig-modular-right-panel { display: flex; }
+
+        #ig-left-toggle-tab, #ig-right-toggle-tab {
+          position: fixed; top: 50%; transform: translateY(-50%);
+          background: var(--igls-surface); color: var(--igls-text-dim);
+          border: 1px solid var(--igls-border); padding: 14px 7px;
+          cursor: pointer; z-index: 2147483648; font-size: 10px; font-weight: 600;
+          writing-mode: vertical-rl;
+        }
+
+        #ig-left-toggle-tab { left: 0; border-left: none; border-radius: 0 10px 10px 0; display: ${prefs.leftHidden ? 'flex' : 'none'}; }
+        #ig-right-toggle-tab { right: 0; border-right: none; border-radius: 10px 0 0 10px; display: ${prefs.rightHidden ? 'flex' : 'none'}; }
+
+        #ig-left-resizer, #ig-right-resizer {
+          position: absolute; top: 0; width: 4px; height: 100%; cursor: ew-resize; z-index: 2147483648;
+        }
+        #ig-left-resizer { right: -2px; display: ${prefs.leftHidden ? 'none' : 'block'}; }
+        #ig-right-resizer { left: -2px; display: ${prefs.rightHidden ? 'none' : 'block'}; }
+
+        .ig-panel-header {
+          padding: 16px 16px 14px; border-bottom: 1px solid var(--igls-border);
+          display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; gap: 10px;
+        }
+
+        .ig-panel-title { font-size: 10.5px; font-weight: 600; color: var(--igls-text-dim); text-transform: uppercase; }
+
+        .ig-panel-body {
+          padding: 12px; flex: 1; overflow-y: auto; overflow-x: hidden; display: flex; flex-direction: column; gap: 10px;
+        }
+
+        .ig-draggable-menu {
+          background: var(--igls-surface); border: 1px solid var(--igls-border); border-radius: 11px;
+          overflow: hidden; flex-shrink: 0; display: flex; flex-direction: column;
+        }
+
+        .ig-menu-header {
+          padding: 10px 12px; font-size: 11.5px; font-weight: 600; color: var(--igls-text);
+          display: flex; justify-content: space-between; align-items: center; cursor: grab; user-select: none;
+        }
+
+        .ig-menu-content {
+          padding: 0 12px 12px; display: flex; flex-direction: column; gap: 8px;
+          resize: vertical; overflow: auto; min-height: 50px; max-height: 80vh;
+        }
+
+        .ig-base-btn {
+          background: var(--igls-accent); color: #171208; border: none; padding: 8px 10px;
+          border-radius: 8px; font-weight: 600; cursor: pointer; font-size: 11px; width: 100%;
+        }
+
+        .ig-hide-btn {
+          background: transparent; color: var(--igls-text-dim); border: 1px solid var(--igls-border);
+          padding: 5px 9px; border-radius: 6px; cursor: pointer; font-size: 10px; font-weight: 600;
+        }
+
+        select.ig-ui-scale-select {
+          background: var(--igls-surface-2); color: var(--igls-text-dim); border: 1px solid var(--igls-border);
+          border-radius: 6px; font-size: 10px; padding: 4px 6px; cursor: pointer;
+        }
+      `;
+    }
+
+    updateStyles();
+    document.documentElement.appendChild(stylesheet);
+
+    function buildModularUI() {
+      if (document.getElementById('ig-modular-left-panel')) return;
+
+      const leftPanel = document.createElement('div');
+      leftPanel.id = 'ig-modular-left-panel';
+      leftPanel.innerHTML = `
+        <div id="ig-left-resizer"></div>
+        <div class="ig-panel-header">
+          <span class="ig-panel-title">Left</span>
+          <button class="ig-hide-btn" id="ig-hide-left-btn">Hide</button>
+        </div>
+        <div class="ig-panel-body" id="ig-left-menu-container"></div>
+      `;
+      document.body.appendChild(leftPanel);
+
+      const rightPanel = document.createElement('div');
+      rightPanel.id = 'ig-modular-right-panel';
+      rightPanel.innerHTML = `
+        <div id="ig-right-resizer"></div>
+        <div class="ig-panel-header">
+          <button class="ig-hide-btn" id="ig-hide-right-btn">Hide</button>
+          <span class="ig-panel-title">Right</span>
+          <select id="ig-ui-scale-select" class="ig-ui-scale-select">
+            <option value="80">80%</option>
+            <option value="90">90%</option>
+            <option value="100">100%</option>
+            <option value="110">110%</option>
+            <option value="120">120%</option>
+          </select>
+        </div>
+        <div class="ig-panel-body" id="ig-right-menu-container"></div>
+      `;
+      document.body.appendChild(rightPanel);
+
+      const leftTab = document.createElement('div');
+      leftTab.id = 'ig-left-toggle-tab';
+      leftTab.textContent = 'LEFT';
+      document.body.appendChild(leftTab);
+
+      const rightTab = document.createElement('div');
+      rightTab.id = 'ig-right-toggle-tab';
+      rightTab.textContent = 'RIGHT';
+      document.body.appendChild(rightTab);
+
+      document.getElementById('ig-hide-left-btn').addEventListener('click', () => { prefs.leftHidden = true; savePrefs(); });
+      leftTab.addEventListener('click', () => { prefs.leftHidden = false; savePrefs(); });
+      document.getElementById('ig-hide-right-btn').addEventListener('click', () => { prefs.rightHidden = true; savePrefs(); });
+      rightTab.addEventListener('click', () => { prefs.rightHidden = false; savePrefs(); });
+
+      const uiScaleSelect = document.getElementById('ig-ui-scale-select');
+      uiScaleSelect.value = prefs.uiScale;
+      uiScaleSelect.addEventListener('change', (e) => {
+        prefs.uiScale = parseInt(e.target.value);
+        savePrefs();
+      });
+
+      const leftResizer = document.getElementById('ig-left-resizer');
+      let isResizingLeft = false;
+      leftResizer.addEventListener('mousedown', () => { isResizingLeft = true; });
+
+      const rightResizer = document.getElementById('ig-right-resizer');
+      let isResizingRight = false;
+      rightResizer.addEventListener('mousedown', () => { isResizingRight = true; });
+
+      window.addEventListener('mousemove', (e) => {
+        if (isResizingLeft) { prefs.leftWidth = Math.min(500, Math.max(50, e.clientX)); updateStyles(); notifyChange(); }
+        if (isResizingRight) { prefs.rightWidth = Math.min(500, Math.max(180, window.innerWidth - e.clientX)); updateStyles(); notifyChange(); }
+      });
+
+      window.addEventListener('mouseup', () => {
+        if (isResizingLeft || isResizingRight) { isResizingLeft = isResizingRight = false; savePrefs(); notifyChange(); }
+      });
+
+      startWatcher();
+    }
+
+    function savePrefs() {
+      localStorage.setItem(PREF_KEY, JSON.stringify(prefs));
+      updateStyles();
+      notifyChange();
+    }
+
+    function notifyChange() {
+      core.emit('sidebar:layout-changed', {
+        leftWidth: prefs.leftHidden ? 0 : prefs.leftWidth,
+        rightWidth: prefs.rightHidden ? 0 : prefs.rightWidth,
+        leftHidden: prefs.leftHidden,
+        rightHidden: prefs.rightHidden
+      });
+    }
+
+    function startWatcher() {
+      setInterval(() => {
+        if (window.location.href.includes('/direct/')) document.body.classList.add('ig-modular-active');
+        else document.body.classList.remove('ig-modular-active');
+      }, 500);
+    }
+
+    if (document.body) buildModularUI();
+    else document.addEventListener('DOMContentLoaded', buildModularUI);
+
+    core.getSidebarPrefs = () => prefs;
+    core.emit('block:ready', { id: 'igDualSidebarUI' });
+  }
+});
+
+/* ============================================================
+   BLOCK: menuCollapseModule (v1)
+   ============================================================ */
+/* ============================================================
+   BLOCK: Menu Card Collapse Module (v1)
+   ============================================================ */
+/* ================================================================
+   BLOCK: Menu Card Collapse Module (Standalone Feature Plugin)
+   - Injects a small collapse button inside every menu header
+   - Toggles card visibility and saves states to localStorage
+   - Automatically detects cards added dynamically by other modules
+================================================================ */
+LegoCore.registerBlock({
+  id: 'menuCollapseModule',
+  init(core) {
+    const STORAGE_KEY = 'ig_menu_collapse_states_v1';
+    let collapsedStates = JSON.parse(localStorage.getItem(STORAGE_KEY)) || {};
+
+    function saveStates() {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(collapsedStates));
+    }
+
+    // Inject CSS for the toggle button and collapsed state
+    const style = document.createElement('style');
+    style.id = 'ig-menu-collapse-styles';
+    style.innerHTML = `
+      .ig-collapse-btn {
+        background: transparent;
+        border: none;
+        color: var(--igls-text-dim, #96949c);
+        cursor: pointer;
+        font-size: 13px;
+        font-weight: bold;
+        line-height: 1;
+        padding: 0 4px;
+        margin-left: 6px;
+        border-radius: 3px;
+        transition: color 0.2s, background 0.2s;
+      }
+      .ig-collapse-btn:hover {
+        color: var(--igls-accent, #c9a876);
+        background: rgba(255, 255, 255, 0.08);
+      }
+      .ig-draggable-menu.is-collapsed .ig-menu-content {
+        display: none !important;
+      }
+      .ig-draggable-menu.is-collapsed {
+        min-height: 0 !important;
+        height: auto !important;
+      }
+    `;
+    document.head.appendChild(style);
+
+    // Apply collapse logic to a target card
+    function processCard(card) {
+      const key = card.dataset.key;
+      const header = card.querySelector('.ig-menu-header');
+      if (!header || !key || header.querySelector('.ig-collapse-btn')) return;
+
+      const dragHandle = header.querySelector('.ig-drag-handle');
+
+      // Create toggle button
+      const btn = document.createElement('button');
+      btn.className = 'ig-collapse-btn';
+      btn.title = 'Collapse/Expand Menu';
+
+      const isCollapsed = !!collapsedStates[key];
+      if (isCollapsed) {
+        card.classList.add('is-collapsed');
+        btn.innerText = '+';
+      } else {
+        btn.innerText = '−';
+      }
+
+      // Prevent card drag handler when clicking the toggle button
+      btn.addEventListener('mousedown', (e) => e.stopPropagation());
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const currentlyCollapsed = card.classList.toggle('is-collapsed');
+        btn.innerText = currentlyCollapsed ? '+' : '−';
+        collapsedStates[key] = currentlyCollapsed;
+        saveStates();
+      });
+
+      // Insert button right before the drag handle
+      if (dragHandle) {
+        header.insertBefore(btn, dragHandle);
+      } else {
+        header.appendChild(btn);
+      }
+    }
+
+    // Attach to existing cards and observe dynamically mounted ones
+    function attachToContainer(containerId) {
+      const container = document.getElementById(containerId);
+      if (!container) return;
+
+      // Process initial cards
+      container.querySelectorAll('.ig-draggable-menu').forEach(processCard);
+
+      // Listen for newly added cards (e.g. registered later via core.registerMenu)
+      const observer = new MutationObserver(() => {
+        container.querySelectorAll('.ig-draggable-menu').forEach(processCard);
+      });
+      observer.observe(container, { childList: true, subtree: true });
+    }
+
+    function initWatcher(attempts) {
+      const left = document.getElementById('ig-left-menu-container');
+      const right = document.getElementById('ig-right-menu-container');
+
+      if (left && right) {
+        attachToContainer('ig-left-menu-container');
+        attachToContainer('ig-right-menu-container');
+      } else if (attempts > 0) {
+        setTimeout(() => initWatcher(attempts - 1), 200);
+      }
+    }
+
+    initWatcher(10);
+    console.log('[MenuCollapseModule] Initialized.');
+    core.emit('block:ready', { id: 'menuCollapseModule' });
+  }
+});
+
+/* ============================================================
+   BLOCK: Menu Panel Switcher Module (v1)
+   ============================================================ */
+/* ============================================================
+   BLOCK: Menu Panel Switcher Module (v1)
+   ============================================================ */
+/* ================================================================
+   BLOCK: Menu Panel Switcher (Standalone Feature Plugin)
+   - Adds a '⇄' button to every menu card header
+   - Moves cards between Left and Right sidebars with 1 click
+   - Persists sidebar assignments to localStorage
+================================================================ */
+LegoCore.registerBlock({
+  id: 'menuPanelSwitcherModule',
+  init(core) {
+    const STORAGE_KEY = 'ig_menu_panel_assignments_v1';
+    let panelAssignments = JSON.parse(localStorage.getItem(STORAGE_KEY)) || {};
+
+    function saveAssignments() {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(panelAssignments));
+    }
+
+    // Inject CSS for the swap button
+    const style = document.createElement('style');
+    style.id = 'ig-menu-switcher-styles';
+    style.innerHTML = `
+      .ig-switch-panel-btn {
+        background: transparent;
+        border: none;
+        color: var(--igls-text-dim, #96949c);
+        cursor: pointer;
+        font-size: 12px;
+        font-weight: bold;
+        line-height: 1;
+        padding: 2px 4px;
+        margin-left: 4px;
+        border-radius: 3px;
+        transition: color 0.2s, background 0.2s;
+      }
+      .ig-switch-panel-btn:hover {
+        color: var(--igls-accent, #c9a876);
+        background: rgba(255, 255, 255, 0.08);
+      }
+    `;
+    document.head.appendChild(style);
+
+    // Apply button and handle persistent positioning for a card
+    function processCard(card) {
+      const key = card.dataset.key;
+      const header = card.querySelector('.ig-menu-header');
+      if (!header || !key) return;
+
+      const leftContainer = document.getElementById('ig-left-menu-container');
+      const rightContainer = document.getElementById('ig-right-menu-container');
+      if (!leftContainer || !rightContainer) return;
+
+      // 1. Move card if its saved preference differs from its current parent
+      const savedSide = panelAssignments[key];
+      if (savedSide === 'left' && card.parentElement !== leftContainer) {
+        leftContainer.appendChild(card);
+      } else if (savedSide === 'right' && card.parentElement !== rightContainer) {
+        rightContainer.appendChild(card);
+      }
+
+      // Avoid adding duplicate buttons
+      if (header.querySelector('.ig-switch-panel-btn')) return;
+
+      // 2. Create the swap button
+      const btn = document.createElement('button');
+      btn.className = 'ig-switch-panel-btn';
+      btn.title = 'Switch Panel (Left <-> Right)';
+      btn.innerText = '⇄';
+
+      // Prevent triggering drag reordering on click/mousedown
+      btn.addEventListener('mousedown', (e) => e.stopPropagation());
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+
+        const currentContainer = card.parentElement;
+        const isCurrentlyLeft = currentContainer.id === 'ig-left-menu-container';
+        const targetContainer = isCurrentlyLeft ? rightContainer : leftContainer;
+
+        // Move DOM element
+        targetContainer.appendChild(card);
+
+        // Save preference ('left' or 'right')
+        panelAssignments[key] = isCurrentlyLeft ? 'right' : 'left';
+        saveAssignments();
+      });
+
+      // Insert button right before the collapse button or drag handle
+      const collapseBtn = header.querySelector('.ig-collapse-btn');
+      const dragHandle = header.querySelector('.ig-drag-handle');
+
+      if (collapseBtn) {
+        header.insertBefore(btn, collapseBtn);
+      } else if (dragHandle) {
+        header.insertBefore(btn, dragHandle);
+      } else {
+        header.appendChild(btn);
+      }
+    }
+
+    // Attach to containers and watch for new cards
+    function attachToContainer(containerId) {
+      const container = document.getElementById(containerId);
+      if (!container) return;
+
+      container.querySelectorAll('.ig-draggable-menu').forEach(processCard);
+
+      const observer = new MutationObserver(() => {
+        container.querySelectorAll('.ig-draggable-menu').forEach(processCard);
+      });
+      observer.observe(container, { childList: true, subtree: true });
+    }
+
+    function initWatcher(attempts) {
+      const left = document.getElementById('ig-left-menu-container');
+      const right = document.getElementById('ig-right-menu-container');
+
+      if (left && right) {
+        attachToContainer('ig-left-menu-container');
+        attachToContainer('ig-right-menu-container');
+      } else if (attempts > 0) {
+        setTimeout(() => initWatcher(attempts - 1), 200);
+      }
+    }
+
+    initWatcher(10);
+    console.log('[MenuPanelSwitcherModule] Switcher enabled.');
+    core.emit('block:ready', { id: 'menuPanelSwitcherModule' });
+  }
+});
+
+/* ============================================================
+   BLOCK: Menu Card Pop-out Module (v4)
+   ============================================================ */
+/* ============================================================
+   BLOCK: Menu Card Pop-out Module (v4) — Corner resize (width +
+   height together) from the bottom-right corner, and height-only
+   resize from the bottom edge, plus the existing width-only side
+   edges. All driven by custom JS now (not the native CSS `resize`
+   handle), so nothing fights over who controls the height.
+   ============================================================ */
+LegoCore.registerBlock({
+  id: 'menuInPagePopoutModule',
+  init(core) {
+    const STORAGE_KEY = 'ig_menu_inpage_popouts_v1';
+    let popoutStates = {};
+
+    try {
+      popoutStates = JSON.parse(localStorage.getItem(STORAGE_KEY)) || {};
+    } catch (e) {
+      popoutStates = {};
+    }
+
+    function saveStates() {
+      try {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(popoutStates));
+      } catch (e) {}
+    }
+
+    // Inject CSS for popout button and floating window chrome
+    const style = document.createElement('style');
+    style.id = 'ig-inpage-popout-styles';
+    style.innerHTML = `
+      .ig-popout-btn {
+        background: transparent;
+        border: none;
+        color: var(--igls-text-dim, #96949c);
+        cursor: pointer;
+        font-size: 11px;
+        font-weight: bold;
+        line-height: 1;
+        padding: 2px 4px;
+        margin-left: 4px;
+        border-radius: 3px;
+        transition: color 0.2s, background 0.2s;
+      }
+      .ig-popout-btn:hover {
+        color: var(--igls-accent, #c9a876);
+        background: rgba(255, 255, 255, 0.08);
+      }
+
+      .ig-draggable-menu.is-popped-out {
+        display: none !important;
+      }
+
+      .ig-floating-modal {
+        position: fixed;
+        z-index: 2147483647;
+        background: var(--igls-surface, #17171d);
+        border: 1px solid var(--igls-border-strong, rgba(255,255,255,0.2));
+        border-radius: 12px;
+        box-shadow: 0 16px 40px rgba(0,0,0,0.6);
+        display: flex;
+        flex-direction: column;
+        min-width: 220px;
+        max-width: 95vw;
+        min-height: 150px;
+        max-height: 95vh;
+        overflow: hidden;
+      }
+
+      .ig-floating-modal .ig-menu-header {
+        background: var(--igls-bg, #131318);
+        border-bottom: 1px solid var(--igls-border, rgba(255,255,255,0.07));
+        padding: 10px 12px;
+        cursor: grab;
+        flex-shrink: 0;
+      }
+
+      .ig-floating-modal .ig-menu-header:active {
+        cursor: grabbing;
+      }
+
+      .ig-floating-modal .ig-menu-content {
+        padding: 12px;
+        overflow: auto;
+        flex: 1;
+        min-height: 0;
+        min-width: 0;
+        resize: none;
+      }
+
+      /* Width-only resize handles on the left and right edges */
+      .ig-floating-resizer {
+        position: absolute;
+        top: 0;
+        width: 6px;
+        height: 100%;
+        cursor: ew-resize;
+        z-index: 2;
+      }
+      .ig-floating-resizer.left { left: 0; }
+      .ig-floating-resizer.right { right: 0; }
+      .ig-floating-resizer:hover, .ig-floating-resizer.active {
+        background: rgba(201, 168, 118, 0.3);
+      }
+
+      /* Height-only resize strip along the bottom edge */
+      .ig-floating-resizer-bottom {
+        position: absolute;
+        left: 0;
+        bottom: 0;
+        width: 100%;
+        height: 6px;
+        cursor: ns-resize;
+        z-index: 2;
+      }
+      .ig-floating-resizer-bottom:hover, .ig-floating-resizer-bottom.active {
+        background: rgba(201, 168, 118, 0.3);
+      }
+
+      /* Corner handle: resizes width + height together */
+      .ig-floating-resizer-corner {
+        position: absolute;
+        right: 0;
+        bottom: 0;
+        width: 14px;
+        height: 14px;
+        cursor: nwse-resize;
+        z-index: 3;
+      }
+      .ig-floating-resizer-corner::after {
+        content: '';
+        position: absolute;
+        right: 3px;
+        bottom: 3px;
+        width: 7px;
+        height: 7px;
+        background: linear-gradient(135deg, transparent 50%, rgba(255,255,255,0.35) 50%);
+        border-radius: 1px;
+      }
+      .ig-floating-resizer-corner:hover::after, .ig-floating-resizer-corner.active::after {
+        background: linear-gradient(135deg, transparent 50%, var(--igls-accent, #c9a876) 50%);
+      }
+    `;
+    document.head.appendChild(style);
+
+    function createFloatingWindow(card) {
+      const key = card.dataset.key;
+      if (document.getElementById('ig-float-modal-' + key)) return;
+
+      const savedPos = popoutStates[key] || { top: 100, left: 200 };
+      const savedWidth = savedPos.width || 300;
+      const savedHeight = savedPos.height || null;
+
+      const modal = document.createElement('div');
+      modal.className = 'ig-floating-modal';
+      modal.id = 'ig-float-modal-' + key;
+      modal.style.top = savedPos.top + 'px';
+      modal.style.left = savedPos.left + 'px';
+      modal.style.width = savedWidth + 'px';
+      if (savedHeight) modal.style.height = savedHeight + 'px';
+      modal.style.position = 'fixed';
+
+      const header = card.querySelector('.ig-menu-header').cloneNode(true);
+      const content = card.querySelector('.ig-menu-content');
+
+      // Replace popout button on floating header with dock-back button
+      const popBtn = header.querySelector('.ig-popout-btn');
+      if (popBtn) {
+        popBtn.innerText = '📥';
+        popBtn.title = 'Dock back to sidebar';
+        popBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          dockBack(card, key);
+        });
+      }
+
+      // Hide side panel control buttons on float header
+      const switchBtn = header.querySelector('.ig-switch-panel-btn');
+      if (switchBtn) switchBtn.style.display = 'none';
+
+      modal.appendChild(header);
+
+      // Move actual DOM content to modal to preserve active listeners/references
+      modal.appendChild(content);
+
+      // Resize handles: left/right = width only, bottom = height only,
+      // corner = width + height together
+      const leftResizer = document.createElement('div');
+      leftResizer.className = 'ig-floating-resizer left';
+      const rightResizer = document.createElement('div');
+      rightResizer.className = 'ig-floating-resizer right';
+      const bottomResizer = document.createElement('div');
+      bottomResizer.className = 'ig-floating-resizer-bottom';
+      const cornerResizer = document.createElement('div');
+      cornerResizer.className = 'ig-floating-resizer-corner';
+      modal.appendChild(leftResizer);
+      modal.appendChild(rightResizer);
+      modal.appendChild(bottomResizer);
+      modal.appendChild(cornerResizer);
+
+      document.body.appendChild(modal);
+
+      card.classList.add('is-popped-out');
+
+      // Make modal draggable across the page
+      makeModalDraggable(modal, header, key);
+
+      // Make modal resizable: sides = width only, bottom = height only,
+      // corner = both at once
+      makeModalResizable(modal, leftResizer, rightResizer, bottomResizer, cornerResizer, key);
+    }
+
+    function dockBack(card, key) {
+      const modal = document.getElementById('ig-float-modal-' + key);
+      if (!modal) return;
+
+      const content = modal.querySelector('.ig-menu-content');
+      if (content) {
+        card.appendChild(content);
+      }
+
+      modal.remove();
+      card.classList.remove('is-popped-out');
+
+      delete popoutStates[key];
+      saveStates();
+    }
+
+    function makeModalDraggable(modal, header, key) {
+      let isDragging = false;
+      let startX, startY, initLeft, initTop;
+
+      header.addEventListener('mousedown', (e) => {
+        if (e.button !== 0 || e.target.tagName === 'BUTTON') return;
+        isDragging = true;
+        startX = e.clientX;
+        startY = e.clientY;
+        initLeft = modal.offsetLeft;
+        initTop = modal.offsetTop;
+
+        document.addEventListener('mousemove', onMouseMove);
+        document.addEventListener('mouseup', onMouseUp);
+        e.preventDefault();
+      });
+
+      function onMouseMove(e) {
+        if (!isDragging) return;
+        const newLeft = initLeft + (e.clientX - startX);
+        const newTop = initTop + (e.clientY - startY);
+        modal.style.left = newLeft + 'px';
+        modal.style.top = newTop + 'px';
+      }
+
+      function onMouseUp() {
+        if (!isDragging) return;
+        isDragging = false;
+        document.removeEventListener('mousemove', onMouseMove);
+        document.removeEventListener('mouseup', onMouseUp);
+
+        const key2 = key;
+        popoutStates[key2] = Object.assign({}, popoutStates[key2], {
+          top: modal.offsetTop,
+          left: modal.offsetLeft
+        });
+        saveStates();
+      }
+    }
+
+    function makeModalResizable(modal, leftResizer, rightResizer, bottomResizer, cornerResizer, key) {
+      const MIN_WIDTH = 220;
+      const MIN_HEIGHT = 150;
+
+      function startResize(mode) {
+        return function (e) {
+          if (e.button !== 0) return;
+          e.preventDefault();
+          e.stopPropagation();
+
+          const startX = e.clientX;
+          const startY = e.clientY;
+          const startWidth = modal.offsetWidth;
+          const startHeight = modal.offsetHeight;
+          const startLeft = modal.offsetLeft;
+
+          const resizerEl = mode === 'left' ? leftResizer
+            : mode === 'right' ? rightResizer
+            : mode === 'bottom' ? bottomResizer
+            : cornerResizer;
+          resizerEl.classList.add('active');
+
+          function onMove(ev) {
+            const dx = ev.clientX - startX;
+            const dy = ev.clientY - startY;
+
+            // Width: right edge and corner grow rightward; left edge grows
+            // leftward (and shifts the modal's left position to compensate).
+            if (mode === 'right' || mode === 'corner') {
+              const newWidth = Math.max(MIN_WIDTH, startWidth + dx);
+              modal.style.width = newWidth + 'px';
+            } else if (mode === 'left') {
+              const newWidth = Math.max(MIN_WIDTH, startWidth - dx);
+              const widthDelta = newWidth - startWidth;
+              modal.style.width = newWidth + 'px';
+              modal.style.left = (startLeft - widthDelta) + 'px';
+            }
+
+            // Height: bottom edge and corner both grow downward.
+            if (mode === 'bottom' || mode === 'corner') {
+              const newHeight = Math.max(MIN_HEIGHT, startHeight + dy);
+              modal.style.height = newHeight + 'px';
+            }
+          }
+
+          function onUp() {
+            document.removeEventListener('mousemove', onMove);
+            document.removeEventListener('mouseup', onUp);
+            resizerEl.classList.remove('active');
+
+            popoutStates[key] = Object.assign({}, popoutStates[key], {
+              top: modal.offsetTop,
+              left: modal.offsetLeft,
+              width: modal.offsetWidth,
+              height: modal.offsetHeight
+            });
+            saveStates();
+          }
+
+          document.addEventListener('mousemove', onMove);
+          document.addEventListener('mouseup', onUp);
+        };
+      }
+
+      leftResizer.addEventListener('mousedown', startResize('left'));
+      rightResizer.addEventListener('mousedown', startResize('right'));
+      bottomResizer.addEventListener('mousedown', startResize('bottom'));
+      cornerResizer.addEventListener('mousedown', startResize('corner'));
+    }
+
+    function processCard(card) {
+      if (!card || !card.dataset) return;
+      const key = card.dataset.key;
+      const header = card.querySelector('.ig-menu-header');
+      if (!header || !key || header.querySelector('.ig-popout-btn')) return;
+
+      const btn = document.createElement('button');
+      btn.className = 'ig-popout-btn';
+      btn.title = 'Pop out as floating window';
+      btn.innerText = '⧉';
+
+      btn.addEventListener('mousedown', (e) => e.stopPropagation());
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        createFloatingWindow(card);
+        popoutStates[key] = popoutStates[key] || { top: 120, left: 220, width: 300 };
+        saveStates();
+      });
+
+      // Insert button in header
+      const switchBtn = header.querySelector('.ig-switch-panel-btn');
+      const collapseBtn = header.querySelector('.ig-collapse-btn');
+      const dragHandle = header.querySelector('.ig-drag-handle');
+
+      if (switchBtn) {
+        header.insertBefore(btn, switchBtn);
+      } else if (collapseBtn) {
+        header.insertBefore(btn, collapseBtn);
+      } else if (dragHandle) {
+        header.insertBefore(btn, dragHandle);
+      } else {
+        header.appendChild(btn);
+      }
+
+      // If previously saved as popped-out, restore floating state on page load
+      if (popoutStates[key]) {
+        setTimeout(() => createFloatingWindow(card), 100);
+      }
+    }
+
+    function attachToContainer(containerId) {
+      const container = document.getElementById(containerId);
+      if (!container) return;
+
+      container.querySelectorAll('.ig-draggable-menu').forEach(processCard);
+
+      const observer = new MutationObserver(() => {
+        container.querySelectorAll('.ig-draggable-menu').forEach(processCard);
+      });
+      observer.observe(container, { childList: true, subtree: true });
+    }
+
+    function initWatcher(attempts) {
+      const left = document.getElementById('ig-left-menu-container');
+      const right = document.getElementById('ig-right-menu-container');
+
+      if (left && right) {
+        attachToContainer('ig-left-menu-container');
+        attachToContainer('ig-right-menu-container');
+      } else if (attempts > 0) {
+        setTimeout(() => initWatcher(attempts - 1), 200);
+      }
+    }
+
+    initWatcher(10);
+    console.log('[MenuInPagePopoutModule] Floating in-page windows enabled (horizontally resizable).');
+    core.emit('block:ready', { id: 'menuInPagePopoutModule' });
+  }
+});
+
+/* ============================================================
+   BLOCK: Header Toolbar Organizer Module (v1)
+   ============================================================ */
+/* ============================================================
+   BLOCK: Header Toolbar Organizer Module (v2 - No Move Handle)
+   ============================================================ */
+/* ================================================================
+   BLOCK: Header Toolbar Organizer (Standalone Feature Plugin)
+   - Removes the redundant move/drag handle icon
+   - Groups remaining action buttons (Pop-out, Switch, Collapse)
+     into a clean, unified toolbar pill
+   - Retains full drag-reorder functionality on the header area
+================================================================ */
+LegoCore.registerBlock({
+  id: 'headerToolbarOrganizerModule',
+  init(core) {
+    // Inject CSS to restyle buttons and hide old drag icons
+    const style = document.createElement('style');
+    style.id = 'ig-header-toolbar-styles';
+    style.innerHTML = `
+      /* Hide standalone move/drag handle icons across all menus */
+      .ig-drag-handle {
+        display: none !important;
+      }
+
+      /* Unified Header Toolbar Container */
+      .ig-card-toolbar {
+        display: flex;
+        align-items: center;
+        gap: 2px;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid var(--igls-border, rgba(255, 255, 255, 0.08));
+        border-radius: 6px;
+        padding: 2px;
+        margin-left: auto;
+      }
+
+      /* Base Style for All Action Buttons inside Toolbar */
+      .ig-card-toolbar button,
+      .ig-card-toolbar .ig-popout-btn,
+      .ig-card-toolbar .ig-switch-panel-btn,
+      .ig-card-toolbar .ig-collapse-btn {
+        background: transparent !important;
+        border: none !important;
+        color: var(--igls-text-dim, #96949c) !important;
+        cursor: pointer !important;
+        font-size: 11px !important;
+        line-height: 1 !important;
+        padding: 4px 6px !important;
+        margin: 0 !important;
+        border-radius: 4px !important;
+        display: inline-flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        transition: color 0.15s, background 0.15s !important;
+      }
+
+      .ig-card-toolbar button:hover,
+      .ig-card-toolbar .ig-popout-btn:hover,
+      .ig-card-toolbar .ig-switch-panel-btn:hover,
+      .ig-card-toolbar .ig-collapse-btn:hover {
+        color: var(--igls-accent, #c9a876) !important;
+        background: rgba(255, 255, 255, 0.1) !important;
+      }
+    `;
+    document.head.appendChild(style);
+
+    function organizeCardHeader(card) {
+      const header = card.querySelector('.ig-menu-header');
+      if (!header) return;
+
+      // 1. Remove/hide existing move handles
+      const dragHandle = header.querySelector('.ig-drag-handle');
+      if (dragHandle) {
+        dragHandle.remove();
+      }
+
+      // 2. Check or create toolbar container
+      let toolbar = header.querySelector('.ig-card-toolbar');
+      if (!toolbar) {
+        toolbar = document.createElement('div');
+        toolbar.className = 'ig-card-toolbar';
+        header.appendChild(toolbar);
+      }
+
+      // 3. Collect action buttons
+      const popBtn = header.querySelector('.ig-popout-btn');
+      const switchBtn = header.querySelector('.ig-switch-panel-btn');
+      const collapseBtn = header.querySelector('.ig-collapse-btn');
+
+      // 4. Move controls into the toolbar pill
+      if (popBtn && popBtn.parentElement !== toolbar) toolbar.appendChild(popBtn);
+      if (switchBtn && switchBtn.parentElement !== toolbar) toolbar.appendChild(switchBtn);
+      if (collapseBtn && collapseBtn.parentElement !== toolbar) toolbar.appendChild(collapseBtn);
+    }
+
+    function attachToContainer(containerId) {
+      const container = document.getElementById(containerId);
+      if (!container) return;
+
+      container.querySelectorAll('.ig-draggable-menu').forEach(organizeCardHeader);
+
+      const observer = new MutationObserver(() => {
+        container.querySelectorAll('.ig-draggable-menu').forEach(organizeCardHeader);
+      });
+      observer.observe(container, { childList: true, subtree: true });
+    }
+
+    function initWatcher(attempts) {
+      const left = document.getElementById('ig-left-menu-container');
+      const right = document.getElementById('ig-right-menu-container');
+
+      if (left && right) {
+        attachToContainer('ig-left-menu-container');
+        attachToContainer('ig-right-menu-container');
+      } else if (attempts > 0) {
+        setTimeout(() => initWatcher(attempts - 1), 200);
+      }
+    }
+
+    initWatcher(10);
+    console.log('[HeaderToolbarOrganizerModule] Move button removed & controls organized.');
+    core.emit('block:ready', { id: 'headerToolbarOrganizerModule' });
+  }
+});
+
+/* ============================================================
+   BLOCK: Workspace Profile & Visibility Manager (v2)
+   ============================================================ */
+/* ============================================================
+   BLOCK: Workspace Profile & Visibility Manager (With Plugin Dock)
+   ============================================================ */
+LegoCore.registerBlock({
+  id: 'profileManagerModule',
+  init(core) {
+    const STORAGE_KEY = 'ig_workspace_profiles_v1';
+    const POS_STORAGE_KEY = 'ig_workspace_profile_window_pos_v1';
+
+    let profileData = {
+      activeProfile: 'Default',
+      profiles: {
+        'Default': {}, 
+        'Quick Message Only': { 'audio-quick': true, 'audio-rec': false, 'audio-lib': false, 'command-center-launcher': false },
+        'Studio Workstation': { 'audio-quick': false, 'audio-rec': true, 'audio-lib': true, 'command-center-launcher': true },
+        'Library Focus': { 'audio-quick': false, 'audio-rec': false, 'audio-lib': true, 'command-center-launcher': true }
+      },
+      hiddenCards: {} 
+    };
+
+    let windowPos = { top: 60, left: 90 }; 
+
+    try {
+      const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
+      if (saved) profileData = Object.assign(profileData, saved);
+
+      const savedPos = JSON.parse(localStorage.getItem(POS_STORAGE_KEY));
+      if (savedPos && typeof savedPos.top === 'number' && typeof savedPos.left === 'number') {
+        windowPos = savedPos;
+      }
+    } catch (e) {}
+
+    function saveProfiles() {
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(profileData)); } catch (e) {}
+    }
+
+    function saveWindowPosition(top, left) {
+      windowPos = { top, left };
+      try { localStorage.setItem(POS_STORAGE_KEY, JSON.stringify(windowPos)); } catch (e) {}
+    }
+
+    const style = document.createElement('style');
+    style.id = 'ig-profile-manager-styles';
+    style.innerHTML = `
+      .ig-profile-btn {
+        background: var(--igls-surface-2, #1c1c23); color: var(--igls-accent, #c9a876);
+        border: 1px solid var(--igls-border-strong, rgba(255,255,255,0.14));
+        padding: 3px 8px; border-radius: 6px; font-size: 10px; font-weight: 600;
+        cursor: pointer; transition: filter 0.2s, border-color 0.2s; margin-left: auto;
+      }
+      .ig-profile-btn:hover { filter: brightness(1.2); border-color: var(--igls-accent, #c9a876); }
+      .ig-draggable-menu.is-profile-hidden { display: none !important; }
+      .ig-profile-floating-window {
+        position: fixed; width: 320px; z-index: 2147483647; background: var(--igls-surface, #17171d);
+        border: 1px solid var(--igls-border-strong, rgba(255,255,255,0.2)); border-radius: 10px;
+        padding: 12px; color: var(--igls-text, #ece9e4); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.7); display: flex; flex-direction: column; gap: 10px;
+      }
+      .ig-profile-floating-header {
+        display: flex; justify-content: space-between; align-items: center; font-size: 12px;
+        font-weight: bold; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 6px; cursor: grab; user-select: none;
+      }
+      .ig-profile-floating-header:active { cursor: grabbing; }
+      .ig-profile-section { display: flex; flex-direction: column; gap: 6px; }
+      .ig-profile-section-title { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--igls-text-dim, #96949c); }
+      .ig-profile-select-row { display: flex; gap: 4px; align-items: center; }
+      .ig-profile-select-row select { flex: 1; background: #111; color: #fff; border: 1px solid #333; border-radius: 5px; padding: 4px; font-size: 11px; }
+      .ig-profile-action-btn { background: var(--igls-surface-2, #1c1c23); color: var(--igls-text, #fff); border: 1px solid #333; border-radius: 5px; padding: 4px 6px; font-size: 10px; font-weight: 600; cursor: pointer; white-space: nowrap; }
+      .ig-profile-action-btn:hover { background: rgba(255,255,255,0.1); }
+      .ig-profile-action-btn--danger { color: #f43f5e; border-color: rgba(244, 63, 94, 0.3); }
+      .ig-profile-action-btn--danger:hover { background: rgba(244, 63, 94, 0.15); }
+      .ig-card-toggle-list { display: flex; flex-direction: column; gap: 4px; max-height: 160px; overflow-y: auto; background: rgba(0,0,0,0.25); padding: 6px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.05); }
+      .ig-card-toggle-item { display: flex; align-items: center; font-size: 11px; padding: 2px 4px; border-radius: 3px; }
+      .ig-card-toggle-item:hover { background: rgba(255,255,255,0.05); }
+      .ig-card-toggle-item label { display: flex; align-items: center; gap: 6px; cursor: pointer; flex: 1; }
+    `;
+    document.head.appendChild(style);
+
+    function applyVisibility() {
+      const allCards = document.querySelectorAll('.ig-draggable-menu');
+      allCards.forEach(card => {
+        const key = card.dataset.key;
+        if (!key) return;
+        card.classList.toggle('is-profile-hidden', !!profileData.hiddenCards[key]);
+      });
+    }
+
+    function openProfileWindow() {
+      const existing = document.getElementById('ig-profile-floating-window');
+      if (existing) { existing.remove(); return; }
+
+      const win = document.createElement('div');
+      win.id = 'ig-profile-floating-window';
+      win.className = 'ig-profile-floating-window';
+      win.style.top = windowPos.top + 'px';
+      win.style.left = windowPos.left + 'px';
+
+      const header = document.createElement('div');
+      header.className = 'ig-profile-floating-header';
+      header.innerHTML = '<span>⚙️ Workspace Profiles</span>';
+
+      const closeBtn = document.createElement('button');
+      closeBtn.innerText = '✕';
+      closeBtn.style.cssText = 'background:none; border:none; color:#999; cursor:pointer; font-size:12px;';
+      closeBtn.onclick = () => win.remove();
+      header.appendChild(closeBtn);
+
+      const secProfiles = document.createElement('div');
+      secProfiles.className = 'ig-profile-section';
+      secProfiles.innerHTML = '<span class="ig-profile-section-title">Active Profile</span>';
+
+      const rowSelect = document.createElement('div');
+      rowSelect.className = 'ig-profile-select-row';
+
+      const select = document.createElement('select');
+      Object.keys(profileData.profiles).forEach(pName => {
+        const opt = document.createElement('option');
+        opt.value = pName; opt.innerText = pName;
+        if (pName === profileData.activeProfile) opt.selected = true;
+        select.appendChild(opt);
+      });
+
+      const newBtn = document.createElement('button');
+      newBtn.className = 'ig-profile-action-btn'; newBtn.innerText = '➕ New';
+
+      const delBtn = document.createElement('button');
+      delBtn.className = 'ig-profile-action-btn ig-profile-action-btn--danger'; delBtn.innerText = '🗑️';
+
+      if (profileData.activeProfile === 'Default') {
+        delBtn.disabled = true; delBtn.style.opacity = '0.3'; delBtn.style.cursor = 'not-allowed';
+      }
+
+      rowSelect.appendChild(select); rowSelect.appendChild(newBtn); rowSelect.appendChild(delBtn);
+      secProfiles.appendChild(rowSelect);
+
+      const secToggles = document.createElement('div');
+      secToggles.className = 'ig-profile-section';
+      secToggles.innerHTML = '<span class="ig-profile-section-title">Visible Modules</span>';
+
+      const toggleList = document.createElement('div');
+      toggleList.className = 'ig-card-toggle-list';
+
+      const allCards = Array.from(document.querySelectorAll('.ig-draggable-menu'));
+      allCards.forEach(card => {
+        const key = card.dataset.key;
+        if (!key) return;
+        const titleSpan = card.querySelector('.ig-menu-header span');
+        const title = titleSpan ? titleSpan.innerText.trim() : key;
+
+        const item = document.createElement('div');
+        item.className = 'ig-card-toggle-item';
+
+        const label = document.createElement('label');
+        const chk = document.createElement('input');
+        chk.type = 'checkbox';
+        chk.checked = !profileData.hiddenCards[key];
+
+        chk.onchange = () => {
+          profileData.hiddenCards[key] = !chk.checked;
+          applyVisibility(); saveProfiles();
+        };
+
+        label.appendChild(chk); label.appendChild(document.createTextNode(' ' + title));
+        item.appendChild(label); toggleList.appendChild(item);
+      });
+
+      secToggles.appendChild(toggleList);
+
+      select.onchange = () => {
+        const chosen = select.value;
+        profileData.activeProfile = chosen;
+        const presetRules = profileData.profiles[chosen] || {};
+        Object.keys(presetRules).forEach(key => profileData.hiddenCards[key] = !presetRules[key]);
+        applyVisibility(); saveProfiles(); win.remove(); openProfileWindow();
+      };
+
+      newBtn.onclick = () => {
+        const name = prompt('Enter a name for your new workspace profile:');
+        if (!name || !name.trim()) return;
+        const newName = name.trim();
+        const currentRules = {};
+        allCards.forEach(card => {
+          if (card.dataset.key) currentRules[card.dataset.key] = !profileData.hiddenCards[card.dataset.key];
+        });
+        profileData.profiles[newName] = currentRules;
+        profileData.activeProfile = newName;
+        saveProfiles(); win.remove(); openProfileWindow();
+      };
+
+      delBtn.onclick = () => {
+        const current = profileData.activeProfile;
+        if (current === 'Default') return;
+        if (confirm(`Are you sure you want to delete profile "${current}"?`)) {
+          delete profileData.profiles[current];
+          profileData.activeProfile = 'Default';
+          profileData.hiddenCards = {}; 
+          applyVisibility(); saveProfiles(); win.remove(); openProfileWindow();
+        }
+      };
+
+      win.appendChild(header);
+      win.appendChild(secProfiles);
+      win.appendChild(secToggles);
+
+      // Extension Container for other plugins to dock into
+      const extContainer = document.createElement('div');
+      extContainer.id = 'ig-profile-extensions-container';
+      extContainer.style.cssText = 'display:flex; flex-direction:column; gap:10px; margin-top:5px; border-top:1px solid rgba(255,255,255,0.1); padding-top:10px;';
+      win.appendChild(extContainer);
+
+      document.body.appendChild(win);
+      makeDraggable(win, header);
+
+      // Emit event so other modules know the window is open and can dock UI into extContainer
+      core.emit('profile-window:opened', { container: extContainer });
+    }
+
+    function makeDraggable(element, handle) {
+      let isDragging = false, startX, startY, initLeft, initTop;
+      handle.addEventListener('mousedown', (e) => {
+        if (e.button !== 0 || e.target.tagName === 'BUTTON') return;
+        isDragging = true; startX = e.clientX; startY = e.clientY;
+        initLeft = element.offsetLeft; initTop = element.offsetTop;
+        document.addEventListener('mousemove', onMouseMove);
+        document.addEventListener('mouseup', onMouseUp);
+        e.preventDefault();
+      });
+      function onMouseMove(e) {
+        if (!isDragging) return;
+        element.style.left = (initLeft + (e.clientX - startX)) + 'px';
+        element.style.top = (initTop + (e.clientY - startY)) + 'px';
+      }
+      function onMouseUp() {
+        if (!isDragging) return;
+        isDragging = false;
+        document.removeEventListener('mousemove', onMouseMove);
+        document.removeEventListener('mouseup', onMouseUp);
+        saveWindowPosition(element.offsetTop, element.offsetLeft);
+      }
+    }
+
+    function injectHeaderButtons() {
+      const targets = [document.getElementById('ig-modular-left-panel'), document.getElementById('ig-modular-right-panel')];
+      targets.forEach(panel => {
+        if (!panel) return;
+        const pHeader = panel.querySelector('.ig-panel-header');
+        if (!pHeader || pHeader.querySelector('.ig-profile-btn')) return;
+        const btn = document.createElement('button');
+        btn.className = 'ig-profile-btn'; btn.innerText = '⚙️ Profiles';
+        btn.onclick = (e) => { e.stopPropagation(); openProfileWindow(); };
+        const hideBtn = pHeader.querySelector('.ig-hide-btn');
+        if (hideBtn) pHeader.insertBefore(btn, hideBtn); else pHeader.appendChild(btn);
+      });
+    }
+
+    function initWatcher(attempts) {
+      const left = document.getElementById('ig-left-menu-container');
+      const right = document.getElementById('ig-right-menu-container');
+      if (left && right) {
+        injectHeaderButtons(); applyVisibility();
+        const observer = new MutationObserver(() => { injectHeaderButtons(); applyVisibility(); });
+        observer.observe(left, { childList: true, subtree: true });
+        observer.observe(right, { childList: true, subtree: true });
+      } else if (attempts > 0) setTimeout(() => initWatcher(attempts - 1), 200);
+    }
+
+    initWatcher(10);
+    core.emit('block:ready', { id: 'profileManagerModule' });
+  }
+});
+
+/* ============================================================
+   BLOCK: Instagram Resizer Feature (v3)
+   ============================================================ */
+/* ============================================================
+   BLOCK: Instagram Resizer Feature (Profile Window UI + Precision Controls)
+   ============================================================ */
+LegoCore.registerBlock({
+  id: 'igPageResizerFeature',
+  init(core) {
+    const STATE_KEY = 'ig_page_resizer_state_v2';
+    
+    let resizerState = JSON.parse(localStorage.getItem(STATE_KEY)) || {
+      enabled: false, editing: false, leftWidth: 156, rightWidth: 248, leftOffset: null, rightOffset: null 
+    };
+
+    function saveState() {
+      localStorage.setItem(STATE_KEY, JSON.stringify(resizerState));
+    }
+
+    function recalculateOffsets() {
+      const leftPanel = document.getElementById('ig-modular-left-panel');
+      const rightPanel = document.getElementById('ig-modular-right-panel');
+      let sidebarL = 0; let sidebarR = 0;
+
+      if (leftPanel) {
+        const leftHidden = leftPanel.style.left && leftPanel.style.left.startsWith('-');
+        sidebarL = leftHidden ? 0 : leftPanel.offsetWidth;
+      }
+      if (rightPanel) {
+        const rightHidden = rightPanel.style.right && rightPanel.style.right.startsWith('-');
+        sidebarR = rightHidden ? 0 : rightPanel.offsetWidth;
+      }
+
+      resizerState.leftOffset = resizerState.leftWidth - sidebarL;
+      resizerState.rightOffset = resizerState.rightWidth - sidebarR;
+      saveState();
+    }
+
+    const style = document.createElement('style');
+    style.id = 'ig-page-resizer-feature-styles';
+    style.innerHTML = `
+      .ig-resizer-status { font-size: 11px; color: var(--igls-text-dim, #96949c); }
+      .ig-resizer-status.is-on { color: #10b981; font-weight: bold; }
+      .ig-resizer-status.is-off { color: #f43f5e; font-weight: bold; }
+      .ig-interactive-handle {
+        position: fixed; top: 0; width: 12px; height: 100vh; z-index: 2147483646;
+        cursor: ew-resize; background: rgba(201, 168, 118, 0.15);
+        border: 1px dashed var(--igls-accent, #c9a876); display: none;
+      }
+      .ig-interactive-handle.is-visible { display: block; }
+      #ig-interactive-left-handle { left: ${resizerState.leftWidth - 6}px; }
+      #ig-interactive-right-handle { right: ${resizerState.rightWidth - 6}px; }
+      .ig-resizer-btn-row { display: flex; gap: 6px; }
+      .ig-resizer-code-btn {
+        background: var(--igls-surface-2, #1c1c23); color: var(--igls-text, #ece9e4);
+        border: 1px solid var(--igls-border-strong, rgba(255,255,255,0.14));
+        border-radius: 6px; padding: 5px 8px; font-size: 10px; font-weight: 600; cursor: pointer;
+        transition: background 0.15s, border-color 0.15s; flex: 1;
+      }
+      .ig-resizer-code-btn:hover { background: rgba(255,255,255,0.1); border-color: var(--igls-accent, #c9a876); }
+      
+      /* Precision Controls UI */
+      .ig-prec-container {
+        font-size: 10px; color: var(--igls-text-dim, #96949c);
+        display: flex; justify-content: space-between; align-items: center;
+        background: rgba(0,0,0,0.25); padding: 8px; border-radius: 6px;
+        border: 1px solid rgba(255,255,255,0.05);
+      }
+      .ig-prec-btn {
+        background: var(--igls-surface-2, #1c1c23); color: var(--igls-text, #ece9e4);
+        border: 1px solid var(--igls-border-strong, rgba(255,255,255,0.14));
+        border-radius: 4px; width: 22px; height: 22px; font-size: 14px; font-weight: bold;
+        cursor: pointer; display: flex; justify-content: center; align-items: center;
+        user-select: none; transition: background 0.1s, transform 0.1s;
+      }
+      .ig-prec-btn:active { background: var(--igls-accent, #c9a876); color: #000; transform: scale(0.95); }
+    `;
+    document.head.appendChild(style);
+
+    const leftHandle = document.createElement('div');
+    leftHandle.id = 'ig-interactive-left-handle';
+    leftHandle.className = 'ig-interactive-handle';
+    document.body.appendChild(leftHandle);
+
+    const rightHandle = document.createElement('div');
+    rightHandle.id = 'ig-interactive-right-handle';
+    rightHandle.className = 'ig-interactive-handle';
+    document.body.appendChild(rightHandle);
+
+    const layoutStyle = document.createElement('style');
+    layoutStyle.id = 'ig-page-resizer-layout-styles';
+    document.head.appendChild(layoutStyle);
+
+    function applyPageDimensions() {
+      const lw = resizerState.leftWidth;
+      const rw = resizerState.rightWidth;
+
+      leftHandle.style.left = (lw - 6) + 'px';
+      rightHandle.style.right = (rw - 6) + 'px';
+
+      if (resizerState.enabled && resizerState.editing) {
+        leftHandle.classList.add('is-visible'); rightHandle.classList.add('is-visible');
+      } else {
+        leftHandle.classList.remove('is-visible'); rightHandle.classList.remove('is-visible');
+      }
+
+      if (!resizerState.enabled) {
+        layoutStyle.innerHTML = '';
+        return;
+      }
+
+      layoutStyle.innerHTML = `
+        html, body.ig-modular-active { width: 100vw !important; height: 100vh !important; overflow: hidden !important; margin: 0 !important; padding: 0 !important; }
+        body.ig-modular-active { position: relative !important; background-color: #000 !important; }
+        body.ig-modular-active #react-root, body.ig-modular-active div[data-testid="mw-direct-inbox"], body.ig-modular-active main {
+          position: absolute !important; top: 0 !important; left: ${lw}px !important;
+          width: calc(100vw - ${lw}px - ${rw}px) !important; height: 100vh !important;
+          max-width: none !important; max-height: none !important; overflow: auto !important;
+        }
+      `;
+    }
+
+    function updateCardUI() {
+      const toggleResizingBtn = document.getElementById('ig-toggle-resizing-btn');
+      if (!toggleResizingBtn) return; 
+
+      const toggleEditingBtn = document.getElementById('ig-toggle-editing-btn');
+      const statusText = document.getElementById('ig-resizer-status-text');
+      const valLeft = document.getElementById('ig-val-left');
+      const valRight = document.getElementById('ig-val-right');
+
+      toggleResizingBtn.innerText = resizerState.enabled ? '🔴 Turn Resizing Off' : '🟢 Activate Resizing';
+      toggleEditingBtn.innerText = resizerState.editing ? '🔒 Lock Editing' : '✏️ Edit Resizing';
+      toggleEditingBtn.style.background = resizerState.editing ? '#f43f5e' : 'var(--igls-surface-2, #1c1c23)';
+      toggleEditingBtn.style.color = resizerState.editing ? '#fff' : 'var(--igls-text, #ece9e4)';
+      statusText.innerText = `Status: ${resizerState.enabled ? (resizerState.editing ? 'RESIZING ACTIVE (Editing)' : 'RESIZING ACTIVE (Locked)') : 'RESIZING OFF'}`;
+      statusText.className = `ig-resizer-status ${resizerState.enabled ? 'is-on' : 'is-off'}`;
+      
+      valLeft.innerText = resizerState.leftWidth;
+      valRight.innerText = resizerState.rightWidth;
+    }
+
+    core.on('profile-window:opened', ({ container }) => {
+      const section = document.createElement('div');
+      section.className = 'ig-profile-section';
+      
+      section.innerHTML = `
+        <span class="ig-profile-section-title">Webpage Resizer</span>
+        <div class="ig-resizer-status ${resizerState.enabled ? 'is-on' : 'is-off'}" id="ig-resizer-status-text">
+          Status: ${resizerState.enabled ? (resizerState.editing ? 'RESIZING ACTIVE (Editing)' : 'RESIZING ACTIVE (Locked)') : 'RESIZING OFF'}
+        </div>
+        <div class="ig-resizer-btn-row">
+          <button class="ig-profile-action-btn" id="ig-toggle-resizing-btn" style="flex:1; padding:8px;"></button>
+          <button class="ig-profile-action-btn" id="ig-toggle-editing-btn" style="flex:1; padding:8px;"></button>
+        </div>
+        
+        <!-- Precision Taps & Hold Area -->
+        <div class="ig-prec-container">
+          <div style="display:flex; align-items:center; gap:4px;">
+            <span style="width:24px;">Left:</span> 
+            <span id="ig-val-left" style="color:#fff; font-weight:bold; width:24px;">${resizerState.leftWidth}</span>
+            <button class="ig-prec-btn" data-target="left" data-dir="-1">-</button>
+            <button class="ig-prec-btn" data-target="left" data-dir="1">+</button>
+          </div>
+          <div style="display:flex; align-items:center; gap:4px;">
+            <span style="width:28px;">Right:</span> 
+            <span id="ig-val-right" style="color:#fff; font-weight:bold; width:24px;">${resizerState.rightWidth}</span>
+            <button class="ig-prec-btn" data-target="right" data-dir="-1">-</button>
+            <button class="ig-prec-btn" data-target="right" data-dir="1">+</button>
+          </div>
+        </div>
+
+        <div class="ig-resizer-btn-row">
+          <button class="ig-resizer-code-btn" id="ig-copy-code-btn">📋 Copy Preset</button>
+          <button class="ig-resizer-code-btn" id="ig-paste-code-btn">📥 Import Preset</button>
+        </div>
+      `;
+
+      container.appendChild(section);
+      updateCardUI();
+
+      // Main Toggle Buttons
+      document.getElementById('ig-toggle-resizing-btn').onclick = () => {
+        resizerState.enabled = !resizerState.enabled;
+        if (!resizerState.enabled) resizerState.editing = false;
+        saveState(); applyPageDimensions(); updateCardUI();
+      };
+
+      document.getElementById('ig-toggle-editing-btn').onclick = () => {
+        if (!resizerState.enabled) { alert("Please activate Resizing first before editing bounds!"); return; }
+        resizerState.editing = !resizerState.editing;
+        saveState(); applyPageDimensions(); updateCardUI();
+      };
+
+      // Press, Hold & Tap Logic for Precision Buttons
+      let holdInterval;
+      let holdTimeout;
+
+      function adjustWidth(target, dir) {
+        if (!resizerState.enabled || !resizerState.editing) return;
+        if (target === 'left') {
+          resizerState.leftWidth = Math.max(0, resizerState.leftWidth + dir);
+        } else {
+          resizerState.rightWidth = Math.max(0, resizerState.rightWidth + dir);
+        }
+        applyPageDimensions();
+        updateCardUI();
+      }
+
+      container.querySelectorAll('.ig-prec-btn').forEach(btn => {
+        const target = btn.getAttribute('data-target');
+        const dir = parseInt(btn.getAttribute('data-dir'));
+
+        const startHold = (e) => {
+          if (e.button !== 0 && e.type === 'mousedown') return;
+          if (!resizerState.enabled || !resizerState.editing) {
+            alert("Unlock editing mode (✏️ Edit Resizing) first to make adjustments.");
+            return;
+          }
+          e.preventDefault();
+          
+          adjustWidth(target, dir); // Immediate tap
+          
+          // Wait 300ms, then rapid continuous adjustment
+          holdTimeout = setTimeout(() => {
+            holdInterval = setInterval(() => {
+              adjustWidth(target, dir);
+            }, 25); 
+          }, 300);
+        };
+
+        const endHold = () => {
+          clearTimeout(holdTimeout);
+          clearInterval(holdInterval);
+          if (resizerState.enabled && resizerState.editing) {
+            recalculateOffsets();
+            saveState();
+          }
+        };
+
+        btn.addEventListener('mousedown', startHold);
+        btn.addEventListener('mouseup', endHold);
+        btn.addEventListener('mouseleave', endHold);
+        btn.addEventListener('touchstart', startHold, {passive: false});
+        btn.addEventListener('touchend', endHold);
+        btn.addEventListener('touchcancel', endHold);
+      });
+
+      // Import / Export Copying
+      document.getElementById('ig-copy-code-btn').onclick = () => {
+        const btn = document.getElementById('ig-copy-code-btn');
+        const codePayload = JSON.stringify({ leftWidth: resizerState.leftWidth, rightWidth: resizerState.rightWidth });
+        navigator.clipboard.writeText(codePayload).then(() => {
+          btn.innerText = '✅ Copied!'; setTimeout(() => btn.innerText = '📋 Copy Preset', 1500);
+        }).catch(() => prompt('Copy this layout preset code:', codePayload));
+      };
+
+      document.getElementById('ig-paste-code-btn').onclick = () => {
+        const input = prompt('Paste your layout preset code here (JSON format):');
+        if (!input || !input.trim()) return;
+        try {
+          const parsed = JSON.parse(input.trim());
+          if (typeof parsed.leftWidth === 'number' && typeof parsed.rightWidth === 'number') {
+            resizerState.leftWidth = parsed.leftWidth;
+            resizerState.rightWidth = parsed.rightWidth;
+            recalculateOffsets();
+            applyPageDimensions(); updateCardUI();
+            alert('Layout preset successfully applied!');
+          } else { alert('Invalid code format.'); }
+        } catch (e) { alert('Failed to parse JSON code.'); }
+      };
+    });
+
+    let activeDragHandle = null;
+
+    leftHandle.addEventListener('mousedown', (e) => {
+      if (!resizerState.enabled || !resizerState.editing) return;
+      activeDragHandle = 'left'; e.preventDefault();
+    });
+
+    rightHandle.addEventListener('mousedown', (e) => {
+      if (!resizerState.enabled || !resizerState.editing) return;
+      activeDragHandle = 'right'; e.preventDefault();
+    });
+
+    window.addEventListener('mousemove', (e) => {
+      if (!activeDragHandle || !resizerState.enabled || !resizerState.editing) return;
+      if (activeDragHandle === 'left') resizerState.leftWidth = Math.min(500, Math.max(50, e.clientX));
+      else if (activeDragHandle === 'right') resizerState.rightWidth = Math.min(500, Math.max(50, window.innerWidth - e.clientX));
+      
+      applyPageDimensions();
+      updateCardUI();
+    });
+
+    window.addEventListener('mouseup', () => {
+      if (activeDragHandle) {
+        activeDragHandle = null;
+        recalculateOffsets();
+      }
+    });
+
+    window.addEventListener('ig-resizer-update', (e) => {
+      if (e.detail && resizerState.enabled) {
+        if (resizerState.leftOffset === null) recalculateOffsets();
+        resizerState.leftWidth = Math.max(0, e.detail.leftWidth + (resizerState.leftOffset || 0));
+        resizerState.rightWidth = Math.max(0, e.detail.rightWidth + (resizerState.rightOffset || 0));
+        saveState();
+      }
+      applyPageDimensions();
+      updateCardUI();
+    });
+
+    if (resizerState.leftOffset === null) {
+      setTimeout(recalculateOffsets, 500); 
+    }
+    applyPageDimensions();
+
+    console.log('[igPageResizerFeature] Profile window docked resizer + Precision Controls loaded.');
+    core.emit('block:ready', { id: 'igPageResizerFeature' });
+  }
+});
+
+/* ============================================================
+   BLOCK: Sidebar-to-Resizer Sync (v1)
+   ============================================================ */
+/* ============================================================
+   BLOCK: Sidebar-to-Resizer Sync Feature (Event-Driven Bridge)
+   ============================================================ */
+LegoCore.registerBlock({
+  id: 'igSidebarSyncFeature',
+  init(core) {
+    // Listen to the native 'sidebar:layout-changed' event emitted by the Dual Sidebar shell
+    core.on('sidebar:layout-changed', (layout) => {
+      const targetLeft = layout.leftHidden ? 0 : layout.leftWidth;
+      const targetRight = layout.rightHidden ? 0 : layout.rightWidth;
+
+      // Dispatch directly to the Resizer Plugin so it updates instantly
+      window.dispatchEvent(new CustomEvent('ig-resizer-update', {
+        detail: {
+          leftWidth: targetLeft,
+          rightWidth: targetRight
+        }
+      }));
+    });
+
+    console.log('[igSidebarSyncFeature] Event-driven sidebar-to-resizer sync active.');
+    core.emit('block:ready', { id: 'igSidebarSyncFeature' });
+  }
+});
+
+/* ============================================================
+   BLOCK: Quick Chat Box (v3)
+   ============================================================ */
+/* ============================================================
+   BLOCK: Quick Chat Box (Sidebar Text Injector with Aggressive Focus Lock)
+   ============================================================ */
+LegoCore.registerBlock({
+  id: 'quickChatBoxPlugin',
+  init(core) {
+    const PREF_KEY = 'ig_quick_chat_prefs_v1';
+    const EFFECTS_KEY = 'ig_quick_effects_enabled_v1';
+    let prefs = JSON.parse(localStorage.getItem(PREF_KEY)) || { keepFocus: true };
+    let effectsEnabled = localStorage.getItem(EFFECTS_KEY) !== 'false'; // default true
+
+    // 1. Build the UI
+    const chatUI = document.createElement('div');
+    chatUI.style.cssText = 'display: flex; flex-direction: column; gap: 8px;';
+    
+    chatUI.innerHTML = `
+      <textarea id="ig-quick-chat-input" placeholder="Type message... (Enter to send, Shift+Enter for new line)" 
+        style="width: 100%; min-height: 65px; max-height: 250px; background: #0f172a; color: #fff; border: 1px solid #334155; border-radius: 6px; padding: 8px; font-size: 12px; resize: vertical; outline: none; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; box-sizing: border-box; line-height: 1.4; transition: border 0.2s;"></textarea>
+      
+      <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px;">
+         <label style="color:var(--igls-text-dim, #96949c); font-size:10px; cursor:pointer; display:flex; align-items:center; gap:4px; user-select:none;">
+           <input type="checkbox" id="ig-qc-keep-focus" ${prefs.keepFocus ? 'checked' : ''}> Keep Focus (Rapid Fire)
+         </label>
+         <label style="color:var(--igls-text-dim, #96949c); font-size:9px; cursor:pointer; display:flex; align-items:center; gap:3px; user-select:none;" title="Disables silence-trim processing on quick voice clips for faster sending">
+           <input type="checkbox" id="ig-qc-effects-chk" style="width:11px; height:11px;" ${effectsEnabled ? 'checked' : ''}> Effects
+         </label>
+         <button id="ig-quick-chat-send" class="ig-base-btn" style="background: #10b981; color: white; border: none; border-radius: 6px; padding: 5px 12px; font-weight: bold; cursor: pointer; transition: filter 0.2s; width:auto;">📤 Send</button>
+      </div>
+    `;
+
+    const inputField = chatUI.querySelector('#ig-quick-chat-input');
+    const sendBtn = chatUI.querySelector('#ig-quick-chat-send');
+    const focusChk = chatUI.querySelector('#ig-qc-keep-focus');
+    const effectsChk = chatUI.querySelector('#ig-qc-effects-chk');
+
+    // 2. Save preferences when toggles change
+    focusChk.onchange = (e) => {
+        prefs.keepFocus = e.target.checked;
+        localStorage.setItem(PREF_KEY, JSON.stringify(prefs));
+    };
+    effectsChk.onchange = (e) => {
+        effectsEnabled = e.target.checked;
+        localStorage.setItem(EFFECTS_KEY, String(effectsEnabled));
+    };
+
+    // 3. Focus styling for UX
+    inputField.addEventListener('focus', () => inputField.style.borderColor = '#6366f1');
+    inputField.addEventListener('blur', () => inputField.style.borderColor = '#334155');
+    sendBtn.addEventListener('mouseover', () => sendBtn.style.filter = 'brightness(1.1)');
+    sendBtn.addEventListener('mouseout', () => sendBtn.style.filter = 'none');
+
+    // 4. Define the sending & aggressive refocusing logic
+    function sendMessage() {
+      const text = inputField.value.trim();
+      if (!text) return;
+
+      const chatZone = document.querySelector('div[contenteditable="true"]');
+      if (!chatZone) {
+        alert("Open an active Instagram chat window first.");
+        return;
+      }
+
+      // Visual feedback & clear input immediately so user can keep typing
+      inputField.value = '';
+      const originalText = sendBtn.innerText;
+      sendBtn.innerText = '✅ Sent!';
+      sendBtn.style.background = '#059669'; 
+      setTimeout(() => {
+        sendBtn.innerText = originalText;
+        sendBtn.style.background = '#10b981';
+      }, 1000);
+
+      // Give Instagram focus just long enough to paste the text
+      chatZone.focus();
+      document.execCommand('insertText', false, text);
+
+      // Wait 100ms for Instagram to register the text before hitting enter
+      setTimeout(() => {
+        const enterEvent = new KeyboardEvent('keydown', {
+          key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true
+        });
+        chatZone.dispatchEvent(enterEvent);
+
+        // AGGRESSIVE FOCUS LOCK:
+        // Instagram's React components usually try to steal focus back AFTER the enter event.
+        // We pulse the focus command 5 times over 100ms to guarantee we win the tug-of-war.
+        if (prefs.keepFocus) {
+          inputField.focus();
+          let attempts = 0;
+          const focusLock = setInterval(() => {
+            inputField.focus();
+            attempts++;
+            if (attempts > 5) clearInterval(focusLock);
+          }, 20); 
+        }
+
+      }, 100); 
+    }
+
+    // 5. Attach Event Listeners
+    sendBtn.onclick = sendMessage;
+
+    inputField.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault(); // Prevents adding a new line
+        sendMessage();
+      }
+    });
+
+    // 6. Mount to the Sidebar Plugin Registry
+    function mountCard(attemptsLeft) {
+      attemptsLeft = attemptsLeft === undefined ? 10 : attemptsLeft;
+      if (typeof core.registerMenu === 'function') {
+        core.registerMenu('right', '💬 Quick Chat', chatUI, '⠿', 'quick-chat-box');
+      } else if (attemptsLeft > 0) {
+        setTimeout(() => mountCard(attemptsLeft - 1), 200);
+      } else {
+        console.warn('[QuickChatBoxPlugin] Could not find core.registerMenu.');
+      }
+    }
+    
+    mountCard();
+    console.log('[QuickChatBoxPlugin] Sidebar chat box loaded with Aggressive Focus Lock + Effects toggle.');
+    core.emit('block:ready', { id: 'quickChatBoxPlugin' });
+  }
+});
+
+/* ============================================================
+   BLOCK: Text Library Module (Saved Snippets) (v4)
+   ============================================================ */
+/* ============================================================
+   BLOCK: Text Library Module (Saved Snippets) (v3)
+   - Unified Native Notion UI
+   - Paste-Only (Zero Send Logic)
+   - Filters, Adjustable Columns, Tags, Folders
+   - Custom Command field (works with the Quick Command Bar plugin)
+   ============================================================ */
+LegoCore.registerBlock({
+  id: 'textLibraryModule',
+  init(core) {
+    const PRO_KEY = 'ig_text_library_pro_v1';
+    const FILTER_PREF_KEY = 'ig_tl_notion_filter_pos';
+    const COL_PREF_KEY = 'ig_tl_col_widths_v1';
+
+    let libraryData = JSON.parse(localStorage.getItem(PRO_KEY)) || { items: [], tags: [] };
+
+    // Auto-Migrate from oldest basic library if needed
+    if (libraryData.items.length === 0) {
+      const oldSnippets = JSON.parse(localStorage.getItem('ig_text_library_v1')) || [];
+      if (oldSnippets.length > 0) {
+        libraryData.items = oldSnippets.map((s, i) => ({
+          id: 'snip_' + Date.now() + i, type: 'snippet', parentId: 'root',
+          title: s.text.length > 25 ? s.text.substring(0, 25) + '...' : s.text,
+          text: s.text, tags: [], order: i
+        }));
+        saveData();
+      }
+    }
+
+    function saveData() { localStorage.setItem(PRO_KEY, JSON.stringify(libraryData)); }
+
+    let activeFolderFilter = 'All';
+    let activeTagFilter = 'All';
+    let filterWindowPos = JSON.parse(localStorage.getItem(FILTER_PREF_KEY)) || { top: 150, left: 350, visible: false };
+    let colWidths = JSON.parse(localStorage.getItem(COL_PREF_KEY)) || { titleWidth: 50 };
+
+    // 1. Core Styles
+    const style = document.createElement('style');
+    style.id = 'ig-text-lib-table-styles';
+    style.innerHTML = `
+      .ig-tln-container { display: flex; flex-direction: column; gap: 8px; font-family: -apple-system, sans-serif; }
+      .ig-tln-header-btns { display: flex; gap: 4px; }
+      .ig-tln-hbtn { flex: 1; background: var(--igls-surface-2, #1c1c23); color: #e2e8f0; border: 1px solid #334155; border-radius: 4px; padding: 6px 4px; font-size: 10px; font-weight: bold; cursor: pointer; transition: 0.2s; }
+      .ig-tln-hbtn:hover { background: #334155; color: #fff; }
+      .ig-tln-hbtn.active-filter { background: #6366f1; color: white; border-color: #8b5cf6; }
+
+      .ig-tln-tree { max-height: 350px; overflow-y: auto; padding-right: 4px; display: flex; flex-direction: column; }
+      .ig-tln-tree::-webkit-scrollbar { width: 4px; }
+      .ig-tln-tree::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+
+      .ig-tln-drop-top { border-top: 2px solid #10b981 !important; }
+      .ig-tln-drop-bottom { border-bottom: 2px solid #10b981 !important; }
+      .ig-tln-drop-inside { background: rgba(16, 185, 129, 0.15) !important; border: 1px dashed #10b981 !important; }
+
+      .ig-tln-folder-head { display: flex; align-items: center; gap: 6px; font-weight: bold; font-size: 11px; color: #94a3b8; padding: 6px; background: rgba(0,0,0,0.2); border-bottom: 1px solid rgba(255,255,255,0.05); cursor: grab; }
+      .ig-tln-folder-head:active { cursor: grabbing; }
+      .ig-tln-caret { font-size: 9px; cursor: pointer; padding: 2px; width: 14px; text-align: center; transition: transform 0.2s; }
+      .ig-tln-caret.collapsed { transform: rotate(-90deg); }
+      .ig-tln-folder-content { display: flex; flex-direction: column; }
+      .ig-tln-folder-content.collapsed { display: none; }
+
+      .ig-tln-snippet { display: flex; flex-direction: column; border-bottom: 1px solid rgba(255,255,255,0.05); cursor: pointer; transition: background 0.2s; }
+      .ig-tln-snippet.alt-bg { background: rgba(255,255,255,0.02); }
+      .ig-tln-snippet:hover { background: rgba(255,255,255,0.06); }
+
+      .ig-tln-row { display: flex; align-items: center; padding: 4px 6px; }
+      .ig-tln-drag-grip { color: #475569; font-size: 10px; cursor: grab; margin-right: 6px; }
+      .ig-tln-drag-grip:active { cursor: grabbing; }
+
+      .ig-tln-title-col { display: flex; align-items: center; font-size: 11px; color: #f8fafc; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; gap: 4px;}
+
+      .ig-tln-col-resizer { width: 6px; height: 18px; cursor: col-resize; background: rgba(255,255,255,0.05); border-radius: 3px; margin: 0 4px; transition: background 0.1s; flex-shrink: 0; }
+      .ig-tln-col-resizer:hover, .ig-tln-col-resizer.active { background: #6366f1; }
+
+      .ig-tln-tags { flex: 1; display: flex; gap: 4px; overflow: hidden; pointer-events: none; }
+      .ig-tln-tag-pill { font-size: 9px; padding: 2px 6px; border-radius: 4px; font-weight: 600; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; max-width: 100%; }
+
+      .ig-tln-cmd-pill { font-size: 9px; padding: 2px 6px; border-radius: 4px; font-weight: 700; white-space: nowrap; background: rgba(255,255,255,0.1); color: #c9a876; flex-shrink: 0; }
+
+      .ig-tln-actions { display: flex; gap: 2px; align-items: center; margin-left: auto; }
+      .ig-tln-btn { background: transparent; border: none; color: #64748b; cursor: pointer; font-size: 11px; padding: 4px; border-radius: 4px; transition: 0.2s; }
+      .ig-tln-btn:hover { background: rgba(255,255,255,0.1); color: #fff; }
+
+      .ig-tln-preview { font-size: 10px; color: #94a3b8; padding: 0 8px 8px 30px; line-height: 1.4; display: none; white-space: pre-wrap; word-wrap: break-word; background: rgba(0,0,0,0.2); }
+      .ig-tln-preview.visible { display: block; }
+
+      .ig-tln-filter-window {
+        position: fixed; z-index: 2147483646; background: rgba(15, 23, 42, 0.95); backdrop-filter: blur(8px);
+        border: 1px solid #334155; border-radius: 8px; width: 220px; padding: 12px; display: flex; flex-direction: column; gap: 10px;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.5); pointer-events: auto;
+      }
+      .ig-tln-filter-header { display: flex; justify-content: space-between; align-items: center; font-size: 11px; font-weight: bold; color: #fff; cursor: grab; padding-bottom: 6px; border-bottom: 1px solid rgba(255,255,255,0.1); }
+      .ig-tln-filter-header:active { cursor: grabbing; }
+
+      .ig-tlp-modal-overlay { position: fixed; top:0; left:0; right:0; bottom:0; background: rgba(0,0,0,0.6); z-index: 2147483647; display: flex; justify-content: center; align-items: center; }
+      .ig-tlp-modal { background: #0f172a; border: 1px solid #334155; border-radius: 8px; width: 320px; padding: 16px; display: flex; flex-direction: column; gap: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
+      .ig-tlp-modal h3 { margin: 0; font-size: 14px; color: #fff; }
+      .ig-tlp-input { width: 100%; background: #1e293b; border: 1px solid #475569; color: #fff; padding: 8px; border-radius: 4px; font-size: 12px; box-sizing: border-box; outline: none; }
+      .ig-tlp-input:focus { border-color: #6366f1; }
+    `;
+    document.head.appendChild(style);
+
+    function hexToRgba(hex, alpha) {
+      const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
+      return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+    }
+
+    // PURE PASTE FUNCTION - Absolute Zero Send Logic
+    function injectText(text) {
+      const chatZone = document.querySelector('div[contenteditable="true"]');
+      if (!chatZone) { alert("Open an active Instagram chat window first."); return; }
+
+      chatZone.focus();
+      document.execCommand('insertText', false, text);
+      chatZone.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+    }
+
+    // Build the UI Shell
+    const libUI = document.createElement('div');
+    libUI.className = 'ig-tln-container';
+    libUI.innerHTML = `
+      <div class="ig-tln-header-btns">
+        <button id="ig-tlc-new-snip" class="ig-tln-hbtn">📝 New</button>
+        <button id="ig-tlc-new-fold" class="ig-tln-hbtn">📁 Fold</button>
+        <button id="ig-tlc-filter-btn" class="ig-tln-hbtn ${filterWindowPos.visible ? 'active-filter' : ''}">🔍 Filter</button>
+      </div>
+      <div id="ig-tlc-tree-root" class="ig-tln-tree"></div>
+    `;
+
+    function buildFilterWindow() {
+      if (document.getElementById('ig-tln-filter-win')) return;
+
+      const win = document.createElement('div');
+      win.id = 'ig-tln-filter-win';
+      win.className = 'ig-tln-filter-window';
+      win.style.top = filterWindowPos.top + 'px';
+      win.style.left = filterWindowPos.left + 'px';
+      win.style.display = filterWindowPos.visible ? 'flex' : 'none';
+
+      const header = document.createElement('div');
+      header.className = 'ig-tln-filter-header';
+      header.innerHTML = `<span>🔍 Filters</span> <button id="ig-tln-close-filter" style="background:none; border:none; color:#94a3b8; cursor:pointer;">✕</button>`;
+
+      const folderSelect = document.createElement('select');
+      folderSelect.className = 'ig-tlp-input'; folderSelect.style.padding = '4px';
+
+      const tagSelect = document.createElement('select');
+      tagSelect.className = 'ig-tlp-input'; tagSelect.style.padding = '4px';
+
+      function updateDropdowns() {
+        folderSelect.innerHTML = `<option value="All">📁 All Folders</option>`;
+        libraryData.items.filter(i => i.type === 'folder').forEach(f => {
+          const opt = document.createElement('option');
+          opt.value = f.id; opt.innerText = '📁 ' + f.name;
+          if (activeFolderFilter === f.id) opt.selected = true;
+          folderSelect.appendChild(opt);
+        });
+
+        tagSelect.innerHTML = `<option value="All">🏷️ All Tags</option>`;
+        libraryData.tags.forEach(t => {
+          const opt = document.createElement('option');
+          opt.value = t.id; opt.innerText = '🏷️ ' + t.name;
+          if (activeTagFilter === t.id) opt.selected = true;
+          tagSelect.appendChild(opt);
+        });
+      }
+      updateDropdowns();
+
+      folderSelect.onchange = () => { activeFolderFilter = folderSelect.value; renderTree(); };
+      tagSelect.onchange = () => { activeTagFilter = tagSelect.value; renderTree(); };
+
+      win.appendChild(header); win.appendChild(folderSelect); win.appendChild(tagSelect);
+      document.body.appendChild(win);
+
+      win.querySelector('#ig-tln-close-filter').onclick = () => {
+        filterWindowPos.visible = false; win.style.display = 'none';
+        localStorage.setItem(FILTER_PREF_KEY, JSON.stringify(filterWindowPos));
+        libUI.querySelector('#ig-tlc-filter-btn').classList.remove('active-filter');
+      };
+
+      let isDragging = false, startX, startY, initLeft, initTop;
+      header.addEventListener('mousedown', (e) => {
+        if (e.target.tagName === 'BUTTON') return;
+        isDragging = true; startX = e.clientX; startY = e.clientY;
+        initLeft = win.offsetLeft; initTop = win.offsetTop;
+        document.addEventListener('mousemove', onMouseMove);
+        document.addEventListener('mouseup', onMouseUp);
+        e.preventDefault();
+      });
+      function onMouseMove(e) {
+        if (!isDragging) return;
+        win.style.left = (initLeft + (e.clientX - startX)) + 'px';
+        win.style.top = (initTop + (e.clientY - startY)) + 'px';
+      }
+      function onMouseUp() {
+        isDragging = false;
+        document.removeEventListener('mousemove', onMouseMove);
+        document.removeEventListener('mouseup', onMouseUp);
+        filterWindowPos.top = win.offsetTop; filterWindowPos.left = win.offsetLeft;
+        localStorage.setItem(FILTER_PREF_KEY, JSON.stringify(filterWindowPos));
+      }
+      win.updateDropdowns = updateDropdowns;
+    }
+
+    libUI.querySelector('#ig-tlc-filter-btn').onclick = (e) => {
+      const win = document.getElementById('ig-tln-filter-win');
+      if(!win) return;
+      filterWindowPos.visible = !filterWindowPos.visible;
+      win.style.display = filterWindowPos.visible ? 'flex' : 'none';
+      e.target.classList.toggle('active-filter', filterWindowPos.visible);
+      localStorage.setItem(FILTER_PREF_KEY, JSON.stringify(filterWindowPos));
+    };
+
+    libUI.querySelector('#ig-tlc-new-fold').onclick = () => {
+      const name = prompt("Folder Name:");
+      if (!name || !name.trim()) return;
+      libraryData.items.push({ id: 'fld_' + Date.now(), type: 'folder', parentId: 'root', name: name.trim(), collapsed: false, order: Date.now() });
+      saveData();
+      const win = document.getElementById('ig-tln-filter-win'); if(win) win.updateDropdowns();
+      renderTree();
+    };
+
+    libUI.querySelector('#ig-tlc-new-snip').onclick = () => openSnippetEditor(null);
+
+    function openSnippetEditor(itemToEdit) {
+      const isEdit = !!itemToEdit;
+      let selectedTags = isEdit ? [...(itemToEdit.tags || [])] : [];
+
+      const overlay = document.createElement('div');
+      overlay.className = 'ig-tlp-modal-overlay';
+      overlay.dataset.thumbnail = isEdit && itemToEdit.thumbnail ? itemToEdit.thumbnail : '';
+
+      const tagOptionsHtml = libraryData.tags.map(t => {
+        const isSel = selectedTags.includes(t.id);
+        return `<label style="display:flex; align-items:center; gap:6px; font-size:11px; cursor:pointer; background:rgba(255,255,255,0.05); padding:4px 8px; border-radius:4px;">
+          <input type="checkbox" class="ig-tlc-tag-chk" data-id="${t.id}" ${isSel ? 'checked' : ''}>
+          <span class="ig-tln-tag-pill" style="background:${hexToRgba(t.color, 0.2)}; color:${t.color}; border:1px solid ${t.color};">${t.name}</span>
+        </label>`;
+      }).join('');
+
+      overlay.innerHTML = `
+        <div class="ig-tlp-modal" style="width:380px;" id="ig-tlp-modal-box">
+          <h3>${isEdit ? '✏️ Edit Snippet' : '📝 New Snippet'}</h3>
+
+          <div style="font-size:11px; font-weight:bold; color:#94a3b8; margin-top:4px;">Title:</div>
+          <input type="text" id="ig-tlc-snip-title" class="ig-tlp-input" placeholder="Short title..." value="${isEdit ? itemToEdit.title : ''}">
+
+          <div style="font-size:11px; font-weight:bold; color:#94a3b8; margin-top:4px;">Message Text:</div>
+          <textarea id="ig-tlc-snip-text" class="ig-tlp-input" style="height:60px; resize:vertical;" placeholder="Type your full message...">${isEdit ? itemToEdit.text : ''}</textarea>
+
+          <div style="font-size:11px; font-weight:bold; color:#94a3b8; margin-top:4px;">Custom Command (used by Quick Command Bar):</div>
+          <div style="display:flex; align-items:center; gap:4px;">
+            <span style="color:#94a3b8; font-weight:bold;">/</span>
+            <input type="text" id="ig-tlc-snip-command" class="ig-tlp-input" placeholder="e.g. hola" value="${isEdit && itemToEdit.customCommand ? itemToEdit.customCommand : ''}">
+          </div>
+
+          <div style="font-size:11px; font-weight:bold; color:#94a3b8; margin-top:4px;">Assign Tags:</div>
+          <div style="display:flex; flex-wrap:wrap; gap:6px; max-height:80px; overflow-y:auto;">
+            ${tagOptionsHtml || '<span style="color:#64748b; font-style:italic;">No tags created yet.</span>'}
+          </div>
+
+          <div style="display:flex; justify-content:space-between; margin-top:8px;">
+            <div style="display:flex; gap:8px;">
+              <button id="ig-tlc-snip-copy" style="background:#334155; color:#fff; border:none; padding:6px 12px; border-radius:4px; font-weight:bold; cursor:pointer;">📋 Copy</button>
+              ${isEdit ? '<button id="ig-tlc-snip-del" style="background:#dc2626; color:#fff; border:none; padding:6px 12px; border-radius:4px; font-weight:bold; cursor:pointer;">🗑️ Delete</button>' : ''}
+            </div>
+            <div style="display:flex; gap:8px;">
+              <button id="ig-tlc-snip-cancel" style="background:transparent; color:#94a3b8; border:none; cursor:pointer; font-weight:bold;">Cancel</button>
+              <button id="ig-tlc-snip-save" style="background:#6366f1; color:#fff; border:none; padding:6px 12px; border-radius:4px; font-weight:bold; cursor:pointer;">💾 Save</button>
+            </div>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(overlay);
+
+      overlay.querySelector('#ig-tlc-snip-copy').onclick = () => {
+        const btn = overlay.querySelector('#ig-tlc-snip-copy');
+        const text = overlay.querySelector('#ig-tlc-snip-text').value;
+        navigator.clipboard.writeText(text).then(() => {
+          const original = btn.innerText;
+          btn.innerText = '✅ Copied!';
+          setTimeout(() => { btn.innerText = original; }, 1200);
+        }).catch(() => alert('Could not copy to clipboard.'));
+      };
+
+      overlay.querySelector('#ig-tlc-snip-cancel').onclick = () => overlay.remove();
+
+      if (isEdit) {
+        overlay.querySelector('#ig-tlc-snip-del').onclick = () => {
+          if(confirm("Permanently delete this snippet?")) {
+            libraryData.items = libraryData.items.filter(i => i.id !== itemToEdit.id);
+            saveData(); renderTree(); overlay.remove();
+          }
+        };
+      }
+
+      overlay.querySelector('#ig-tlc-snip-save').onclick = () => {
+        const text = overlay.querySelector('#ig-tlc-snip-text').value.trim();
+        const titleInput = overlay.querySelector('#ig-tlc-snip-title').value.trim();
+        if (!text) return;
+
+        const title = titleInput || (text.length > 25 ? text.substring(0, 25) + '...' : text);
+        const finalTags = Array.from(overlay.querySelectorAll('.ig-tlc-tag-chk:checked')).map(cb => cb.dataset.id);
+        const finalCommand = overlay.querySelector('#ig-tlc-snip-command').value.trim().replace(/^\/+/, '');
+        const pendingThumb = overlay.dataset.thumbnail;
+
+        if (isEdit) {
+          itemToEdit.title = title;
+          itemToEdit.text = text;
+          itemToEdit.tags = finalTags;
+          itemToEdit.customCommand = finalCommand;
+          if (pendingThumb === 'CLEAR') delete itemToEdit.thumbnail;
+          else if (pendingThumb) itemToEdit.thumbnail = pendingThumb;
+        } else {
+          const targetParent = activeFolderFilter === 'All' ? 'root' : activeFolderFilter;
+          const newSnip = { id: 'snip_' + Date.now(), type: 'snippet', parentId: targetParent, title: title, text: text, tags: finalTags, customCommand: finalCommand, order: Date.now() };
+          if (pendingThumb && pendingThumb !== 'CLEAR') newSnip.thumbnail = pendingThumb;
+          libraryData.items.push(newSnip);
+        }
+        saveData(); renderTree(); overlay.remove();
+      };
+    }
+
+    // Drag & Drop
+    let draggedItem = null;
+    function handleDragStart(e, id) { draggedItem = libraryData.items.find(i => i.id === id); e.dataTransfer.effectAllowed = 'move'; setTimeout(() => e.target.style.opacity = '0.3', 0); }
+    function handleDragOver(e, id, type) {
+      e.preventDefault(); e.stopPropagation();
+      const targetEl = e.currentTarget;
+      document.querySelectorAll('.ig-tln-drop-top, .ig-tln-drop-bottom, .ig-tln-drop-inside').forEach(el => el.classList.remove('ig-tln-drop-top', 'ig-tln-drop-bottom', 'ig-tln-drop-inside'));
+      if (!draggedItem || draggedItem.id === id) return;
+      const rect = targetEl.getBoundingClientRect(); const y = e.clientY - rect.top; const h = rect.height;
+      if (type === 'folder' && y > h * 0.25 && y < h * 0.75) {
+        if (draggedItem.type === 'folder' && id === draggedItem.id) return;
+        targetEl.classList.add('ig-tln-drop-inside');
+      } else if (y < h / 2) targetEl.classList.add('ig-tln-drop-top');
+      else targetEl.classList.add('ig-tln-drop-bottom');
+    }
+    function handleDrop(e, targetId, targetType) {
+      e.preventDefault(); e.stopPropagation();
+      if (!draggedItem || draggedItem.id === targetId) return;
+      const targetEl = e.currentTarget; const rect = targetEl.getBoundingClientRect(); const y = e.clientY - rect.top; const h = rect.height;
+      const targetItem = libraryData.items.find(i => i.id === targetId);
+      if (targetType === 'folder' && y > h * 0.25 && y < h * 0.75) {
+        draggedItem.parentId = targetItem.id; draggedItem.order = Date.now();
+      } else {
+        draggedItem.parentId = targetItem.parentId;
+        const siblings = libraryData.items.filter(i => i.parentId === targetItem.parentId).sort((a,b) => a.order - b.order);
+        const cleanSiblings = siblings.filter(i => i.id !== draggedItem.id);
+        const targetIndex = cleanSiblings.findIndex(i => i.id === targetId);
+        if (y < h / 2) cleanSiblings.splice(targetIndex, 0, draggedItem);
+        else cleanSiblings.splice(targetIndex + 1, 0, draggedItem);
+        cleanSiblings.forEach((item, index) => { item.order = index; });
+      }
+      draggedItem = null; saveData(); renderTree();
+    }
+
+    let activeColResizer = null;
+    window.addEventListener('mousemove', (e) => {
+      if (!activeColResizer) return;
+      const containerRect = activeColResizer.container.getBoundingClientRect();
+      const newWidthPercent = ((e.clientX - containerRect.left) / containerRect.width) * 100;
+      colWidths.titleWidth = Math.min(80, Math.max(20, newWidthPercent));
+      document.querySelectorAll('.ig-tln-title-col').forEach(el => el.style.width = colWidths.titleWidth + '%');
+    });
+    window.addEventListener('mouseup', () => {
+      if (activeColResizer) {
+        activeColResizer.el.classList.remove('active'); activeColResizer = null;
+        localStorage.setItem(COL_PREF_KEY, JSON.stringify(colWidths));
+      }
+    });
+
+    function renderTree() {
+      const rootContainer = libUI.querySelector('#ig-tlc-tree-root');
+      if (!rootContainer) return;
+      rootContainer.innerHTML = '';
+
+      let snippetCounter = 0;
+      function buildNode(parentId, containerElement) {
+        const children = libraryData.items.filter(i => i.parentId === parentId).sort((a,b) => a.order - b.order);
+
+        children.forEach(item => {
+          if (item.type === 'snippet' && activeTagFilter !== 'All') {
+            if (!item.tags || !item.tags.includes(activeTagFilter)) return;
+          }
+
+          const el = document.createElement('div');
+
+          if (item.type === 'folder') {
+            el.className = 'ig-tln-folder-head'; el.draggable = true;
+            el.addEventListener('dragstart', (e) => handleDragStart(e, item.id));
+            el.addEventListener('dragend', (e) => { e.target.style.opacity = '1'; draggedItem = null; });
+            el.addEventListener('dragover', (e) => handleDragOver(e, item.id, item.type));
+            el.addEventListener('dragleave', (e) => { e.currentTarget.classList.remove('ig-tln-drop-top', 'ig-tln-drop-bottom', 'ig-tln-drop-inside'); });
+            el.addEventListener('drop', (e) => handleDrop(e, item.id, item.type));
+
+            el.innerHTML = `
+              <span class="ig-tln-caret ${item.collapsed ? 'collapsed' : ''}">▼</span>
+              <span>📁 ${item.name}</span>
+              <button class="ig-tln-btn" style="margin-left:auto; padding:0 4px;" title="Edit/Delete Folder">⚙️</button>
+            `;
+
+            const contentDiv = document.createElement('div');
+            contentDiv.className = `ig-tln-folder-content ${item.collapsed ? 'collapsed' : ''}`;
+
+            el.querySelector('.ig-tln-caret').onclick = () => { item.collapsed = !item.collapsed; saveData(); renderTree(); };
+            el.querySelector('.ig-tln-btn').onclick = () => {
+              const action = prompt(`Edit Folder: "${item.name}"\n\nType a new name to rename it.\nType "DELETE" (all caps) to delete it and its contents.`);
+              if (!action) return;
+              if (action === 'DELETE') {
+                const deleteNodeAndChildren = (id) => { libraryData.items.filter(i => i.parentId === id).forEach(child => deleteNodeAndChildren(child.id)); libraryData.items = libraryData.items.filter(i => i.id !== id); };
+                deleteNodeAndChildren(item.id); saveData(); renderTree();
+              } else { item.name = action.trim(); saveData(); renderTree(); }
+            };
+
+            containerElement.appendChild(el); containerElement.appendChild(contentDiv); buildNode(item.id, contentDiv);
+          } else {
+            snippetCounter++;
+            el.className = `ig-tln-snippet ${snippetCounter % 2 === 0 ? 'alt-bg' : ''}`;
+            el.dataset.id = item.id;
+
+            const tagsHtml = (item.tags || []).map(tid => {
+              const t = libraryData.tags.find(x => x.id === tid);
+              return t ? `<span class="ig-tln-tag-pill" style="background:${hexToRgba(t.color, 0.2)}; color:${t.color};">${t.name}</span>` : '';
+            }).join('');
+
+            const cmdHtml = item.customCommand ? `<span class="ig-tln-cmd-pill">/${item.customCommand}</span>` : '';
+
+            el.innerHTML = `
+              <div class="ig-tln-row">
+                <span class="ig-tln-drag-grip" draggable="true">⠿</span>
+                <div class="ig-tln-title-col" style="width: ${colWidths.titleWidth}%;">
+                  ${item.title}
+                </div>
+                <div class="ig-tln-col-resizer" title="Drag to resize columns"></div>
+                ${cmdHtml}
+                <div class="ig-tln-tags">${tagsHtml}</div>
+                <div class="ig-tln-actions">
+                  <button class="ig-tln-btn preview-btn" title="Toggle Text Preview">👁️</button>
+                  <button class="ig-tln-btn edit-btn" title="Edit Snippet">✏️</button>
+                </div>
+              </div>
+              <div class="ig-tln-preview">${item.text}</div>
+            `;
+
+            const grip = el.querySelector('.ig-tln-drag-grip');
+            grip.addEventListener('dragstart', (e) => handleDragStart(e, item.id));
+            grip.addEventListener('dragend', (e) => { e.target.style.opacity = '1'; draggedItem = null; });
+            el.addEventListener('dragover', (e) => handleDragOver(e, item.id, item.type));
+            el.addEventListener('dragleave', (e) => { e.currentTarget.classList.remove('ig-tln-drop-top', 'ig-tln-drop-bottom', 'ig-tln-drop-inside'); });
+            el.addEventListener('drop', (e) => handleDrop(e, item.id, item.type));
+
+            const resizer = el.querySelector('.ig-tln-col-resizer');
+            resizer.addEventListener('mousedown', (e) => {
+              e.stopPropagation(); e.preventDefault();
+              resizer.classList.add('active');
+              activeColResizer = { el: resizer, container: el.querySelector('.ig-tln-row') };
+            });
+
+            // STRICT 1-CLICK PASTE ONLY (Zero Send Logic)
+            el.onclick = (e) => {
+              e.stopPropagation();
+              if (e.target.tagName === 'BUTTON' || e.target.classList.contains('ig-tln-drag-grip') || e.target.classList.contains('ig-tln-col-resizer') || e.target.classList.contains('ig-tln-thumb-icon')) return;
+
+              injectText(item.text);
+
+              const originalBg = el.style.background;
+              el.style.background = 'rgba(16, 185, 129, 0.2)';
+              setTimeout(() => { el.style.background = originalBg; }, 200);
+            };
+
+            const previewBtn = el.querySelector('.preview-btn');
+            const previewBox = el.querySelector('.ig-tln-preview');
+            previewBtn.onclick = (e) => { e.stopPropagation(); previewBox.classList.toggle('visible'); };
+
+            const editBtn = el.querySelector('.edit-btn');
+            editBtn.onclick = (e) => { e.stopPropagation(); openSnippetEditor(item, libUI); };
+
+            containerElement.appendChild(el);
+          }
+        });
+      }
+
+      const renderRoot = activeFolderFilter === 'All' ? 'root' : activeFolderFilter;
+      buildNode(renderRoot, rootContainer);
+
+      core.emit('tl:tree-rendered', libUI);
+    }
+
+    // Register Menu Natively (No more hijacking!)
+    function mountCard(attemptsLeft = 10) {
+      if (typeof core.registerMenu === 'function') {
+        core.registerMenu('left', '📝 Text Library', libUI, '⠿', 'text-library-module');
+        buildFilterWindow(libUI);
+        renderTree();
+        console.log('[TextLibraryModule] Unified Table UI loaded natively.');
+      } else if (attemptsLeft > 0) {
+        setTimeout(() => mountCard(attemptsLeft - 1), 200);
+      }
+    }
+
+    mountCard();
+  }
+});
+
+/* ============================================================
+   BLOCK: image manager (v1)
+   ============================================================ */
+/* ============================================================
+   BLOCK: Text Library Image Manager (Right-Side Icon & Viewer)
+   - Completely separate extension. 
+   - Handles file uploading, compression, and hover viewing.
+   ============================================================ */
+LegoCore.registerBlock({
+  id: 'textLibraryImageManager',
+  init(core) {
+    const PRO_KEY = 'ig_text_library_pro_v1';
+    
+    const style = document.createElement('style');
+    style.innerHTML = `
+      .ig-tln-thumb-btn { 
+        background: transparent; border: none; font-size: 11px; cursor: pointer; 
+        padding: 4px; border-radius: 4px; transition: 0.1s; margin-right: 2px;
+      }
+      .ig-tln-thumb-btn:hover { background: rgba(255,255,255,0.1); }
+      .ig-tln-thumb-btn:active { transform: scale(0.9); }
+    `;
+    document.head.appendChild(style);
+
+    const thumbViewer = document.createElement('div');
+    thumbViewer.style.cssText = 'position:fixed; z-index:2147483647; max-width:250px; max-height:250px; border-radius:8px; box-shadow:0 10px 30px rgba(0,0,0,0.8); pointer-events:none; display:none; background:#0f172a; padding:6px; border:1px solid #334155;';
+    const thumbViewerImg = document.createElement('img');
+    thumbViewerImg.style.cssText = 'max-width:100%; max-height:100%; border-radius:4px; object-fit:contain; display:block;';
+    thumbViewer.appendChild(thumbViewerImg);
+    document.body.appendChild(thumbViewer);
+
+    function compressImage(file, maxSize, callback) {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const img = new Image();
+        img.onload = () => {
+          const canvas = document.createElement('canvas');
+          let w = img.width; let h = img.height;
+          if (w > maxSize || h > maxSize) {
+            const ratio = Math.min(maxSize / w, maxSize / h);
+            w *= ratio; h *= ratio;
+          }
+          canvas.width = w; canvas.height = h;
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0, w, h);
+          callback(canvas.toDataURL('image/jpeg', 0.8));
+        };
+        img.src = e.target.result;
+      };
+      reader.readAsDataURL(file);
+    }
+
+    core.on('tl:tree-rendered', (contentArea) => {
+      const libraryData = JSON.parse(localStorage.getItem(PRO_KEY));
+      if (!libraryData) return;
+
+      contentArea.querySelectorAll('.ig-tln-snippet').forEach(row => {
+        const id = row.dataset.id;
+        const item = libraryData.items.find(i => i.id === id);
+        
+        if (item && item.thumbnail && !row.querySelector('.ig-tln-thumb-btn')) {
+          const actionsDiv = row.querySelector('.ig-tln-actions');
+          const btn = document.createElement('button');
+          btn.className = 'ig-tln-thumb-btn ig-tln-thumb-icon';
+          btn.title = 'Hold to view thumbnail';
+          btn.innerText = '🖼️';
+          
+          btn.onmousedown = (e) => {
+            e.stopPropagation();
+            thumbViewerImg.src = item.thumbnail;
+            thumbViewer.style.left = (e.clientX - 265) + 'px'; 
+            thumbViewer.style.top = (e.clientY + 10) + 'px';
+            thumbViewer.style.display = 'block';
+          };
+          const hide = () => thumbViewer.style.display = 'none';
+          btn.onmouseup = hide; btn.onmouseleave = hide; btn.onclick = e => e.stopPropagation();
+          
+          actionsDiv.insertBefore(btn, actionsDiv.firstChild);
+        }
+      });
+    });
+
+    const observer = new MutationObserver((mutations) => {
+      mutations.forEach(m => {
+        m.addedNodes.forEach(node => {
+          if (node.nodeType === 1 && node.querySelector('#ig-tlp-modal-box')) {
+            const overlay = node;
+            const modal = overlay.querySelector('#ig-tlp-modal-box');
+            const tagSection = Array.from(modal.querySelectorAll('div')).find(d => d.innerText.includes('Assign Tags:'));
+            
+            if (!tagSection || modal.querySelector('#ig-tlc-thumb-upload')) return;
+
+            const currentThumb = overlay.dataset.thumbnail || '';
+            
+            const thumbUI = document.createElement('div');
+            thumbUI.innerHTML = `
+              <div style="font-size:11px; font-weight:bold; color:#94a3b8; margin-top:4px;">Thumbnail Image (Optional):</div>
+              <div style="display:flex; gap:8px; align-items:center;">
+                <input type="file" id="ig-tlc-thumb-upload" accept="image/*" style="font-size:10px; color:#fff; width:180px;">
+                <button id="ig-tlc-thumb-clear" style="background:transparent; color:#f43f5e; border:none; cursor:pointer; font-size:10px; display:${currentThumb ? 'block' : 'none'};">Clear Image</button>
+              </div>
+              <img id="ig-tlc-thumb-preview" src="${currentThumb}" style="max-height:40px; border-radius:4px; display:${currentThumb ? 'block' : 'none'}; object-fit:contain; margin-top:4px;">
+            `;
+            
+            modal.insertBefore(thumbUI, tagSection);
+
+            const upload = thumbUI.querySelector('#ig-tlc-thumb-upload');
+            const clear = thumbUI.querySelector('#ig-tlc-thumb-clear');
+            const preview = thumbUI.querySelector('#ig-tlc-thumb-preview');
+
+            upload.onchange = (e) => {
+              const file = e.target.files[0];
+              if (file) {
+                compressImage(file, 400, (base64) => {
+                  overlay.dataset.thumbnail = base64; 
+                  preview.src = base64;
+                  preview.style.display = 'block';
+                  clear.style.display = 'block';
+                });
+              }
+            };
+
+            clear.onclick = () => {
+              overlay.dataset.thumbnail = 'CLEAR'; 
+              preview.style.display = 'none';
+              clear.style.display = 'none';
+              upload.value = '';
+            };
+          }
+        });
+      });
+    });
+
+    observer.observe(document.body, { childList: true, subtree: true });
+    console.log('[TextLibraryImageManager] Loaded: Image Logic successfully decoupled.');
+    core.emit('block:ready', { id: 'textLibraryImageManager' });
+  }
+});
+
+/* ============================================================
+   BLOCK: Highlighter (v1)
+   ============================================================ */
+/* ============================================================
+   BLOCK: Text Highlighter (v1)
+   ------------------------------------------------------------
+   Standalone plugin -- no dependency on any other block. Mounts
+   its own card into the Dual Sidebar via core.registerMenu, same
+   as your other cards.
+
+   Replaces your bookmarklet with:
+   - A saved list of highlight rules (term + color + on/off),
+     persisted across sessions
+   - Each rule gets its own color, chosen via a native color
+     swatch, from a rotating default palette when you add one
+   - A live match count per rule (how many currently-visible
+     elements match it right now)
+   - A master pause toggle
+   - Clean un-highlighting: turning a rule off or deleting it
+     removes exactly the styling it applied (tracked per element
+     via a data attribute), rather than just piling more styles
+     on top like the bookmarklet did
+   ============================================================ */
+LegoCore.registerBlock({
+  id: 'textHighlighterPlugin',
+  init(core) {
+    const RULES_KEY = 'ig_text_highlighter_rules_v1';
+    const MASTER_KEY = 'ig_text_highlighter_master_v1';
+    const PALETTE = ['#f6c344', '#7ee787', '#ff8fa3', '#8ecae6', '#c9a876', '#ff9770', '#c792ea', '#94e2c4'];
+
+    let rules = [];
+    try { rules = JSON.parse(localStorage.getItem(RULES_KEY)) || []; } catch (e) { rules = []; }
+
+    let masterEnabled = localStorage.getItem(MASTER_KEY) !== 'false';
+
+    function saveRules() { localStorage.setItem(RULES_KEY, JSON.stringify(rules)); }
+    function saveMaster() { localStorage.setItem(MASTER_KEY, String(masterEnabled)); }
+
+    function nextPaletteColor() {
+      const used = rules.map(r => r.color);
+      const free = PALETTE.find(c => !used.includes(c));
+      return free || PALETTE[rules.length % PALETTE.length];
+    }
+
+    function contrastColor(hex) {
+      const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
+      const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+      return luminance > 0.6 ? '#000000' : '#ffffff';
+    }
+
+    function uid() { return 'hlrule_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
+
+    // ---------------- Styles ----------------
+    function injectStyles() {
+      if (document.getElementById('ig-hl-styles')) return;
+      const style = document.createElement('style');
+      style.id = 'ig-hl-styles';
+      style.innerHTML = `
+        .ig-hl-wrap { display:flex; flex-direction:column; gap:8px; font-family:-apple-system,sans-serif; font-size:11px; }
+        .ig-hl-master { display:flex; align-items:center; justify-content:space-between; background:var(--igls-surface-2,#1c1c23); border:1px solid var(--igls-border,rgba(255,255,255,.07)); border-radius:6px; padding:6px 8px; }
+        .ig-hl-master label { display:flex; align-items:center; gap:6px; cursor:pointer; font-size:10.5px; color:var(--igls-text-dim,#96949c); }
+        .ig-hl-add-row { display:flex; gap:4px; align-items:center; }
+        .ig-hl-input { flex:1; background:var(--igls-surface-2,#1c1c23); color:var(--igls-text,#ece9e4); border:1px solid var(--igls-border,rgba(255,255,255,.08)); border-radius:6px; padding:6px 8px; font-size:11px; outline:none; }
+        .ig-hl-input:focus { border-color:var(--igls-accent,#c9a876); }
+        .ig-hl-color-input { width:26px; height:26px; border:1px solid var(--igls-border,rgba(255,255,255,.1)); border-radius:6px; cursor:pointer; background:transparent; padding:0; flex-shrink:0; }
+        .ig-hl-add-btn { background:var(--igls-accent,#c9a876); color:#171208; border:none; border-radius:6px; padding:6px 10px; font-size:11px; font-weight:700; cursor:pointer; flex-shrink:0; }
+        .ig-hl-add-btn:hover { filter:brightness(1.08); }
+
+        .ig-hl-list { display:flex; flex-direction:column; gap:4px; max-height:280px; overflow-y:auto; }
+        .ig-hl-row { display:flex; align-items:center; gap:6px; background:rgba(255,255,255,.03); border:1px solid var(--igls-border,rgba(255,255,255,.06)); border-radius:6px; padding:5px 6px; }
+        .ig-hl-row.disabled { opacity:.45; }
+        .ig-hl-term { flex:1; font-size:11px; color:var(--igls-text,#ece9e4); font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; cursor:pointer; }
+        .ig-hl-term:hover { text-decoration:underline; }
+        .ig-hl-count { font-size:9px; color:var(--igls-text-dim,#96949c); background:rgba(255,255,255,.06); padding:1px 6px; border-radius:8px; flex-shrink:0; min-width:14px; text-align:center; }
+        .ig-hl-btn { background:transparent; border:none; color:var(--igls-text-dim,#96949c); cursor:pointer; font-size:11px; padding:3px; border-radius:4px; flex-shrink:0; }
+        .ig-hl-btn:hover { color:var(--igls-accent,#c9a876); background:rgba(255,255,255,.08); }
+        .ig-hl-empty { padding:14px; text-align:center; font-size:10.5px; color:var(--igls-text-dim,#96949c); }
+      `;
+      document.head.appendChild(style);
+    }
+
+    // ---------------- UI ----------------
+    const wrap = document.createElement('div');
+    wrap.className = 'ig-hl-wrap';
+    wrap.innerHTML = `
+      <div class="ig-hl-master">
+        <label><input type="checkbox" id="ig-hl-master-chk" ${masterEnabled ? 'checked' : ''}> Highlighting active</label>
+      </div>
+      <div class="ig-hl-add-row">
+        <input type="text" id="ig-hl-new-term" class="ig-hl-input" placeholder="Name or word to highlight...">
+        <input type="color" id="ig-hl-new-color" class="ig-hl-color-input" value="${nextPaletteColor()}">
+        <button id="ig-hl-add-btn" class="ig-hl-add-btn">+ Add</button>
+      </div>
+      <div id="ig-hl-list" class="ig-hl-list"></div>
+    `;
+
+    function renderList() {
+      const list = wrap.querySelector('#ig-hl-list');
+      list.innerHTML = '';
+      if (!rules.length) {
+        list.innerHTML = '<div class="ig-hl-empty">No highlights yet. Add a name or word above.</div>';
+        return;
+      }
+      rules.forEach(rule => {
+        const row = document.createElement('div');
+        row.className = 'ig-hl-row' + (rule.enabled ? '' : ' disabled');
+        row.dataset.ruleId = rule.id;
+        row.innerHTML = `
+          <input type="checkbox" class="ig-hl-toggle" ${rule.enabled ? 'checked' : ''} title="On/off">
+          <input type="color" class="ig-hl-color-input ig-hl-row-color" value="${rule.color}">
+          <span class="ig-hl-term" title="Click to rename">${rule.term}</span>
+          <span class="ig-hl-count" data-count-for="${rule.id}">0</span>
+          <button class="ig-hl-btn ig-hl-del" title="Delete">❌</button>
+        `;
+
+        row.querySelector('.ig-hl-toggle').onchange = e => {
+          rule.enabled = e.target.checked;
+          row.classList.toggle('disabled', !rule.enabled);
+          saveRules();
+          scanAndHighlight();
+        };
+
+        row.querySelector('.ig-hl-row-color').onchange = e => {
+          rule.color = e.target.value;
+          saveRules();
+          // Force a fresh pass so already-highlighted elements pick up the new color
+          document.querySelectorAll(`[data-ig-hl-id="${rule.id}"]`).forEach(el => {
+            el.style.backgroundColor = rule.color;
+            el.style.color = contrastColor(rule.color);
+          });
+        };
+
+        row.querySelector('.ig-hl-term').onclick = () => {
+          const name = prompt('Rename highlight:', rule.term);
+          if (!name || !name.trim()) return;
+          rule.term = name.trim();
+          saveRules();
+          renderList();
+        };
+
+        row.querySelector('.ig-hl-del').onclick = () => {
+          if (!confirm(`Remove highlight "${rule.term}"?`)) return;
+          document.querySelectorAll(`[data-ig-hl-id="${rule.id}"]`).forEach(el => clearHighlight(el));
+          rules = rules.filter(r => r.id !== rule.id);
+          saveRules();
+          renderList();
+        };
+
+        list.appendChild(row);
+      });
+    }
+
+    wrap.querySelector('#ig-hl-master-chk').onchange = e => {
+      masterEnabled = e.target.checked;
+      saveMaster();
+      if (!masterEnabled) {
+        document.querySelectorAll('[data-ig-hl-id]').forEach(el => clearHighlight(el));
+      }
+    };
+
+    wrap.querySelector('#ig-hl-add-btn').onclick = () => {
+      const input = wrap.querySelector('#ig-hl-new-term');
+      const colorInput = wrap.querySelector('#ig-hl-new-color');
+      const term = input.value.trim();
+      if (!term) return;
+      rules.push({ id: uid(), term, color: colorInput.value, enabled: true });
+      saveRules();
+      input.value = '';
+      colorInput.value = nextPaletteColor();
+      renderList();
+      scanAndHighlight();
+    };
+
+    wrap.querySelector('#ig-hl-new-term').addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); wrap.querySelector('#ig-hl-add-btn').click(); }
+    });
+
+    // ---------------- Scan & highlight ----------------
+    function clearHighlight(el) {
+      delete el.dataset.igHlId;
+      el.style.backgroundColor = '';
+      el.style.color = '';
+      el.style.fontWeight = '';
+      el.style.borderRadius = '';
+      el.style.padding = '';
+    }
+
+    function scanAndHighlight() {
+      if (!masterEnabled) return;
+      const enabledRules = rules.filter(r => r.enabled && r.term.trim());
+      const counts = {};
+      enabledRules.forEach(r => { counts[r.id] = 0; });
+
+      const spans = document.querySelectorAll('div[role="link"] span, div[role="button"] span');
+      spans.forEach(s => {
+        const text = (s.innerText || '').toLowerCase();
+        if (!text) { if (s.dataset.igHlId) clearHighlight(s); return; }
+
+        let matched = null;
+        for (const r of enabledRules) {
+          if (text.includes(r.term.toLowerCase())) { matched = r; break; }
+        }
+
+        if (matched) {
+          counts[matched.id] = (counts[matched.id] || 0) + 1;
+          if (s.dataset.igHlId !== matched.id) {
+            s.dataset.igHlId = matched.id;
+            s.style.backgroundColor = matched.color;
+            s.style.color = contrastColor(matched.color);
+            s.style.fontWeight = 'bold';
+            s.style.borderRadius = '3px';
+            s.style.padding = '0 2px';
+          }
+        } else if (s.dataset.igHlId) {
+          clearHighlight(s);
+        }
+      });
+
+      Object.keys(counts).forEach(id => {
+        const badge = wrap.querySelector(`[data-count-for="${id}"]`);
+        if (badge) badge.innerText = counts[id];
+      });
+    }
+
+    setInterval(scanAndHighlight, 500);
+
+    // ---------------- Mount ----------------
+    function mountCard(attemptsLeft) {
+      attemptsLeft = attemptsLeft === undefined ? 10 : attemptsLeft;
+      if (typeof core.registerMenu === 'function') {
+        injectStyles();
+        core.registerMenu('left', '🖍️ Text Highlighter', wrap, '⠿', 'text-highlighter');
+        renderList();
+      } else if (attemptsLeft > 0) {
+        setTimeout(() => mountCard(attemptsLeft - 1), 200);
+      }
+    }
+    mountCard();
+
+    core.emit('block:ready', { id: 'textHighlighterPlugin' });
+  }
+});
+
+/* ============================================================
+   BLOCK: Commands (v7)
+   ============================================================ */
+/* ================================================================
+   BLOCK: Quick Command Extension (v6 - Automation Send Fix)
+   ------------------------------------------------------------
+   Standalone plugin -- upgrades the "💬 Quick Chat" card with
+   slash command searches, including Text, Audio, and ManyChat
+   Automations (Flows) with a safety preview confirmation.
+================================================================ */
+LegoCore.registerBlock({
+  id: 'quickCommandExtension',
+  init(core) {
+    const TEXT_LIB_KEY = 'ig_text_library_pro_v1';
+    const EFFECTS_KEY = 'ig_quick_effects_enabled_v1';
+    const MC_FLOWS_KEY = 'mc_flows_cache_v1';
+    const MC_API_KEY = 'mc_api_key_v1';
+    const MC_TARGET_KEY = 'mc_target_subscriber_v1';
+
+    // ---------------- Data helpers ----------------
+    function withDb(cb) {
+      const existing = core.getDb();
+      if (existing) { cb(existing); return; }
+      core.on('db:ready', db => cb(db));
+    }
+
+    function getTextLibraryData() {
+      try { return JSON.parse(localStorage.getItem(TEXT_LIB_KEY)) || { items: [], tags: [] }; }
+      catch (e) { return { items: [], tags: [] }; }
+    }
+
+    function saveTextLibraryData(data) {
+      localStorage.setItem(TEXT_LIB_KEY, JSON.stringify(data));
+    }
+
+    function getAllSearchableItems() {
+      return new Promise(resolve => {
+        withDb(db => {
+          const tx = db.transaction(['clips'], 'readonly');
+          tx.objectStore('clips').getAll().onsuccess = e => {
+            const clips = e.target.result || [];
+            const textData = getTextLibraryData();
+            const textItems = textData.items.filter(i => i.type === 'snippet');
+            let mcFlows = [];
+            try { mcFlows = JSON.parse(localStorage.getItem(MC_FLOWS_KEY)) || []; } catch (err) {}
+            resolve({ clips, textItems, mcFlows });
+          };
+        });
+      });
+    }
+
+    function computeMatches(query, mode, clips, textItems, mcFlows) {
+      const q = (query || '').trim().toLowerCase();
+      let results = [];
+
+      if (mode !== 'audio' && mode !== 'flow') {
+        textItems.forEach(item => {
+          const cmd = (item.customCommand || '').toLowerCase();
+          const titleMatch = (item.title || '').toLowerCase().includes(q);
+          const contentMatch = (item.text || '').toLowerCase().includes(q);
+          const cmdExact = cmd && cmd === q;
+          const cmdPrefix = cmd && q.length > 0 && cmd.startsWith(q);
+          if (!q || titleMatch || contentMatch || cmdPrefix) {
+            results.push({
+              kind: 'text',
+              item,
+              score: cmdExact ? 100 : cmdPrefix ? 85 : titleMatch ? 50 : 30
+            });
+          }
+        });
+      }
+
+      if (mode !== 'text' && mode !== 'flow') {
+        clips.forEach(clip => {
+          const cmd = (clip.customCommand || '').toLowerCase();
+          const nameMatch = (clip.name || '').toLowerCase().includes(q);
+          const cmdExact = cmd && cmd === q;
+          const cmdPrefix = cmd && q.length > 0 && cmd.startsWith(q);
+          if (!q || nameMatch || cmdPrefix) {
+            results.push({
+              kind: 'audio',
+              item: clip,
+              score: cmdExact ? 100 : cmdPrefix ? 85 : nameMatch ? 50 : 30
+            });
+          }
+        });
+      }
+
+      if (mode !== 'text' && mode !== 'audio') {
+        mcFlows.forEach(flow => {
+          const nameMatch = (flow.name || '').toLowerCase().includes(q);
+          if (!q || nameMatch) {
+            results.push({
+              kind: 'flow',
+              item: flow,
+              score: nameMatch ? 60 : 40
+            });
+          }
+        });
+      }
+
+      results.sort((a, b) => b.score - a.score);
+      return results.slice(0, 8);
+    }
+
+    function getAllFolders() {
+      return new Promise(resolve => {
+        withDb(db => {
+          const tx = db.transaction(['folders'], 'readonly');
+          const names = [];
+          tx.objectStore('folders').openCursor().onsuccess = e => {
+            const cursor = e.target.result;
+            if (cursor) { names.push(cursor.value.name); cursor.continue(); }
+            else resolve(names);
+          };
+        });
+      });
+    }
+
+    function sendManyChatFlow(flowNs) {
+      return new Promise((resolve, reject) => {
+        const apiKey = localStorage.getItem(MC_API_KEY) || '';
+        const subscriberId = localStorage.getItem(MC_TARGET_KEY) || '';
+
+        if (!apiKey) return reject(new Error('No ManyChat API Key found. Configure ManyChat first.'));
+        if (!subscriberId) return reject(new Error('No Target Subscriber ID set. Look up user first.'));
+
+        const payload = {
+          subscriber_id: parseInt(subscriberId, 10),
+          flow_ns: flowNs
+        };
+
+        if (typeof GM_xmlhttpRequest === 'undefined') {
+          return reject(new Error('GM_xmlhttpRequest not available.'));
+        }
+
+        GM_xmlhttpRequest({
+          method: 'POST',
+          url: 'https://api.manychat.com/fb/sending/sendFlow',
+          headers: {
+            'Authorization': 'Bearer ' + apiKey,
+            'Content-Type': 'application/json'
+          },
+          data: JSON.stringify(payload),
+          onload: function (response) {
+            if (response.status >= 200 && response.status < 300) resolve();
+            else reject(new Error('API error: ' + response.status));
+          },
+          onerror: function () { reject(new Error('Network error.')); }
+        });
+      });
+    }
+
+    // Silence-trim helpers
+    async function detectAndTrimSilence(blob, cutStart, cutEnd, customThreshold) {
+      try {
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const audioBuffer = await audioCtx.decodeAudioData(await blob.arrayBuffer());
+        const channelData = audioBuffer.getChannelData(0);
+        const sr = audioBuffer.sampleRate;
+        const threshold = parseFloat(customThreshold) || 0.035;
+        let startIdx = 0, endIdx = channelData.length;
+        if (cutStart) { for (let i = 0; i < channelData.length; i++) { if (Math.abs(channelData[i]) > threshold) { startIdx = Math.max(0, i - Math.floor(sr * 0.05)); break; } } }
+        if (cutEnd) { for (let i = channelData.length - 1; i >= 0; i--) { if (Math.abs(channelData[i]) > threshold) { endIdx = Math.min(channelData.length, i + Math.floor(sr * 0.15)); break; } } }
+        if (startIdx >= endIdx) return blob;
+        const trimmed = audioCtx.createBuffer(audioBuffer.numberOfChannels, endIdx - startIdx, sr);
+        for (let c = 0; c < audioBuffer.numberOfChannels; c++) trimmed.getChannelData(c).set(audioBuffer.getChannelData(c).subarray(startIdx, endIdx));
+        return new Blob([audioBufferToWav(trimmed)], { type: 'audio/mp4' });
+      } catch (e) { return blob; }
+    }
+
+    function audioBufferToWav(buffer) {
+      const numChannels = buffer.numberOfChannels, sr = buffer.sampleRate, format = 1, bitDepth = 16;
+      const result = numChannels === 2 ? (function (l, r) { const res = new Float32Array(l.length + r.length); for (let i = 0, j = 0; i < l.length; i++) { res[j++] = l[i]; res[j++] = r[i]; } return res; })(buffer.getChannelData(0), buffer.getChannelData(1)) : buffer.getChannelData(0);
+      const dataLength = result.length * (bitDepth / 8);
+      const wav = new Uint8Array(44 + dataLength);
+      const view = new DataView(wav.buffer);
+      const ws = (v, o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+      ws(view, 0, 'RIFF'); view.setUint32(4, 36 + dataLength, true);
+      ws(view, 8, 'WAVE'); ws(view, 12, 'fmt ');
+      view.setUint32(16, 16, true); view.setUint16(20, format, true);
+      view.setUint16(22, numChannels, true); view.setUint32(24, sr, true);
+      view.setUint32(28, sr * numChannels * (bitDepth / 8), true);
+      view.setUint16(32, numChannels * (bitDepth / 8), true);
+      view.setUint16(34, bitDepth, true); ws(view, 36, 'data');
+      view.setUint32(40, dataLength, true);
+      for (let i = 0, offset = 44; i < result.length; i++, offset += 2) {
+        let s = Math.max(-1, Math.min(1, result[i]));
+        view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      }
+      return wav;
+    }
+
+    // ---------------- Styles ----------------
+    const style = document.createElement('style');
+    style.id = 'ig-qcx-styles';
+    style.innerHTML = `
+      .ig-qcx-wrapper { position: relative; }
+
+      .ig-qcx-dropdown { position: fixed; max-height: 260px; overflow-y: auto; background: #0f172a; border: 1px solid #334155; border-radius: 8px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); z-index: 2147483647; display: none; flex-direction: column; padding: 4px; gap: 2px; }
+      .ig-qcx-dropdown::-webkit-scrollbar { width: 4px; }
+      .ig-qcx-dropdown::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+
+      .ig-qcx-dd-row { padding: 6px 8px; border-radius: 5px; cursor: pointer; transition: background 0.1s; }
+      .ig-qcx-dd-row:hover { background: rgba(255,255,255,0.06); }
+      .ig-qcx-dd-row.selected { background: #6366f1; }
+      .ig-qcx-dd-row-top { display: flex; align-items: center; gap: 6px; }
+      .ig-qcx-dd-title { flex: 1; font-weight: bold; color: #f8fafc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 11px; }
+      .ig-qcx-dd-cmd { font-size: 9px; background: rgba(255,255,255,0.12); color: #c9a876; padding: 1px 6px; border-radius: 8px; font-weight: bold; flex-shrink: 0; }
+      .ig-qcx-dd-preview { font-size: 10px; color: #94a3b8; margin-top: 2px; padding-left: 20px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .ig-qcx-dd-empty { padding: 10px; text-align: center; color: #94a3b8; font-size: 10px; }
+
+      .ig-qcx-audio-row { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
+
+      .ig-qcx-overlay-row {
+        position: absolute; top: 6px; right: 6px; left: 6px;
+        display: flex; align-items: center; justify-content: flex-end; gap: 4px;
+        pointer-events: none;
+      }
+      .ig-qcx-overlay-row > * { pointer-events: auto; }
+
+      .ig-qcx-record-btn { background: #dc2626; border: none; color: white; font-size: 11px; width: 26px; height: 26px; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: 0.15s; box-shadow: 0 1px 4px rgba(0,0,0,0.4); }
+      .ig-qcx-record-btn:hover { filter: brightness(1.1); }
+      .ig-qcx-record-btn.recording { background: #7f1d1d; animation: ig-qcx-pulse 1s infinite; }
+      .ig-qcx-record-btn:disabled { opacity: 0.6; cursor: default; }
+      @keyframes ig-qcx-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+      .ig-qcx-preview-bar { flex: 1; min-width: 0; display: flex; align-items: center; gap: 4px; background: rgba(15, 23, 42, 0.95); border: 1px solid #334155; border-radius: 6px; padding: 3px 6px; box-shadow: 0 1px 4px rgba(0,0,0,0.4); }
+      .ig-qcx-preview-label { flex: 1; min-width: 0; font-size: 10px; font-weight: bold; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .ig-qcx-icon-btn { background: transparent; border: none; color: var(--igls-text-dim, #96949c); cursor: pointer; font-size: 12px; padding: 2px 5px; border-radius: 4px; transition: 0.15s; flex-shrink: 0; }
+      .ig-qcx-icon-btn:hover { color: var(--igls-accent, #c9a876); background: rgba(255,255,255,0.1); }
+
+      .ig-qcx-gear-btn { background: transparent; border: none; color: var(--igls-text-dim, #96949c); cursor: pointer; font-size: 12px; padding: 2px 5px; border-radius: 4px; transition: 0.15s; }
+      .ig-qcx-gear-btn:hover { color: var(--igls-accent, #c9a876); background: rgba(255,255,255,0.1); }
+
+      .ig-qcx-modal-overlay { position: fixed; top:0; left:0; right:0; bottom:0; background: rgba(0,0,0,0.6); z-index: 2147483647; display: flex; justify-content: center; align-items: center; }
+      .ig-qcx-modal { background: #0f172a; border: 1px solid #334155; border-radius: 8px; width: 380px; max-height: 80vh; padding: 16px; display: flex; flex-direction: column; gap: 10px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
+      .ig-qcx-modal h3 { margin: 0; font-size: 14px; color: #fff; }
+      .ig-qcx-mgr-search { width: 100%; box-sizing: border-box; background: #1e293b; border: 1px solid #475569; color: #fff; padding: 8px; border-radius: 4px; font-size: 12px; outline: none; }
+      .ig-qcx-mgr-search:focus { border-color: #6366f1; }
+      .ig-qcx-mgr-list { overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 4px; }
+      .ig-qcx-mgr-row { display: flex; align-items: center; gap: 6px; background: rgba(255,255,255,0.03); padding: 6px 8px; border-radius: 6px; }
+      .ig-qcx-mgr-name { flex: 1; font-size: 11px; color: #f8fafc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .ig-qcx-mgr-cmd-input { width: 90px; background: #1e293b; border: 1px solid #475569; color: #c9a876; padding: 4px 6px; border-radius: 4px; font-size: 10px; outline: none; }
+      .ig-qcx-mgr-cmd-input:focus { border-color: #6366f1; }
+    `;
+    document.head.appendChild(style);
+
+    // ---------------- Attach to the existing Quick Chat card ----------------
+    let enhanced = false;
+
+    function tryEnhance() {
+      if (enhanced) return;
+      const card = document.querySelector('.ig-draggable-menu[data-key="quick-chat-box"]');
+      if (!card) return;
+
+      const oldInput = card.querySelector('#ig-quick-chat-input');
+      const oldSendBtn = card.querySelector('#ig-quick-chat-send');
+      const header = card.querySelector('.ig-menu-header');
+      if (!oldInput || !oldSendBtn || !header) return;
+
+      enhanced = true;
+      enhanceCard(card, oldInput, oldSendBtn, header);
+    }
+
+    function enhanceCard(card, oldInput, oldSendBtn, header) {
+      const keepFocusChk = card.querySelector('#ig-qc-keep-focus');
+
+      const input = oldInput.cloneNode(true);
+      oldInput.parentNode.replaceChild(input, oldInput);
+      input.placeholder = 'Type message, or / to search (text/audio/flow)...';
+      input.style.paddingRight = '76px';
+
+      const sendBtn = oldSendBtn.cloneNode(true);
+      oldSendBtn.parentNode.replaceChild(sendBtn, oldSendBtn);
+
+      const controlsRow = sendBtn.closest('div');
+      sendBtn.remove();
+      controlsRow.style.justifyContent = 'flex-start';
+      sendBtn.innerText = '📤';
+      sendBtn.title = 'Send (Enter)';
+      sendBtn.style.cssText = 'background:#10b981; color:#fff; border:none; border-radius:50%; width:26px; height:26px; padding:0; font-size:12px; font-weight:bold; cursor:pointer; display:flex; align-items:center; justify-content:center; flex-shrink:0; box-shadow:0 1px 4px rgba(0,0,0,0.4); transition:0.15s;';
+
+      const recordBtn = document.createElement('button');
+      recordBtn.className = 'ig-qcx-record-btn';
+      recordBtn.title = 'Record a quick audio clip';
+      recordBtn.innerText = '🔴';
+
+      const wrapper = document.createElement('div');
+      wrapper.className = 'ig-qcx-wrapper';
+      input.parentNode.insertBefore(wrapper, input);
+      wrapper.appendChild(input);
+
+      const previewBar = document.createElement('div');
+      previewBar.className = 'ig-qcx-preview-bar';
+      previewBar.style.display = 'none';
+      previewBar.innerHTML = `
+        <span class="ig-qcx-preview-label"></span>
+        <button class="ig-qcx-icon-btn ig-qcx-preview-play" title="Play">▶️</button>
+        <button class="ig-qcx-icon-btn ig-qcx-preview-discard" title="Discard">🗑️</button>
+      `;
+
+      const overlayRow = document.createElement('div');
+      overlayRow.className = 'ig-qcx-overlay-row';
+      overlayRow.appendChild(previewBar);
+      overlayRow.appendChild(recordBtn);
+      overlayRow.appendChild(sendBtn);
+      wrapper.appendChild(overlayRow);
+
+      const previewLabel = previewBar.querySelector('.ig-qcx-preview-label');
+      const previewPlayBtn = previewBar.querySelector('.ig-qcx-preview-play');
+      const previewDiscardBtn = previewBar.querySelector('.ig-qcx-preview-discard');
+
+      const dropdownEl = document.createElement('div');
+      dropdownEl.className = 'ig-qcx-dropdown';
+      document.body.appendChild(dropdownEl);
+
+      function positionDropdown() {
+        const rect = input.getBoundingClientRect();
+        const gap = 6;
+        const spaceAbove = rect.top - gap - 8;
+        dropdownEl.style.left = rect.left + 'px';
+        dropdownEl.style.width = rect.width + 'px';
+        dropdownEl.style.top = 'auto';
+        dropdownEl.style.bottom = (window.innerHeight - rect.top + gap) + 'px';
+        dropdownEl.style.maxHeight = Math.max(120, Math.min(260, spaceAbove)) + 'px';
+        document.body.appendChild(dropdownEl);
+      }
+
+      const gearBtn = document.createElement('button');
+      gearBtn.className = 'ig-qcx-gear-btn';
+      gearBtn.title = 'Configure custom commands';
+      gearBtn.innerText = '⚙️';
+      const toolbar = header.querySelector('.ig-card-toolbar');
+      const dragHandle = header.querySelector('.ig-drag-handle');
+      if (toolbar) toolbar.insertBefore(gearBtn, toolbar.firstChild);
+      else if (dragHandle) header.insertBefore(gearBtn, dragHandle);
+      else header.appendChild(gearBtn);
+
+      // ---------------- State ----------------
+      let dropdownOpen = false;
+      let matches = [];
+      let selectedIndex = 0;
+      
+      let pendingAudioBlob = null;
+      let pendingAudioName = '';
+      let pendingFlowNs = null;
+      let pendingFlowName = '';
+      let previewPlayer = null;
+
+      // ---------------- Dropdown ----------------
+      function openDropdown() {
+        dropdownOpen = true;
+        positionDropdown();
+        dropdownEl.style.display = 'flex';
+        renderDropdown();
+        window.addEventListener('scroll', onViewportChange, true);
+        window.addEventListener('resize', onViewportChange);
+      }
+      function closeDropdown() {
+        dropdownOpen = false;
+        dropdownEl.style.display = 'none';
+        matches = [];
+        selectedIndex = 0;
+        window.removeEventListener('scroll', onViewportChange, true);
+        window.removeEventListener('resize', onViewportChange);
+      }
+      function onViewportChange() {
+        if (dropdownOpen) positionDropdown();
+      }
+      function renderDropdown() {
+        dropdownEl.innerHTML = '';
+        if (!matches.length) {
+          dropdownEl.innerHTML = '<div class="ig-qcx-dd-empty">No matches</div>';
+          return;
+        }
+        matches.forEach((m, idx) => {
+          const row = document.createElement('div');
+          row.className = 'ig-qcx-dd-row' + (idx === selectedIndex ? ' selected' : '');
+          if (m.kind === 'folder' || m.kind === 'folder-new') {
+            const icon = m.kind === 'folder-new' ? '➕' : '📁';
+            const label = m.kind === 'folder-new' ? `Create "${m.name}"` : m.name;
+            row.innerHTML = `<div class="ig-qcx-dd-row-top"><span>${icon}</span><span class="ig-qcx-dd-title">${label}</span></div>`;
+          } else if (m.kind === 'flow') {
+            row.innerHTML = `<div class="ig-qcx-dd-row-top"><span>🤖</span><span class="ig-qcx-dd-title">${m.item.name}</span></div><div class="ig-qcx-dd-preview">ManyChat Automation</div>`;
+          } else {
+            const icon = m.kind === 'text' ? '📝' : '🎵';
+            const title = m.kind === 'text' ? m.item.title : m.item.name;
+            const cmdBadge = m.item.customCommand ? `<span class="ig-qcx-dd-cmd">/${m.item.customCommand}</span>` : '';
+            const preview = m.kind === 'text' ? `<div class="ig-qcx-dd-preview">${(m.item.text || '').slice(0, 70)}</div>` : '';
+            row.innerHTML = `<div class="ig-qcx-dd-row-top"><span>${icon}</span><span class="ig-qcx-dd-title">${title}</span>${cmdBadge}</div>${preview}`;
+          }
+          row.onmouseenter = () => { selectedIndex = idx; renderDropdown(); };
+          row.onclick = () => { selectedIndex = idx; pickSelected(); };
+          dropdownEl.appendChild(row);
+        });
+      }
+
+      async function recomputeMatches() {
+        const val = input.value;
+
+        const saveFolderMatch = val.match(/^\/save\s+audio\s+([^.]*)$/i);
+        if (saveFolderMatch) {
+          const rawQuery = saveFolderMatch[1].trim();
+          const query = rawQuery.toLowerCase();
+          const folders = await getAllFolders();
+          const filtered = folders.filter(f => !query || f.toLowerCase().includes(query));
+          matches = filtered.map(f => ({ kind: 'folder', name: f }));
+          if (query && !folders.some(f => f.toLowerCase() === query)) {
+            matches.push({ kind: 'folder-new', name: rawQuery });
+          }
+          selectedIndex = 0;
+          openDropdown();
+          return;
+        }
+        if (/^\/save\s+audio\s+[^.]+\..*$/i.test(val)) {
+          closeDropdown();
+          return;
+        }
+
+        if (!val.startsWith('/')) { closeDropdown(); return; }
+
+        const remainder = val.slice(1);
+        const lower = remainder.toLowerCase();
+        let mode = 'all', q = remainder;
+
+        if (lower.startsWith('text ')) { mode = 'text'; q = remainder.slice(5); }
+        else if (lower === 'text') { mode = 'text'; q = ''; }
+        else if (lower.startsWith('audio ')) { mode = 'audio'; q = remainder.slice(6); }
+        else if (lower === 'audio') { mode = 'audio'; q = ''; }
+        else if (lower.startsWith('flow ')) { mode = 'flow'; q = remainder.slice(5); }
+        else if (lower === 'flow') { mode = 'flow'; q = ''; }
+
+        const { clips, textItems, mcFlows } = await getAllSearchableItems();
+        matches = computeMatches(q, mode, clips, textItems, mcFlows);
+        selectedIndex = 0;
+        openDropdown();
+      }
+
+      function pickSelected() {
+        if (!matches.length) return;
+        const m = matches[selectedIndex];
+        
+        if (m.kind === 'folder' || m.kind === 'folder-new') {
+          input.value = `/save audio ${m.name}.`;
+          closeDropdown();
+          input.focus();
+          input.setSelectionRange(input.value.length, input.value.length);
+          return;
+        }
+        
+        if (m.kind === 'flow') {
+          pendingFlowNs = m.item.flow_ns;
+          pendingFlowName = m.item.name;
+          input.value = '';
+          closeDropdown();
+          showFlowPreview();
+          input.focus();
+          return;
+        }
+
+        if (m.kind === 'text') {
+          input.value = m.item.text;
+          clearPending();
+          closeDropdown();
+          input.focus();
+          input.setSelectionRange(input.value.length, input.value.length);
+        } else {
+          pendingAudioBlob = m.item.blob;
+          pendingAudioName = m.item.name;
+          input.value = '';
+          closeDropdown();
+          showAudioPreview();
+          input.focus();
+        }
+      }
+
+      // ---------------- Preview bar ----------------
+      function showFlowPreview() {
+        previewBar.style.display = 'flex';
+        previewLabel.innerText = '🤖 ' + pendingFlowName;
+        previewPlayBtn.style.display = 'none';
+      }
+      
+      function showAudioPreview() {
+        previewBar.style.display = 'flex';
+        previewLabel.innerText = '🎵 ' + pendingAudioName;
+        previewPlayBtn.style.display = '';
+      }
+      
+      function clearPending() {
+        pendingAudioBlob = null;
+        pendingAudioName = '';
+        pendingFlowNs = null;
+        pendingFlowName = '';
+        previewBar.style.display = 'none';
+        if (previewPlayer) { previewPlayer.pause(); previewPlayer = null; }
+        previewPlayBtn.innerText = '▶️';
+        previewPlayBtn.style.display = '';
+      }
+
+      previewPlayBtn.onclick = () => {
+        if (!pendingAudioBlob) return;
+        if (!previewPlayer) {
+          previewPlayer = new Audio(URL.createObjectURL(pendingAudioBlob));
+          previewPlayBtn.innerText = '⏹️';
+          previewPlayer.play();
+          previewPlayer.onended = () => { previewPlayBtn.innerText = '▶️'; previewPlayer = null; };
+        } else {
+          previewPlayer.pause();
+          previewPlayer = null;
+          previewPlayBtn.innerText = '▶️';
+        }
+      };
+      
+      previewDiscardBtn.onclick = () => clearPending();
+
+      // ---------------- Save recorded/picked audio into the Library ----------------
+      function saveAudioToLibrary(folder, name) {
+        if (!pendingAudioBlob) {
+          alert("No audio loaded to save yet. Record one with 🔴, or pull one up with /audio first.");
+          return;
+        }
+        const finalFolder = folder || 'General';
+        const finalName = name || ('clip_' + Date.now());
+        withDb(db => {
+          const tx = db.transaction(['folders', 'clips'], 'readwrite');
+          tx.objectStore('folders').put({ name: finalFolder });
+          const store = tx.objectStore('clips');
+          const countReq = store.count();
+          countReq.onsuccess = () => {
+            store.add({ name: finalName, folder: finalFolder, color: '#0095f6', order: countReq.result, blob: pendingAudioBlob, customCommand: '' });
+          };
+          tx.oncomplete = () => {
+            core.emit('folders:refresh');
+            core.emit('library:refresh');
+            input.value = '';
+            previewLabel.innerText = '✅ Saved to ' + finalFolder + ' / ' + finalName;
+            setTimeout(() => {
+              if (pendingAudioBlob) previewLabel.innerText = '🎵 ' + pendingAudioName;
+            }, 1400);
+          };
+        });
+      }
+
+      // ---------------- Sending ----------------
+      function sendText(text) {
+        const chatZone = document.querySelector('div[contenteditable="true"]');
+        if (!chatZone) { alert("Open an active Instagram chat window first."); return; }
+
+        chatZone.focus();
+        document.execCommand('insertText', false, text);
+
+        setTimeout(() => {
+          const enterEvent = new KeyboardEvent('keydown', {
+            key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true
+          });
+          chatZone.dispatchEvent(enterEvent);
+
+          if (keepFocusChk && keepFocusChk.checked) {
+            input.focus();
+            let attempts = 0;
+            const focusLock = setInterval(() => {
+              input.focus();
+              attempts++;
+              if (attempts > 5) clearInterval(focusLock);
+            }, 20);
+          }
+        }, 100);
+      }
+
+      function sendCurrent() {
+        if (pendingAudioBlob) {
+          core.injectClipToChat(pendingAudioBlob, pendingAudioName);
+          clearPending();
+          return;
+        }
+        
+        if (pendingFlowNs) {
+          const original = sendBtn.innerText;
+          sendBtn.innerText = '⏳';
+          previewLabel.innerText = '🤖 Sending...';
+          
+          sendManyChatFlow(pendingFlowNs)
+            .then(() => {
+              sendBtn.innerText = '✅';
+              previewLabel.innerText = '✅ Sent!';
+              setTimeout(() => { 
+                sendBtn.innerText = original; 
+                clearPending(); 
+              }, 1500);
+            })
+            .catch(err => {
+              alert('Failed to send automation: ' + err.message);
+              sendBtn.innerText = '❌';
+              previewLabel.innerText = '❌ Failed';
+              setTimeout(() => { 
+                sendBtn.innerText = original; 
+                previewLabel.innerText = '🤖 ' + pendingFlowName;
+              }, 1500);
+            });
+          return;
+        }
+        
+        const text = input.value.trim();
+        if (!text) return;
+
+        input.value = '';
+        const original = sendBtn.innerText;
+        sendBtn.innerText = '✅';
+        sendBtn.style.background = '#059669';
+        setTimeout(() => {
+          sendBtn.innerText = original;
+          sendBtn.style.background = '#10b981';
+        }, 1000);
+
+        sendText(text);
+      }
+      sendBtn.onclick = sendCurrent;
+
+      // ---------------- Input events ----------------
+      input.addEventListener('input', () => { recomputeMatches(); });
+
+      input.addEventListener('keydown', (e) => {
+        if (dropdownOpen) {
+          if (e.key === 'ArrowDown') { e.preventDefault(); selectedIndex = (selectedIndex + 1) % matches.length; renderDropdown(); return; }
+          if (e.key === 'ArrowUp') { e.preventDefault(); selectedIndex = (selectedIndex - 1 + matches.length) % matches.length; renderDropdown(); return; }
+          if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); pickSelected(); return; }
+          if (e.key === 'Escape') { e.preventDefault(); closeDropdown(); return; }
+          // Removed the dangling return here so typing still flows normally
+        }
+        
+        if (e.key === 'Enter' && !e.shiftKey) {
+          e.preventDefault();
+          e.stopPropagation(); // Stop Instagram from interfering
+          
+          const saveMatch = input.value.match(/^\/save\s+audio\s+([^.]+)\.(.*)$/i);
+          if (saveMatch) {
+            saveAudioToLibrary(saveMatch[1].trim(), saveMatch[2].trim());
+            return;
+          }
+          sendCurrent();
+          return;
+        }
+        if (e.key === 'Escape') {
+          if (pendingAudioBlob || pendingFlowNs) clearPending();
+        }
+      });
+
+      document.addEventListener('click', (e) => {
+        if (dropdownOpen && !wrapper.contains(e.target) && !dropdownEl.contains(e.target)) closeDropdown();
+      });
+
+      // ---------------- Recording ----------------
+      let mediaRecorder;
+      let audioChunks = [];
+      let isRecording = false;
+
+      navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+        mediaRecorder = new MediaRecorder(stream);
+        mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+        mediaRecorder.onstop = async () => {
+          let blob = new Blob(audioChunks, { type: 'audio/mp4' });
+          audioChunks = [];
+
+          const effectsEnabled = localStorage.getItem(EFFECTS_KEY) !== 'false';
+          const trimStart = effectsEnabled && localStorage.getItem('sb_quick_autotrim_start') === 'true';
+          const trimEnd = effectsEnabled && localStorage.getItem('sb_quick_autotrim_end') === 'true';
+          const threshold = localStorage.getItem('sb_quick_silence_threshold') || '0.035';
+          const autoSend = localStorage.getItem('sb_quick_autosend') === 'true';
+
+          if (trimStart || trimEnd) {
+            blob = await detectAndTrimSilence(blob, trimStart, trimEnd, threshold);
+          }
+
+          pendingAudioBlob = blob;
+          pendingAudioName = 'quick_audio_' + Date.now();
+          showAudioPreview();
+
+          if (autoSend) {
+            core.injectClipToChat(pendingAudioBlob, pendingAudioName);
+            clearPending();
+          }
+        };
+      }).catch(err => console.warn("[QuickCommandExtension] Mic error:", err));
+
+      recordBtn.onclick = () => {
+        if (!mediaRecorder) { alert("Microphone not initialized."); return; }
+        if (!isRecording) {
+          clearPending();
+          audioChunks = [];
+          mediaRecorder.start();
+          isRecording = true;
+          recordBtn.classList.add('recording');
+          recordBtn.innerText = '⏹️';
+        } else {
+          const lagMs = parseInt(localStorage.getItem('sb_quick_trailing_lag')) || 800;
+          recordBtn.innerText = '⏳';
+          recordBtn.disabled = true;
+          setTimeout(() => {
+            if (mediaRecorder.state === 'recording') mediaRecorder.stop();
+            isRecording = false;
+            recordBtn.classList.remove('recording');
+            recordBtn.innerText = '🔴';
+            recordBtn.disabled = false;
+          }, lagMs);
+        }
+      };
+
+      // ---------------- Command manager (gear icon) ----------------
+      gearBtn.onclick = async (e) => {
+        e.stopPropagation();
+        const overlay = document.createElement('div');
+        overlay.className = 'ig-qcx-modal-overlay';
+        overlay.innerHTML = `
+          <div class="ig-qcx-modal">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+              <h3>⚙️ Custom Commands</h3>
+              <button id="ig-qcx-mgr-close" style="background:none; border:none; color:#94a3b8; cursor:pointer; font-size:14px;">✕</button>
+            </div>
+            <input type="text" id="ig-qcx-mgr-search" class="ig-qcx-mgr-search" placeholder="🔍 Search items...">
+            <div id="ig-qcx-mgr-list" class="ig-qcx-mgr-list"></div>
+          </div>
+        `;
+        document.body.appendChild(overlay);
+        overlay.querySelector('#ig-qcx-mgr-close').onclick = () => overlay.remove();
+
+        const { clips, textItems } = await getAllSearchableItems();
+        const listEl = overlay.querySelector('#ig-qcx-mgr-list');
+        const searchEl = overlay.querySelector('#ig-qcx-mgr-search');
+
+        function renderMgrList() {
+          const term = searchEl.value.toLowerCase();
+          listEl.innerHTML = '';
+
+          const combined = [
+            ...textItems.map(i => ({ kind: 'text', item: i })),
+            ...clips.map(c => ({ kind: 'audio', item: c }))
+          ].filter(x => {
+            const name = x.kind === 'text' ? x.item.title : x.item.name;
+            return !term || (name || '').toLowerCase().includes(term);
+          });
+
+          if (!combined.length) {
+            listEl.innerHTML = '<div style="padding:10px; text-align:center; color:#94a3b8; font-size:10px;">Nothing found.</div>';
+            return;
+          }
+
+          combined.forEach(x => {
+            const row = document.createElement('div');
+            row.className = 'ig-qcx-mgr-row';
+            const name = x.kind === 'text' ? x.item.title : x.item.name;
+            const icon = x.kind === 'text' ? '📝' : '🎵';
+            row.innerHTML = `
+              <span>${icon}</span>
+              <span class="ig-qcx-mgr-name" title="${name}">${name}</span>
+              <span style="opacity:0.5;">/</span>
+              <input type="text" class="ig-qcx-mgr-cmd-input" placeholder="command" value="${x.item.customCommand || ''}">
+            `;
+            const cmdInput = row.querySelector('.ig-qcx-mgr-cmd-input');
+            cmdInput.onchange = () => {
+              const val = cmdInput.value.trim().replace(/^\/+/, '');
+              if (x.kind === 'text') {
+                const data = getTextLibraryData();
+                const found = data.items.find(i => i.id === x.item.id);
+                if (found) {
+                  found.customCommand = val;
+                  saveTextLibraryData(data);
+                  x.item.customCommand = val;
+                }
+              } else {
+                withDb(db => {
+                  const tx = db.transaction(['clips'], 'readwrite');
+                  tx.objectStore('clips').get(x.item.id).onsuccess = ev => {
+                    const c = ev.target.result;
+                    if (c) {
+                      c.customCommand = val;
+                      tx.objectStore('clips').put(c);
+                      x.item.customCommand = val;
+                    }
+                  };
+                });
+              }
+            };
+            listEl.appendChild(row);
+          });
+        }
+
+        renderMgrList();
+        searchEl.oninput = renderMgrList;
+      };
+    }
+
+    function initWatcher(attempts) {
+      tryEnhance();
+      if (enhanced) return;
+      attempts = attempts === undefined ? 30 : attempts;
+      if (attempts > 0) setTimeout(() => initWatcher(attempts - 1), 300);
+    }
+    initWatcher();
+
+    function attachObserver(attemptsLeft) {
+      attemptsLeft = attemptsLeft === undefined ? 10 : attemptsLeft;
+      const left = document.getElementById('ig-left-menu-container');
+      const right = document.getElementById('ig-right-menu-container');
+      if (!left && !right) {
+        if (attemptsLeft > 0) setTimeout(() => attachObserver(attemptsLeft - 1), 300);
+        return;
+      }
+      [left, right].forEach(container => {
+        if (!container) return;
+        const observer = new MutationObserver(() => tryEnhance());
+        observer.observe(container, { childList: true, subtree: true });
+      });
+    }
+    attachObserver();
+
+    core.emit('block:ready', { id: 'quickCommandExtension' });
+  }
+});
+
+/* ============================================================
+   BLOCK: Reorder Module (v1)
+   ============================================================ */
+/* ============================================================
+   BLOCK: Menu Card Reorder Module (v2 - Infinite Loop Fixed)
+   ------------------------------------------------------------
+   Standalone plugin -- no dependency on any other block.
+   Lets you drag a card by its header and drop it above/below any
+   other card in the same panel to reorder it. Order is saved per
+   side (left/right) to localStorage.
+================================================================ */
+LegoCore.registerBlock({
+  id: 'menuCardReorderModule',
+  init(core) {
+    const STORAGE_KEY = 'ig_menu_card_order_v1';
+    let orderData = {};
+    try { orderData = JSON.parse(localStorage.getItem(STORAGE_KEY)) || { left: [], right: [] }; }
+    catch (e) { orderData = { left: [], right: [] }; }
+    if (!orderData.left) orderData.left = [];
+    if (!orderData.right) orderData.right = [];
+
+    function saveOrder() {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(orderData));
+    }
+
+    const style = document.createElement('style');
+    style.id = 'ig-menu-reorder-styles';
+    style.innerHTML = `
+      .ig-menu-header { -webkit-user-drag: element; }
+      .ig-menu-header button,
+      .ig-menu-header select,
+      .ig-menu-header input {
+        -webkit-user-drag: none;
+      }
+      .ig-draggable-menu.ig-reorder-dragging { opacity: 0.35; }
+      .ig-draggable-menu.ig-reorder-drop-top { box-shadow: inset 0 3px 0 0 var(--igls-accent, #c9a876); }
+      .ig-draggable-menu.ig-reorder-drop-bottom { box-shadow: inset 0 -3px 0 0 var(--igls-accent, #c9a876); }
+    `;
+    document.head.appendChild(style);
+
+    let draggedCard = null;
+
+    function clearDropIndicators() {
+      document.querySelectorAll('.ig-reorder-drop-top, .ig-reorder-drop-bottom').forEach(el => {
+        el.classList.remove('ig-reorder-drop-top', 'ig-reorder-drop-bottom');
+      });
+    }
+
+    function recordOrder(container, side) {
+      orderData[side] = Array.from(container.children)
+        .filter(el => el.classList && el.classList.contains('ig-draggable-menu'))
+        .map(el => el.dataset.key)
+        .filter(Boolean);
+      saveOrder();
+    }
+
+    function applyStoredOrder(container, side) {
+      const order = orderData[side] || [];
+      order.forEach(key => {
+        const card = container.querySelector('[data-key="' + key + '"]');
+        if (card) container.appendChild(card);
+      });
+    }
+
+    function processCard(card, side, container) {
+      const header = card.querySelector('.ig-menu-header');
+      if (!header || header.dataset.reorderBound) return;
+      header.dataset.reorderBound = 'true';
+      header.setAttribute('draggable', 'true');
+
+      header.addEventListener('dragstart', (e) => {
+        draggedCard = card;
+        card.classList.add('ig-reorder-dragging');
+        e.dataTransfer.effectAllowed = 'move';
+        try { e.dataTransfer.setData('text/plain', card.dataset.key || ''); } catch (err) {}
+      });
+
+      header.addEventListener('dragend', () => {
+        card.classList.remove('ig-reorder-dragging');
+        clearDropIndicators();
+        draggedCard = null;
+      });
+
+      card.addEventListener('dragover', (e) => {
+        if (!draggedCard || draggedCard === card) return;
+        if (draggedCard.parentElement !== card.parentElement) return;
+        e.preventDefault();
+        const rect = card.getBoundingClientRect();
+        const isTop = (e.clientY - rect.top) < rect.height / 2;
+        card.classList.toggle('ig-reorder-drop-top', isTop);
+        card.classList.toggle('ig-reorder-drop-bottom', !isTop);
+      });
+
+      card.addEventListener('dragleave', () => {
+        card.classList.remove('ig-reorder-drop-top', 'ig-reorder-drop-bottom');
+      });
+
+      card.addEventListener('drop', (e) => {
+        if (!draggedCard || draggedCard === card) return;
+        if (draggedCard.parentElement !== card.parentElement) return;
+        e.preventDefault();
+        const rect = card.getBoundingClientRect();
+        const isTop = (e.clientY - rect.top) < rect.height / 2;
+        card.classList.remove('ig-reorder-drop-top', 'ig-reorder-drop-bottom');
+        const parent = card.parentElement;
+        if (isTop) parent.insertBefore(draggedCard, card);
+        else parent.insertBefore(draggedCard, card.nextSibling);
+        recordOrder(parent, side);
+      });
+    }
+
+    function attachToContainer(containerId, side) {
+      const container = document.getElementById(containerId);
+      if (!container) return;
+
+      applyStoredOrder(container, side);
+      container.querySelectorAll('.ig-draggable-menu').forEach(card => processCard(card, side, container));
+
+      const observer = new MutationObserver(() => {
+        // FIX: Pause observer to prevent infinite loop during DOM appendChild operations
+        observer.disconnect(); 
+        
+        container.querySelectorAll('.ig-draggable-menu').forEach(card => processCard(card, side, container));
+        applyStoredOrder(container, side);
+        
+        // Resume observer after DOM is settled
+        observer.observe(container, { childList: true }); 
+      });
+      
+      observer.observe(container, { childList: true });
+    }
+
+    function initWatcher(attempts) {
+      const left = document.getElementById('ig-left-menu-container');
+      const right = document.getElementById('ig-right-menu-container');
+      if (left && right) {
+        attachToContainer('ig-left-menu-container', 'left');
+        attachToContainer('ig-right-menu-container', 'right');
+      } else if (attempts > 0) {
+        setTimeout(() => initWatcher(attempts - 1), 200);
+      }
+    }
+    initWatcher(15);
+
+    console.log('[MenuCardReorderModule] Drag-to-reorder enabled and stabilized.');
+    core.emit('block:ready', { id: 'menuCardReorderModule' });
+  }
+});
+
+/* ============================================================
+   BLOCK: text sync Google Sheets (v1)
+   ============================================================ */
+/* ============================================================
+   BLOCK: text sync (v3 - Fixed CSP/CORS block via GM_xmlhttpRequest)
+   ============================================================ */
+LegoCore.registerBlock({
+  id: 'textLibrarySheetsSync',
+  init(core) {
+    const PRO_KEY = 'ig_text_library_pro_v1';
+    const LAST_URL_KEY = 'ig_tl_sync_last_url';
+
+    // Helper: Escape CSV fields
+    function escapeCSV(str) {
+      if (str === null || str === undefined) return '""';
+      let escaped = str.toString().replace(/"/g, '""');
+      return `"${escaped}"`;
+    }
+
+    // Helper: Parse raw CSV text into rows and columns
+    function parseCSV(str) {
+      const result = [];
+      let row = [];
+      let inQuotes = false;
+      let val = '';
+      for (let i = 0; i < str.length; i++) {
+        let char = str[i];
+        let nextChar = str[i + 1];
+        if (inQuotes) {
+          if (char === '"' && nextChar === '"') {
+            val += '"';
+            i++;
+          } else if (char === '"') {
+            inQuotes = false;
+          } else {
+            val += char;
+          }
+        } else {
+          if (char === '"') {
+            inQuotes = true;
+          } else if (char === ',') {
+            row.push(val);
+            val = '';
+          } else if (char === '\n' || char === '\r') {
+            if (char === '\r' && nextChar === '\n') i++;
+            row.push(val);
+            result.push(row);
+            row = [];
+            val = '';
+          } else {
+            val += char;
+          }
+        }
+      }
+      if (val !== '' || row.length > 0) {
+        row.push(val);
+        result.push(row);
+      }
+      return result;
+    }
+
+    // Helper: GM_xmlhttpRequest wrapped in a Promise, mirroring the
+    // pattern already used by the ManyChat blocks. Needed because a
+    // plain fetch() from this page's own JS context gets blocked by
+    // Instagram's CSP (connect-src) and would fail CORS anyway, since
+    // Google's CSV export endpoint doesn't allow instagram.com as an
+    // origin. GM_xmlhttpRequest runs outside the page's CSP/CORS jail.
+    function gmFetchText(url) {
+      return new Promise((resolve, reject) => {
+        if (typeof GM_xmlhttpRequest === 'undefined') {
+          reject(new Error('GM_xmlhttpRequest not available. Add @grant GM_xmlhttpRequest to your userscript header.'));
+          return;
+        }
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url: url,
+          onload: function (response) {
+            if (response.status >= 200 && response.status < 300) {
+              resolve(response.responseText);
+            } else {
+              reject(new Error('Request failed with status ' + response.status));
+            }
+          },
+          onerror: function () {
+            reject(new Error('Network error while fetching the sheet.'));
+          },
+          ontimeout: function () {
+            reject(new Error('Request timed out.'));
+          }
+        });
+      });
+    }
+
+    // Modal UI Generator
+    function openSyncModal() {
+      if (document.getElementById('ig-tlc-sync-modal')) return;
+
+      const savedUrl = localStorage.getItem(LAST_URL_KEY) || '';
+
+      const overlay = document.createElement('div');
+      overlay.className = 'ig-tlp-modal-overlay';
+      overlay.id = 'ig-tlc-sync-modal';
+
+      overlay.innerHTML = `
+        <div class="ig-tlp-modal" style="width:400px; max-width:90vw;">
+          <h3>☁️ Google Sheets Sync</h3>
+          
+          <div style="background:rgba(255,255,255,0.05); padding:10px; border-radius:6px; margin-top:4px;">
+            <div style="font-size:11px; color:#94a3b8; margin-bottom:8px;">1. Export your current library to a CSV file to upload into Google Sheets.</div>
+            <button id="ig-sync-export-btn" style="background:#0284c7; color:#fff; border:none; padding:8px 12px; border-radius:4px; font-weight:bold; cursor:pointer; width:100%;">📤 Export to CSV</button>
+          </div>
+
+          <div style="background:rgba(244,63,94,0.05); border:1px solid rgba(244,63,94,0.2); padding:10px; border-radius:6px; margin-top:8px;">
+            <div style="font-size:11px; color:#94a3b8; margin-bottom:8px;">2. Restore from a public Google Sheets URL.<br><span style="color:#f43f5e; font-weight:bold;">⚠️ This overwrites your entire Text Library!</span></div>
+            <input type="text" id="ig-sync-import-url" class="ig-tlp-input" placeholder="https://docs.google.com/spreadsheets/d/.../edit" value="${savedUrl}" style="margin-bottom:8px;">
+            <button id="ig-sync-import-btn" style="background:#dc2626; color:#fff; border:none; padding:8px 12px; border-radius:4px; font-weight:bold; cursor:pointer; width:100%;">📥 Overwrite & Import</button>
+          </div>
+
+          <button id="ig-sync-close-btn" style="background:transparent; color:#94a3b8; border:none; cursor:pointer; font-weight:bold; margin-top:8px; width:100%;">Close</button>
+        </div>
+      `;
+
+      document.body.appendChild(overlay);
+
+      // --- EXPORT LOGIC (unchanged -- this part never touched the network) ---
+      overlay.querySelector('#ig-sync-export-btn').onclick = () => {
+        const data = JSON.parse(localStorage.getItem(PRO_KEY)) || { items: [], tags: [] };
+        
+        const folders = {};
+        data.items.filter(i => i.type === 'folder').forEach(f => folders[f.id] = f.name);
+        
+        const tags = {};
+        data.tags.forEach(t => tags[t.id] = t.name);
+
+        let csvContent = 'Name,Group,Tags,Command,Description\n';
+        
+        data.items.filter(i => i.type === 'snippet').forEach(snip => {
+          const fName = folders[snip.parentId] || 'General';
+          const tNames = (snip.tags || []).map(tid => tags[tid]).filter(Boolean).join('|');
+          
+          const title = escapeCSV(snip.title);
+          const folder = escapeCSV(fName);
+          const tagStr = escapeCSV(tNames);
+          const cmd = escapeCSV(snip.customCommand || '');
+          const desc = escapeCSV(snip.text || '');
+          
+          csvContent += `${title},${folder},${tagStr},${cmd},${desc}\n`;
+        });
+
+        const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `Text_Library_Backup_${Date.now()}.csv`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+      };
+
+      // --- IMPORT LOGIC (fixed: uses GM_xmlhttpRequest instead of fetch) ---
+      overlay.querySelector('#ig-sync-import-btn').onclick = async () => {
+        const urlInput = overlay.querySelector('#ig-sync-import-url').value.trim();
+        if (!urlInput) return alert("Please enter a Google Sheets URL.");
+
+        // Save URL memory for future sessions
+        localStorage.setItem(LAST_URL_KEY, urlInput);
+
+        // Extract Document ID & Sheet GID
+        const match = urlInput.match(/\/d\/([a-zA-Z0-9-_]+)/);
+        if (!match) return alert("Invalid Google Sheets URL. Make sure you copy the full browser link.");
+        
+        const docId = match[1];
+        const gidMatch = urlInput.match(/gid=([0-9]+)/);
+        const gidParam = gidMatch ? `&gid=${gidMatch[1]}` : '';
+        const fetchUrl = `https://docs.google.com/spreadsheets/d/${docId}/export?format=csv${gidParam}`;
+
+        if (!confirm("⚠️ WARNING: This will permanently DELETE and OVERWRITE your current Text Library with the data from the Google Sheet. Are you absolutely sure?")) {
+            return;
+        }
+
+        const btn = overlay.querySelector('#ig-sync-import-btn');
+        btn.innerText = "⏳ Fetching...";
+        btn.disabled = true;
+
+        try {
+          const csvText = await gmFetchText(fetchUrl);
+
+          if (csvText.includes('<html') && (csvText.includes('sign in') || csvText.includes('ServiceLogin'))) {
+              throw new Error("Sheet is private. Change sharing settings to 'Anyone with the link can view'.");
+          }
+
+          const rows = parseCSV(csvText);
+          if (rows.length < 2) throw new Error("Sheet appears empty or invalid.");
+
+          const newLib = { items: [], tags: [] };
+          const folderMap = {};
+          const tagMap = {};
+
+          const defaultPalette = ['#0095f6', '#2e7d32', '#f77f00', '#9d0208', '#7209b7', '#10b981', '#f43f5e'];
+          let tagColorIndex = 0;
+
+          for (let i = 1; i < rows.length; i++) {
+              const row = rows[i];
+              if (!row || row.length < 1 || !row[0].trim()) continue;
+
+              const title = row[0].trim();
+              const folderName = (row[1] || '').trim() || 'General';
+              const tagsRaw = (row[2] || '').trim();
+              const command = (row[3] || '').trim();
+              const description = (row[4] || row[0] || '').trim();
+
+              // 1. Process Folder
+              if (!folderMap[folderName]) {
+                  const fid = 'fld_' + Date.now() + '_' + i;
+                  folderMap[folderName] = fid;
+                  newLib.items.push({
+                      id: fid, type: 'folder', parentId: 'root', name: folderName, collapsed: false, order: i
+                  });
+              }
+
+              // 2. Process Tags
+              const tagIds = [];
+              if (tagsRaw) {
+                  const splitTags = tagsRaw.split('|').map(t => t.trim()).filter(Boolean);
+                  splitTags.forEach(tName => {
+                      if (!tagMap[tName]) {
+                          const tid = 'tag_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5);
+                          tagMap[tName] = tid;
+                          newLib.tags.push({
+                              id: tid, name: tName, color: defaultPalette[tagColorIndex % defaultPalette.length]
+                          });
+                          tagColorIndex++;
+                      }
+                      tagIds.push(tagMap[tName]);
+                  });
+              }
+
+              // 3. Process Snippet
+              newLib.items.push({
+                  id: 'snip_' + Date.now() + '_' + i,
+                  type: 'snippet',
+                  parentId: folderMap[folderName],
+                  title: title,
+                  text: description,
+                  tags: tagIds,
+                  customCommand: command,
+                  order: i
+              });
+          }
+
+          localStorage.setItem(PRO_KEY, JSON.stringify(newLib));
+          alert("✅ Import successful! Reloading page to apply changes.");
+          window.location.reload();
+
+        } catch (err) {
+          console.error(err);
+          alert("Import failed: " + err.message + "\n\nEnsure Google Sheet sharing is set to 'Anyone with the link can view'.");
+          btn.innerText = "📥 Overwrite & Import";
+          btn.disabled = false;
+        }
+      };
+
+      overlay.querySelector('#ig-sync-close-btn').onclick = () => overlay.remove();
+    }
+
+    // Direct DOM injection helper
+    function attachSyncButton() {
+      const headerBtns = document.querySelector('[data-key="text-library-module"] .ig-tln-header-btns') || document.querySelector('.ig-tln-header-btns');
+      if (headerBtns && !headerBtns.querySelector('#ig-tlc-sync-btn')) {
+        const syncBtn = document.createElement('button');
+        syncBtn.id = 'ig-tlc-sync-btn';
+        syncBtn.className = 'ig-tln-hbtn';
+        syncBtn.innerText = '☁️ Sync';
+        syncBtn.onclick = openSyncModal;
+        headerBtns.appendChild(syncBtn);
+      }
+    }
+
+    // 1. Listen for re-render events
+    core.on('tl:tree-rendered', () => attachSyncButton());
+
+    // 2. Poll/watch DOM directly to handle initialization order race conditions
+    function initWatcher(attempts = 15) {
+      attachSyncButton();
+      if (!document.querySelector('#ig-tlc-sync-btn') && attempts > 0) {
+        setTimeout(() => initWatcher(attempts - 1), 200);
+      }
+    }
+    initWatcher();
+
+    console.log('[TextLibrarySheetsSync] Google Sheets Sync extension loaded (v3: GM_xmlhttpRequest fix).');
+    core.emit('block:ready', { id: 'textLibrarySheetsSync' });
+  }
+});
+
+/* ============================================================
+   BLOCK: ManyChat Integration (v4)
+   ============================================================ */
+/* ============================================================
+   BLOCK: ManyChat Integration (v9 - No Email/Phone, Username Display)
+   ------------------------------------------------------------
+   - Removed manual Find by Email/Phone buttons.
+   - Now displays the detected @username next to the status dot 
+     when a user is matched, reading directly from the Bridge.
+   ============================================================ */
+LegoCore.registerBlock({
+  id: 'manychatModule',
+  init(core) {
+    const API_KEY_STORAGE = 'mc_api_key_v1';
+    const FLOWS_STORAGE = 'mc_flows_cache_v1';
+    const TARGET_ID_STORAGE = 'mc_target_subscriber_v1';
+    const FOLDERS_STORAGE = 'mc_folders_v1';
+    const COLLAPSED_FOLDERS_KEY = 'mc_folders_collapsed_v1';
+    const TARGET_COLLAPSE_KEY = 'mc_target_collapsed_v1';
+    const API_BASE = 'https://api.manychat.com';
+
+    let apiKey = localStorage.getItem(API_KEY_STORAGE) || '';
+    let flows = [];
+    try { flows = JSON.parse(localStorage.getItem(FLOWS_STORAGE)) || []; } catch (e) { flows = []; }
+    let targetSubscriberId = localStorage.getItem(TARGET_ID_STORAGE) || '';
+
+    let folders = [];
+    try { folders = JSON.parse(localStorage.getItem(FOLDERS_STORAGE)) || ['General']; } catch (e) { folders = ['General']; }
+    if (!folders.length) folders = ['General'];
+    if (!folders.includes('General')) folders.unshift('General');
+
+    let collapsedFolders = new Set();
+    try { collapsedFolders = new Set(JSON.parse(localStorage.getItem(COLLAPSED_FOLDERS_KEY)) || []); } catch (e) {}
+
+    let targetCollapsed = localStorage.getItem(TARGET_COLLAPSE_KEY) !== 'false'; // default true
+
+    function saveFlows() { localStorage.setItem(FLOWS_STORAGE, JSON.stringify(flows)); }
+    function saveTargetId(val) { targetSubscriberId = val; localStorage.setItem(TARGET_ID_STORAGE, val); }
+    function saveFolders() { localStorage.setItem(FOLDERS_STORAGE, JSON.stringify(folders)); }
+    function saveCollapsedFolders() { localStorage.setItem(COLLAPSED_FOLDERS_KEY, JSON.stringify(Array.from(collapsedFolders))); }
+
+    function gmRequest(url, options) {
+      return new Promise((resolve, reject) => {
+        const defaults = {
+          method: 'GET',
+          headers: {
+            'Authorization': 'Bearer ' + apiKey,
+            'Content-Type': 'application/json'
+          },
+          url: url,
+          onload: function(response) {
+            try {
+              const data = JSON.parse(response.responseText);
+              if (response.status >= 200 && response.status < 300) {
+                resolve(data);
+              } else {
+                const detail = data && (data.message || data.error || JSON.stringify(data)) || response.statusText;
+                reject(new Error('API error (' + response.status + '): ' + detail));
+              }
+            } catch (e) {
+              reject(new Error('Failed to parse response: ' + e.message));
+            }
+          },
+          onerror: function(response) {
+            reject(new Error('Network error: ' + (response.statusText || 'Unknown error')));
+          },
+          ontimeout: function() {
+            reject(new Error('Request timed out'));
+          }
+        };
+
+        const merged = Object.assign({}, defaults, options || {});
+        if (typeof GM_xmlhttpRequest !== 'undefined') {
+          GM_xmlhttpRequest(merged);
+        } else {
+          reject(new Error('GM_xmlhttpRequest not available. Add @grant GM_xmlhttpRequest to your userscript header.'));
+        }
+      });
+    }
+
+    async function mcRequest(path, options) {
+      if (!apiKey) {
+        throw new Error('No API Key saved yet.');
+      }
+      const fixedOptions = Object.assign({}, options);
+      if (fixedOptions.body) {
+        fixedOptions.data = fixedOptions.body;
+        delete fixedOptions.body;
+      }
+      return gmRequest(API_BASE + path, fixedOptions);
+    }
+
+    function logDebug(title, data) {
+      console.log('%c[ManyChat Debug] ' + title, 'color: #6366f1; font-weight: bold;', data);
+    }
+
+    // Styles
+    const style = document.createElement('style');
+    style.id = 'ig-mc-module-styles';
+    style.innerHTML = `
+      .ig-mc-wrap { display:flex; flex-direction:column; gap:10px; font-family:-apple-system,sans-serif; font-size:11px; color:#fff; }
+      .ig-mc-section { background:#18181b; padding:8px; border-radius:6px; border:1px solid #334155; display:flex; flex-direction:column; gap:6px; }
+      .ig-mc-label { color:#94a3b8; font-size:10px; font-weight:bold; text-transform:uppercase; letter-spacing:0.03em; }
+      .ig-mc-row { display:flex; gap:6px; align-items:center; }
+      .ig-mc-input { flex:1; background:#0f172a; color:#fff; border:1px solid #334155; border-radius:4px; padding:6px 8px; font-size:11px; outline:none; min-width:0; }
+      .ig-mc-input:focus { border-color:#6366f1; }
+      .ig-mc-btn { background:#334155; color:#fff; border:none; border-radius:4px; padding:6px 10px; font-size:10px; font-weight:bold; cursor:pointer; white-space:nowrap; transition:0.15s; }
+      .ig-mc-btn:hover { background:#475569; }
+      .ig-mc-btn:disabled { opacity:0.6; cursor:not-allowed; }
+      .ig-mc-btn-primary { background:#6366f1; }
+      .ig-mc-btn-primary:hover:not(:disabled) { background:#4f46e5; }
+      .ig-mc-btn-green { background:#10b981; }
+      .ig-mc-btn-green:hover:not(:disabled) { background:#059669; }
+      .ig-mc-btn-small { padding:4px 8px; font-size:9px; }
+      .ig-mc-status { font-size:10px; display:flex; align-items:center; gap:5px; }
+      .ig-mc-dot { width:7px; height:7px; border-radius:50%; background:#dc2626; flex-shrink:0; }
+      .ig-mc-dot.connected { background:#10b981; }
+      .ig-mc-msg { font-size:10px; color:#94a3b8; padding:4px 2px; line-height:1.4; min-height:12px; max-height:60px; overflow-y:auto; }
+      .ig-mc-msg.error { color:#f87171; }
+      .ig-mc-msg.success { color:#34d399; }
+      .ig-mc-flow-list { display:flex; flex-direction:column; gap:0; max-height:280px; overflow-y:auto; }
+      .ig-mc-flow-list::-webkit-scrollbar { width:4px; }
+      .ig-mc-flow-list::-webkit-scrollbar-thumb { background:#334155; border-radius:4px; }
+      .ig-mc-flow-row { display:flex; flex-direction:column; gap:4px; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.06); border-radius:5px; padding:6px 8px; margin:2px 0 2px 6px; }
+      .ig-mc-flow-header { display:flex; align-items:center; gap:6px; }
+      .ig-mc-flow-name { flex:1; min-width:0; font-size:11px; color:#f8fafc; font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+      .ig-mc-flow-actions { display:flex; gap:4px; flex-shrink:0; }
+      .ig-mc-flow-del { background:transparent; border:none; color:#64748b; cursor:pointer; font-size:11px; padding:2px 4px; flex-shrink:0; transition:0.15s; }
+      .ig-mc-flow-del:hover { color:#f87171; }
+      .ig-mc-flow-edit { background:transparent; border:none; color:#64748b; cursor:pointer; font-size:11px; padding:2px 4px; flex-shrink:0; transition:0.15s; }
+      .ig-mc-flow-edit:hover { color:var(--igls-accent, #c9a876); }
+      .ig-mc-empty { padding:14px; text-align:center; font-size:10.5px; color:#64748b; }
+
+      /* Header gear icon */
+      .ig-mc-gear-btn { background: transparent; border: none; color: var(--igls-text-dim, #96949c); cursor: pointer; font-size: 12px; padding: 2px 5px; border-radius: 4px; transition: 0.15s; }
+      .ig-mc-gear-btn:hover { color: var(--igls-accent, #c9a876); background: rgba(255,255,255,0.08); }
+
+      /* Settings modal */
+      .ig-mc-modal-overlay { position: fixed; top:0; left:0; right:0; bottom:0; background: rgba(0,0,0,0.6); z-index: 2147483647; display: flex; justify-content: center; align-items: center; }
+      .ig-mc-modal { background: #0f172a; border: 1px solid #334155; border-radius: 8px; width: 320px; padding: 16px; display: flex; flex-direction: column; gap: 10px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
+      .ig-mc-modal h3 { margin: 0; font-size: 14px; color: #fff; }
+
+      /* Collapsible Target Subscriber pill */
+      .ig-mc-target-toggle { display:flex; align-items:center; gap:7px; cursor:pointer; padding:2px; user-select:none; }
+      .ig-mc-target-dot { width:8px; height:8px; border-radius:50%; background:#475569; flex-shrink:0; transition:0.15s; }
+      .ig-mc-target-dot.on { background:#10b981; box-shadow:0 0 6px rgba(16,185,129,0.6); }
+      .ig-mc-target-status-text { flex:1; font-size:11px; font-weight:600; color:#e2e8f0; }
+      .ig-mc-target-caret { font-size:9px; color:#64748b; transition:transform 0.2s; }
+      .ig-mc-target-caret.open { transform: rotate(90deg); }
+      .ig-mc-target-detail { flex-direction:column; gap:6px; margin-top:4px; }
+
+      /* Automations header + folders -- tightened spacing */
+      .ig-mc-automations-header { margin-bottom: -2px; }
+      .ig-mc-folder-head { display:flex; align-items:center; gap:6px; font-weight:bold; font-size:10.5px; color:#94a3b8; padding:5px 4px; background:rgba(0,0,0,0.2); border-bottom:1px solid rgba(255,255,255,0.05); cursor:pointer; user-select:none; border-radius:4px; }
+      .ig-mc-caret { font-size:9px; padding:2px; width:12px; text-align:center; transition: transform .2s; flex-shrink:0; }
+      .ig-mc-caret.collapsed { transform: rotate(-90deg); }
+      .ig-mc-folder-content { display:flex; flex-direction:column; }
+      .ig-mc-folder-content.collapsed { display:none; }
+      .ig-mc-folder-del { background:transparent; border:none; color:#64748b; cursor:pointer; font-size:10px; padding:2px 4px; margin-left:4px; }
+      .ig-mc-folder-del:hover { color:#f87171; }
+      .ig-mc-flow-folder-select { font-size:9px !important; padding:3px 4px !important; }
+
+      /* Edit/Preview Flow modal */
+      .ig-mc-edit-flow-id-box { background:rgba(0,0,0,0.3); border:1px solid #334155; border-radius:4px; padding:6px 8px; font-size:10px; color:#94a3b8; font-family:monospace; word-break:break-all; line-height:1.4; max-height:80px; overflow-y:auto; }
+    `;
+    document.head.appendChild(style);
+
+    // UI
+    const wrap = document.createElement('div');
+    wrap.className = 'ig-mc-wrap';
+    wrap.innerHTML = `
+      <div class="ig-mc-section">
+        <div class="ig-mc-target-toggle" id="ig-mc-target-toggle">
+          <span class="ig-mc-target-dot" id="ig-mc-target-dot"></span>
+          <span class="ig-mc-target-status-text" id="ig-mc-target-status-text">User not detected</span>
+          <span class="ig-mc-target-caret" id="ig-mc-target-caret">▸</span>
+        </div>
+        <div class="ig-mc-row ig-mc-target-detail" id="ig-mc-target-detail" style="display:none;">
+          <input type="text" id="ig-mc-target-input" class="ig-mc-input" placeholder="Subscriber ID..." value="${targetSubscriberId ? targetSubscriberId.replace(/"/g, '&quot;') : ''}">
+        </div>
+      </div>
+
+      <div class="ig-mc-section">
+        <div class="ig-mc-row ig-mc-automations-header" style="justify-content:space-between; flex-wrap:wrap; gap:4px;">
+          <span class="ig-mc-label">Automations</span>
+          <div class="ig-mc-row" style="gap:4px;">
+            <button id="ig-mc-fetch-btn" class="ig-mc-btn ig-mc-btn-small">🔄 Fetch</button>
+            <button id="ig-mc-new-folder-btn" class="ig-mc-btn ig-mc-btn-small">📁 Folder</button>
+            <button id="ig-mc-add-btn" class="ig-mc-btn ig-mc-btn-small">➕ Add</button>
+          </div>
+        </div>
+        <div id="ig-mc-msg-box" class="ig-mc-msg"></div>
+        <div id="ig-mc-flow-list" class="ig-mc-flow-list"></div>
+      </div>
+    `;
+
+    function mountCard() {
+      if (typeof core.registerMenu === 'function') {
+        core.registerMenu('right', '🤖 ManyChat', wrap, '⠿', 'manychat-module');
+      } else {
+        setTimeout(mountCard, 200);
+      }
+    }
+    mountCard();
+
+    // ---------------- Header gear icon (settings modal trigger) ----------------
+    function attachHeaderGear(attempts) {
+      attempts = attempts === undefined ? 20 : attempts;
+      const card = document.querySelector('.ig-draggable-menu[data-key="manychat-module"]');
+      const header = card && card.querySelector('.ig-menu-header');
+      if (!header) {
+        if (attempts > 0) setTimeout(() => attachHeaderGear(attempts - 1), 200);
+        return;
+      }
+      if (header.querySelector('.ig-mc-gear-btn')) return;
+
+      const gearBtn = document.createElement('button');
+      gearBtn.className = 'ig-mc-gear-btn';
+      gearBtn.title = 'ManyChat Settings (API Key)';
+      gearBtn.innerText = '⚙️';
+      gearBtn.addEventListener('mousedown', e => e.stopPropagation());
+      gearBtn.addEventListener('click', (e) => { e.stopPropagation(); openSettingsModal(); });
+
+      const dragHandle = header.querySelector('.ig-drag-handle');
+      if (dragHandle) header.insertBefore(gearBtn, dragHandle);
+      else header.appendChild(gearBtn);
+    }
+    attachHeaderGear();
+
+    function openSettingsModal() {
+      if (document.getElementById('ig-mc-settings-modal')) return;
+
+      const overlay = document.createElement('div');
+      overlay.className = 'ig-mc-modal-overlay';
+      overlay.id = 'ig-mc-settings-modal';
+      overlay.innerHTML = `
+        <div class="ig-mc-modal">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <h3>⚙️ ManyChat Settings</h3>
+            <button id="ig-mc-settings-close" style="background:none; border:none; color:#94a3b8; cursor:pointer; font-size:14px;">✕</button>
+          </div>
+          <span class="ig-mc-label">API Key</span>
+          <div class="ig-mc-row">
+            <input type="password" id="ig-mc-settings-key-input" class="ig-mc-input" placeholder="Paste your ManyChat API Key..." value="${apiKey ? apiKey.replace(/"/g, '&quot;') : ''}">
+            <button id="ig-mc-settings-save-btn" class="ig-mc-btn ig-mc-btn-primary">Save</button>
+          </div>
+          <div class="ig-mc-status">
+            <span class="ig-mc-dot" id="ig-mc-settings-status-dot"></span>
+            <span id="ig-mc-settings-status-text">Not connected</span>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(overlay);
+
+      const dot = overlay.querySelector('#ig-mc-settings-status-dot');
+      const text = overlay.querySelector('#ig-mc-settings-status-text');
+      function updateModalStatus() {
+        dot.classList.toggle('connected', !!apiKey);
+        text.textContent = apiKey ? 'Key saved' : 'Not connected';
+      }
+      updateModalStatus();
+
+      overlay.querySelector('#ig-mc-settings-close').onclick = () => overlay.remove();
+      overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+
+      overlay.querySelector('#ig-mc-settings-save-btn').onclick = () => {
+        apiKey = overlay.querySelector('#ig-mc-settings-key-input').value.trim();
+        localStorage.setItem(API_KEY_STORAGE, apiKey);
+        updateModalStatus();
+      };
+    }
+
+    // ---------------- Collapsible Target Subscriber ID ----------------
+    const targetToggle = wrap.querySelector('#ig-mc-target-toggle');
+    const targetDetail = wrap.querySelector('#ig-mc-target-detail');
+    const targetDot = wrap.querySelector('#ig-mc-target-dot');
+    const targetStatusText = wrap.querySelector('#ig-mc-target-status-text');
+    const targetCaret = wrap.querySelector('#ig-mc-target-caret');
+    const targetInput = wrap.querySelector('#ig-mc-target-input');
+    const msgBox = wrap.querySelector('#ig-mc-msg-box');
+    const flowListEl = wrap.querySelector('#ig-mc-flow-list');
+
+    function applyTargetCollapse() {
+      targetDetail.style.display = targetCollapsed ? 'none' : 'flex';
+      targetCaret.classList.toggle('open', !targetCollapsed);
+    }
+    applyTargetCollapse();
+
+    targetToggle.onclick = () => {
+      targetCollapsed = !targetCollapsed;
+      localStorage.setItem(TARGET_COLLAPSE_KEY, String(targetCollapsed));
+      applyTargetCollapse();
+    };
+
+    function updateTargetStatus() {
+      const has = !!targetInput.value.trim();
+      targetDot.classList.toggle('on', has);
+      
+      let displayTxt = has ? 'User detected' : 'User not detected';
+      
+      if (has) {
+         // Attempt to read the username from the Bridge block UI to show it inline
+         const bridgeDetected = document.getElementById('ig-ub-detected');
+         if (bridgeDetected && bridgeDetected.textContent && bridgeDetected.textContent.startsWith('@')) {
+             displayTxt = `Detected: ${bridgeDetected.textContent}`;
+         }
+      }
+      targetStatusText.textContent = displayTxt;
+    }
+    updateTargetStatus();
+
+    targetInput.addEventListener('input', () => {
+      saveTargetId(targetInput.value.trim());
+      updateTargetStatus();
+    });
+
+    function showMessage(text, type) {
+      msgBox.textContent = text;
+      msgBox.className = 'ig-mc-msg' + (type ? ' ' + type : '');
+    }
+
+    // ---------------- Automations (with folders) ----------------
+    function mergeFlows(newFlows) {
+      newFlows.forEach(nf => {
+        const existingIdx = flows.findIndex(f => f.flow_ns === nf.flow_ns);
+        if (existingIdx === -1) {
+          flows.push(Object.assign({ folder: 'General' }, nf));
+        } else {
+          const existingFolder = flows[existingIdx].folder || 'General';
+          flows[existingIdx] = Object.assign({}, nf, { folder: existingFolder });
+        }
+      });
+      saveFlows();
+      renderFlows();
+    }
+
+    wrap.querySelector('#ig-mc-fetch-btn').onclick = async () => {
+      const btn = wrap.querySelector('#ig-mc-fetch-btn');
+      const original = btn.innerText;
+      btn.innerText = '⏳ Fetching...';
+      btn.disabled = true;
+      showMessage('Fetching automations from ManyChat...', null);
+      try {
+        const data = await mcRequest('/fb/page/getFlows', { method: 'GET' });
+        const rawList = (data && data.data) || [];
+        if (!Array.isArray(rawList) || !rawList.length) {
+          showMessage('Fetched successfully, but no automations came back. Use "Add" instead.', 'error');
+        } else {
+          const mapped = rawList.map(f => ({
+            name: f.name || f.caption || ('Flow ' + (f.ns || f.id)),
+            flow_ns: f.ns || f.flow_ns || f.id
+          })).filter(f => f.flow_ns);
+          mergeFlows(mapped);
+          showMessage('Fetched ' + mapped.length + ' automation(s).', 'success');
+        }
+      } catch (e) {
+        showMessage((e.message || 'Fetch failed.') + ' -- Use "Add" instead.', 'error');
+      } finally {
+        btn.innerText = original;
+        btn.disabled = false;
+      }
+    };
+
+    wrap.querySelector('#ig-mc-add-btn').onclick = () => {
+      // Basic prompt since showModal was completely removed
+      const name = prompt('Automation Name (e.g. Welcome Message):');
+      if (!name || !name.trim()) return;
+      const flowNs = prompt('Flow ID (e.g. content20260822180954_359487):');
+      if (!flowNs || !flowNs.trim()) return;
+      
+      mergeFlows([{ name: name.trim(), flow_ns: flowNs.trim() }]);
+      showMessage('✅ Added "' + name + '". Verify the ID is correct via the ✏️ edit icon!', 'success');
+    };
+
+    wrap.querySelector('#ig-mc-new-folder-btn').onclick = () => {
+      const name = prompt('New folder name:');
+      if (!name || !name.trim()) return;
+      const trimmed = name.trim();
+      if (!folders.includes(trimmed)) {
+        folders.push(trimmed);
+        saveFolders();
+      }
+      renderFlows();
+    };
+
+    // ---------------- Edit/Preview Flow modal ----------------
+    function openEditFlowModal(flow) {
+      if (document.getElementById('ig-mc-edit-flow-modal')) return;
+
+      const overlay = document.createElement('div');
+      overlay.className = 'ig-mc-modal-overlay';
+      overlay.id = 'ig-mc-edit-flow-modal';
+      overlay.innerHTML = `
+        <div class="ig-mc-modal" style="width:340px;">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <h3>✏️ Edit Automation</h3>
+            <button id="ig-mc-edit-close" style="background:none; border:none; color:#94a3b8; cursor:pointer; font-size:14px;">✕</button>
+          </div>
+
+          <span class="ig-mc-label">Name</span>
+          <input type="text" id="ig-mc-edit-name-input" class="ig-mc-input" value="${flow.name.replace(/"/g, '&quot;')}">
+
+          <span class="ig-mc-label">Flow ID</span>
+          <div class="ig-mc-edit-flow-id-box" id="ig-mc-edit-flow-id-preview">${flow.flow_ns}</div>
+          <input type="text" id="ig-mc-edit-id-input" class="ig-mc-input" value="${flow.flow_ns.replace(/"/g, '&quot;')}" style="font-family:monospace;">
+
+          <div style="display:flex; justify-content:space-between; margin-top:6px;">
+            <button id="ig-mc-edit-copy" class="ig-mc-btn ig-mc-btn-small">📋 Copy ID</button>
+            <button id="ig-mc-edit-save" class="ig-mc-btn ig-mc-btn-primary">💾 Save</button>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(overlay);
+
+      overlay.querySelector('#ig-mc-edit-close').onclick = () => overlay.remove();
+      overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
+
+      const idInput = overlay.querySelector('#ig-mc-edit-id-input');
+      const idPreview = overlay.querySelector('#ig-mc-edit-flow-id-preview');
+      idInput.addEventListener('input', () => { idPreview.textContent = idInput.value || '(empty)'; });
+
+      overlay.querySelector('#ig-mc-edit-copy').onclick = () => {
+        navigator.clipboard.writeText(idInput.value).then(() => {
+          showMessage('Flow ID copied to clipboard.', 'success');
+        }).catch(() => {});
+      };
+
+      overlay.querySelector('#ig-mc-edit-save').onclick = () => {
+        const newName = overlay.querySelector('#ig-mc-edit-name-input').value.trim();
+        const newId = idInput.value.trim();
+        if (!newName || !newId) { alert('Name and Flow ID cannot be empty.'); return; }
+        flow.name = newName;
+        flow.flow_ns = newId;
+        saveFlows();
+        renderFlows();
+        overlay.remove();
+      };
+    }
+
+    async function sendFlow(flow) {
+      const subscriberId = targetInput.value.trim();
+      if (!subscriberId) {
+        showMessage('Set a Target Subscriber ID first.', 'error');
+        return;
+      }
+
+      const numericId = parseInt(subscriberId, 10);
+      if (isNaN(numericId)) {
+        showMessage('Invalid Subscriber ID. Must be a number.', 'error');
+        return;
+      }
+
+      const payload = {
+        subscriber_id: numericId,
+        flow_ns: flow.flow_ns
+      };
+
+      logDebug('Sending Flow', payload);
+      showMessage('Sending "' + flow.name + '"...', null);
+      try {
+        await mcRequest('/fb/sending/sendFlow', {
+          method: 'POST',
+          body: JSON.stringify(payload)
+        });
+        logDebug('Send Success', payload);
+        showMessage('✅ Sent "' + flow.name + '" to subscriber ' + subscriberId + '.', 'success');
+      } catch (e) {
+        logDebug('Send Error', { message: e.message, payload: payload });
+        showMessage('❌ ' + (e.message || 'Send failed.'), 'error');
+      }
+    }
+
+    function renderFlows() {
+      flowListEl.innerHTML = '';
+      if (!flows.length) {
+        flowListEl.innerHTML = '<div class="ig-mc-empty">No automations yet. Fetch from ManyChat or add one manually.</div>';
+        return;
+      }
+
+      const grouped = {};
+      flows.forEach(f => {
+        const fld = f.folder || 'General';
+        if (!grouped[fld]) grouped[fld] = [];
+        grouped[fld].push(f);
+      });
+
+      const orderedFolderNames = folders.slice();
+      Object.keys(grouped).forEach(fld => {
+        if (!orderedFolderNames.includes(fld)) orderedFolderNames.push(fld);
+      });
+
+      orderedFolderNames.forEach(folderName => {
+        const items = grouped[folderName];
+        if (!items || !items.length) return; // hide empty folders from the list; they still exist for assignment
+
+        const isCollapsed = collapsedFolders.has(folderName);
+
+        const folderHead = document.createElement('div');
+        folderHead.className = 'ig-mc-folder-head';
+        folderHead.innerHTML = `
+          <span class="ig-mc-caret ${isCollapsed ? 'collapsed' : ''}">▼</span>
+          <span>📁 ${folderName}</span>
+          <span style="margin-left:auto; font-size:9px; opacity:0.6;">${items.length}</span>
+          ${folderName !== 'General' ? '<button class="ig-mc-folder-del" title="Delete folder (moves items to General)">🗑️</button>' : ''}
+        `;
+        folderHead.querySelector('.ig-mc-caret').onclick = (e) => {
+          e.stopPropagation();
+          if (collapsedFolders.has(folderName)) collapsedFolders.delete(folderName);
+          else collapsedFolders.add(folderName);
+          saveCollapsedFolders();
+          renderFlows();
+        };
+        folderHead.onclick = () => {
+          if (collapsedFolders.has(folderName)) collapsedFolders.delete(folderName);
+          else collapsedFolders.add(folderName);
+          saveCollapsedFolders();
+          renderFlows();
+        };
+        const delBtn = folderHead.querySelector('.ig-mc-folder-del');
+        if (delBtn) {
+          delBtn.onclick = (e) => {
+            e.stopPropagation();
+            if (!confirm('Delete folder "' + folderName + '"? Its automations will move to General.')) return;
+            flows.forEach(f => { if ((f.folder || 'General') === folderName) f.folder = 'General'; });
+            folders = folders.filter(f => f !== folderName);
+            saveFlows();
+            saveFolders();
+            renderFlows();
+          };
+        }
+        flowListEl.appendChild(folderHead);
+
+        const folderContent = document.createElement('div');
+        folderContent.className = 'ig-mc-folder-content' + (isCollapsed ? ' collapsed' : '');
+
+        items.forEach(flow => {
+          const row = document.createElement('div');
+          row.className = 'ig-mc-flow-row';
+          const folderOptions = folders.map(f =>
+            `<option value="${f}" ${f === (flow.folder || 'General') ? 'selected' : ''}>${f}</option>`
+          ).join('');
+          row.innerHTML = `
+            <div class="ig-mc-flow-header">
+              <span class="ig-mc-flow-name" title="${flow.name}">${flow.name}</span>
+              <div class="ig-mc-flow-actions">
+                <button class="ig-mc-btn ig-mc-btn-green ig-mc-btn-small ig-mc-send-btn">📤 Send</button>
+                <button class="ig-mc-flow-edit" title="Preview / Edit">✏️</button>
+                <button class="ig-mc-flow-del" title="Remove">🗑️</button>
+              </div>
+            </div>
+            <div class="ig-mc-row">
+              <span style="font-size:9px; color:#64748b;">Folder:</span>
+              <select class="ig-mc-input ig-mc-flow-folder-select">${folderOptions}</select>
+            </div>
+          `;
+          row.querySelector('.ig-mc-send-btn').onclick = () => sendFlow(flow);
+          row.querySelector('.ig-mc-flow-edit').onclick = () => openEditFlowModal(flow);
+          row.querySelector('.ig-mc-flow-del').onclick = () => {
+            flows = flows.filter(f => f.flow_ns !== flow.flow_ns);
+            saveFlows();
+            renderFlows();
+          };
+          row.querySelector('.ig-mc-flow-folder-select').onchange = (e) => {
+            flow.folder = e.target.value;
+            saveFlows();
+            renderFlows();
+          };
+          folderContent.appendChild(row);
+        });
+
+        flowListEl.appendChild(folderContent);
+      });
+    }
+
+    renderFlows();
+
+    core.emit('block:ready', { id: 'manychatModule' });
+  }
+});
+
+/* ============================================================
+   BLOCK: ManyChat Username Detector (v3)
+   ============================================================ */
+/* ============================================================
+   BLOCK: IG Username Detector + Auto ManyChat Lookup (v3.1)
+   ------------------------------------------------------------
+   Standalone plugin -- does NOT modify the ManyChat Integration
+   block's code. Fully automatic: no manual list, no manual
+   Field ID lookup, no button clicks needed once configured.
+   ============================================================ */
+LegoCore.registerBlock({
+  id: 'igUsernameManyChatBridge',
+  init(core) {
+    const API_KEY_STORAGE = 'mc_api_key_v1'; // shared with ManyChat module
+    const FIELD_NAME_STORAGE = 'ig_ub_field_name_v1';
+    const FIELD_ID_CACHE_STORAGE = 'ig_ub_field_id_cache_v1';
+    const MANUAL_USERNAME_STORAGE = 'ig_username_manual_v1';
+    const API_BASE = 'https://api.manychat.com';
+
+    let fieldName = localStorage.getItem(FIELD_NAME_STORAGE) || 'Save IG username';
+    let lastDetected = '';
+    let lastMatchedId = null;
+    let lookupInFlight = false;
+
+    // ---------------- GM_xmlhttpRequest wrapper (self-contained) ----------------
+    function gmRequest(url, options) {
+      return new Promise((resolve, reject) => {
+        const apiKey = localStorage.getItem(API_KEY_STORAGE) || '';
+        const defaults = {
+          method: 'GET',
+          headers: {
+            'Authorization': 'Bearer ' + apiKey,
+            'Content-Type': 'application/json'
+          },
+          url: url,
+          onload: function (response) {
+            try {
+              const data = JSON.parse(response.responseText);
+              if (response.status >= 200 && response.status < 300) {
+                resolve(data);
+              } else {
+                const detail = data && (data.message || data.error || JSON.stringify(data)) || response.statusText;
+                reject(new Error('API error (' + response.status + '): ' + detail));
+              }
+            } catch (e) {
+              reject(new Error('Failed to parse response: ' + e.message));
+            }
+          },
+          onerror: function (response) {
+            reject(new Error('Network error: ' + (response.statusText || 'Unknown error')));
+          },
+          ontimeout: function () {
+            reject(new Error('Request timed out'));
+          }
+        };
+        const merged = Object.assign({}, defaults, options || {});
+        if (merged.body) {
+          merged.data = merged.body;
+          delete merged.body;
+        }
+        if (typeof GM_xmlhttpRequest !== 'undefined') {
+          GM_xmlhttpRequest(merged);
+        } else {
+          reject(new Error('GM_xmlhttpRequest not available. Add @grant GM_xmlhttpRequest to your userscript header.'));
+        }
+      });
+    }
+
+    // ---------------- Styles ----------------
+    const style = document.createElement('style');
+    style.id = 'ig-username-bridge-styles';
+    style.innerHTML = `
+      .ig-ub-wrap { display:flex; flex-direction:column; gap:10px; font-family:-apple-system,sans-serif; font-size:11px; color:#fff; }
+      .ig-ub-section { background:#18181b; padding:8px; border-radius:6px; border:1px solid #334155; display:flex; flex-direction:column; gap:6px; }
+      .ig-ub-label { color:#94a3b8; font-size:10px; font-weight:bold; text-transform:uppercase; letter-spacing:0.03em; }
+      .ig-ub-row { display:flex; gap:6px; align-items:center; }
+      .ig-ub-input { flex:1; background:#0f172a; color:#fff; border:1px solid #334155; border-radius:4px; padding:6px 8px; font-size:11px; outline:none; min-width:0; }
+      .ig-ub-input:focus { border-color:#6366f1; }
+      .ig-ub-detected { flex:1; background:#0f172a; color:#34d399; border:1px solid #334155; border-radius:4px; padding:6px 8px; font-size:12px; font-weight:bold; font-family:monospace; }
+      .ig-ub-detected.empty { color:#64748b; font-weight:normal; font-family:inherit; font-style:italic; }
+      .ig-ub-id-display { flex:1; background:#0f172a; color:#c9a876; border:1px solid #334155; border-radius:4px; padding:6px 8px; font-size:13px; font-weight:bold; font-family:monospace; }
+      .ig-ub-id-display.empty { color:#64748b; font-weight:normal; font-family:inherit; font-style:italic; }
+      .ig-ub-btn { background:#334155; color:#fff; border:none; border-radius:4px; padding:6px 10px; font-size:10px; font-weight:bold; cursor:pointer; white-space:nowrap; transition:0.15s; }
+      .ig-ub-btn:hover { background:#475569; }
+      .ig-ub-btn:disabled { opacity:0.6; cursor:not-allowed; }
+      .ig-ub-btn-primary { background:#6366f1; }
+      .ig-ub-btn-primary:hover:not(:disabled) { background:#4f46e5; }
+      .ig-ub-btn-small { padding:4px 8px; font-size:9px; }
+      .ig-ub-msg { font-size:10px; color:#94a3b8; padding:4px 2px; line-height:1.4; min-height:12px; max-height:60px; overflow-y:auto; }
+      .ig-ub-msg.error { color:#f87171; }
+      .ig-ub-msg.success { color:#34d399; }
+      .ig-ub-hint { font-size:9px; color:#64748b; line-height:1.4; }
+      .ig-ub-resolved { font-size:9px; color:#64748b; }
+      .ig-ub-resolved.ok { color:#34d399; }
+    `;
+    document.head.appendChild(style);
+
+    // ---------------- UI ----------------
+    const wrap = document.createElement('div');
+    wrap.className = 'ig-ub-wrap';
+    wrap.innerHTML = `
+      <div class="ig-ub-section">
+        <span class="ig-ub-label">Detected Username (this chat)</span>
+        <div class="ig-ub-row">
+          <div id="ig-ub-detected" class="ig-ub-detected empty">Not detected</div>
+          <button id="ig-ub-refresh-btn" class="ig-ub-btn ig-ub-btn-small">🔎 Refresh</button>
+        </div>
+        <span class="ig-ub-label" style="margin-top:4px;">Manual Override</span>
+        <div class="ig-ub-row">
+          <input type="text" id="ig-ub-manual-input" class="ig-ub-input" placeholder="Type/paste username if detection is wrong...">
+          <button id="ig-ub-use-manual-btn" class="ig-ub-btn ig-ub-btn-small">Use This</button>
+        </div>
+      </div>
+
+      <div class="ig-ub-section">
+        <span class="ig-ub-label">Matched Subscriber ID</span>
+        <div id="ig-ub-id-display" class="ig-ub-id-display empty">No match yet</div>
+        <button id="ig-ub-copy-btn" class="ig-ub-btn ig-ub-btn-small" style="align-self:flex-start;">📋 Copy ID</button>
+      </div>
+
+      <div class="ig-ub-section">
+        <span class="ig-ub-label">ManyChat Custom Field Name</span>
+        <div class="ig-ub-row">
+          <input type="text" id="ig-ub-field-name-input" class="ig-ub-input" placeholder="e.g. Save IG username" value="${fieldName.replace(/"/g, '&quot;')}">
+          <button id="ig-ub-save-field-btn" class="ig-ub-btn ig-ub-btn-small">Save</button>
+        </div>
+        <span id="ig-ub-resolved" class="ig-ub-resolved">Not resolved yet.</span>
+        <span class="ig-ub-hint">Type the EXACT name of the Custom Field in ManyChat that stores each subscriber's Instagram username (just the username -- nothing else). The plugin looks up its Field ID automatically.</span>
+      </div>
+
+      <div class="ig-ub-section">
+        <button id="ig-ub-find-btn" class="ig-ub-btn ig-ub-btn-primary" style="width:100%;">🔗 Search Now</button>
+        <div id="ig-ub-msg-box" class="ig-ub-msg"></div>
+      </div>
+    `;
+
+    function mountCard() {
+      if (typeof core.registerMenu === 'function') {
+        core.registerMenu('right', '👤 Chat Username', wrap, '⠿', 'ig-username-bridge');
+      } else {
+        setTimeout(mountCard, 200);
+      }
+    }
+    mountCard();
+
+    const detectedEl = wrap.querySelector('#ig-ub-detected');
+    const manualInput = wrap.querySelector('#ig-ub-manual-input');
+    const idDisplayEl = wrap.querySelector('#ig-ub-id-display');
+    const fieldNameInput = wrap.querySelector('#ig-ub-field-name-input');
+    const resolvedEl = wrap.querySelector('#ig-ub-resolved');
+    const msgBox = wrap.querySelector('#ig-ub-msg-box');
+
+    function showMessage(text, type) {
+      msgBox.textContent = text;
+      msgBox.className = 'ig-ub-msg' + (type ? ' ' + type : '');
+    }
+
+    function setDetected(username) {
+      lastDetected = username || '';
+      if (username) {
+        detectedEl.textContent = '@' + username;
+        detectedEl.classList.remove('empty');
+        manualInput.value = username;
+      } else {
+        detectedEl.textContent = 'Not detected';
+        detectedEl.classList.add('empty');
+      }
+    }
+
+    function setIdDisplay(id) {
+      lastMatchedId = id;
+      if (id) {
+        idDisplayEl.textContent = id;
+        idDisplayEl.classList.remove('empty');
+      } else {
+        idDisplayEl.textContent = 'No match yet';
+        idDisplayEl.classList.add('empty');
+      }
+    }
+    
+    // --- NEW: Helper to force-clear the ManyChat box and trigger the red dot ---
+    function clearManyChatTarget() {
+      const targetInput = document.getElementById('ig-mc-target-input');
+      if (targetInput) {
+        targetInput.value = '';
+        targetInput.dispatchEvent(new Event('input', { bubbles: true })); // Triggers red dot
+      }
+      localStorage.removeItem('mc_target_subscriber_v1');
+    }
+
+    wrap.querySelector('#ig-ub-copy-btn').onclick = () => {
+      if (!lastMatchedId) return;
+      navigator.clipboard.writeText(String(lastMatchedId)).then(() => {
+        showMessage('Copied ' + lastMatchedId + ' to clipboard.', 'success');
+      }).catch(() => {
+        showMessage('Could not copy automatically -- ID is: ' + lastMatchedId, null);
+      });
+    };
+
+    wrap.querySelector('#ig-ub-use-manual-btn').onclick = () => {
+      const val = manualInput.value.trim().replace(/^@/, '');
+      if (!val) return;
+      setDetected(val);
+      localStorage.setItem(MANUAL_USERNAME_STORAGE, val);
+      showMessage('Using manual username: @' + val, null);
+      clearManyChatTarget(); // Clear old ID before looking up new manual one
+      performLookup(val);
+    };
+
+    wrap.querySelector('#ig-ub-save-field-btn').onclick = () => {
+      fieldName = fieldNameInput.value.trim();
+      localStorage.setItem(FIELD_NAME_STORAGE, fieldName);
+      // Clear any cached ID for the OLD name so a rename doesn't stick
+      resolvedEl.textContent = 'Not resolved yet.';
+      resolvedEl.className = 'ig-ub-resolved';
+      showMessage(fieldName ? 'Field name saved. It will be resolved on the next search.' : 'Field name cleared.', 'success');
+    };
+
+    // ---------------- Field Name -> ID Resolution ----------------
+    async function resolveFieldId(name) {
+      let cache = {};
+      try { cache = JSON.parse(localStorage.getItem(FIELD_ID_CACHE_STORAGE)) || {}; } catch (e) {}
+      const key = name.trim().toLowerCase();
+      if (cache[key]) {
+        resolvedEl.textContent = 'Resolved: Field ID ' + cache[key] + ' (cached)';
+        resolvedEl.className = 'ig-ub-resolved ok';
+        return cache[key];
+      }
+      const data = await gmRequest(API_BASE + '/fb/page/getCustomFields', { method: 'GET' });
+      const fields = (data && data.data) || [];
+      const match = fields.find(f => (f.name || '').trim().toLowerCase() === key);
+      if (!match) {
+        resolvedEl.textContent = 'No field named "' + name + '" found in ManyChat.';
+        resolvedEl.className = 'ig-ub-resolved';
+        throw new Error('No Custom Field named "' + name + '" found in ManyChat. Check the spelling matches exactly.');
+      }
+      cache[key] = match.id;
+      localStorage.setItem(FIELD_ID_CACHE_STORAGE, JSON.stringify(cache));
+      resolvedEl.textContent = 'Resolved: Field ID ' + match.id;
+      resolvedEl.className = 'ig-ub-resolved ok';
+      return match.id;
+    }
+
+    async function findSubscriberByCustomField(fieldId, username) {
+      const query = 'field_id=' + encodeURIComponent(fieldId) + '&field_value=' + encodeURIComponent(username);
+      const data = await gmRequest(API_BASE + '/fb/subscriber/findByCustomField?' + query, { method: 'GET' });
+      const result = data && data.data;
+      if (!result) return null;
+      if (Array.isArray(result)) return result.length ? result[0].id : null;
+      return result.id || null;
+    }
+
+    function fillManyChatTarget(subscriberId) {
+      const targetInput = document.getElementById('ig-mc-target-input');
+      if (!targetInput) {
+        localStorage.setItem('mc_target_subscriber_v1', String(subscriberId));
+        return false;
+      }
+      targetInput.value = String(subscriberId);
+      targetInput.dispatchEvent(new Event('input', { bubbles: true }));
+      return true;
+    }
+
+    async function performLookup(username) {
+      if (!username) return;
+      const apiKey = localStorage.getItem(API_KEY_STORAGE) || '';
+      if (!apiKey) {
+        showMessage('No ManyChat API Key found. Save one in the ManyChat card first.', 'error');
+        return;
+      }
+      if (!fieldName) {
+        showMessage('Set a Custom Field Name first.', 'error');
+        return;
+      }
+      if (lookupInFlight) return; // avoid overlapping requests
+      lookupInFlight = true;
+      const btn = wrap.querySelector('#ig-ub-find-btn');
+      const original = btn.innerText;
+      btn.innerText = '⏳ Searching...';
+      btn.disabled = true;
+      showMessage('Searching ManyChat for @' + username + '...', null);
+      try {
+        const fieldId = await resolveFieldId(fieldName);
+        const subscriberId = await findSubscriberByCustomField(fieldId, username);
+        if (subscriberId) {
+          setIdDisplay(subscriberId);
+          const filled = fillManyChatTarget(subscriberId);
+          showMessage('✅ Found subscriber ' + subscriberId + (filled ? ' -- ManyChat target updated.' : ' -- saved.'), 'success');
+        } else {
+          setIdDisplay(null);
+          clearManyChatTarget(); // Wipe ID if search returns nothing
+          showMessage('No subscriber found with that username in the field. Make sure the flow has actually set it for this contact.', 'error');
+        }
+      } catch (e) {
+        showMessage(e.message || 'Lookup failed.', 'error');
+      } finally {
+        btn.innerText = original;
+        btn.disabled = false;
+        lookupInFlight = false;
+      }
+    }
+
+    wrap.querySelector('#ig-ub-find-btn').onclick = () => {
+      const username = (manualInput.value.trim() || lastDetected).replace(/^@/, '');
+      if (!username) {
+        showMessage('No username detected or entered.', 'error');
+        return;
+      }
+      clearManyChatTarget();
+      performLookup(username);
+    };
+
+    // ---------------- Username Detection ----------------
+    const EXCLUDED_PATHS = new Set([
+      'direct', 'explore', 'reels', 'accounts', 'p', 'stories', 'tv',
+      'about', 'legal', 'privacy', 'terms', 'help', 'developer', 'ads',
+      'business', 'download', 'lite', 'web', 'api', 'graphql'
+    ]);
+    const EXCLUDED_WORDS = new Set([
+      'instagram', 'general', 'requests', 'message', 'messages', 'home',
+      'search', 'notifications', 'create', 'profile', 'more', 'reels',
+      'dashboard', 'view', 'next', 'prev', 'contact'
+    ]);
+
+    function looksLikeUsername(text) {
+      if (!text) return false;
+      const t = text.trim();
+      if (t.length < 2 || t.length > 30) return false;
+      if (!/^[a-z0-9_.]+$/i.test(t)) return false;
+      if (EXCLUDED_WORDS.has(t.toLowerCase())) return false;
+      if (/^\d+$/.test(t)) return false;
+      return true;
+    }
+
+    // The real header username sits OUTSIDE any scrollable message/list
+    // container -- shared-post embeds and the conversation list itself
+    // are always INSIDE one. This holds true regardless of screen size,
+    // zoom level, or how far the user has scrolled, which pixel-position
+    // heuristics alone can't reliably guarantee.
+    let cachedScrollers = [];
+    let scrollersCachedAt = 0;
+    function getScrollableContainers() {
+      const now = Date.now();
+      if (now - scrollersCachedAt < 3000 && cachedScrollers.length) return cachedScrollers;
+      const scrollers = [];
+      document.querySelectorAll('div').forEach(el => {
+        if (el.clientHeight < 100) return;
+        if (el.scrollHeight <= el.clientHeight + 20) return;
+        const style = getComputedStyle(el);
+        if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
+          scrollers.push(el);
+        }
+      });
+      cachedScrollers = scrollers;
+      scrollersCachedAt = now;
+      return scrollers;
+    }
+    function isInsideScrollable(el, scrollers) {
+      for (let i = 0; i < scrollers.length; i++) {
+        if (scrollers[i] !== el && scrollers[i].contains(el)) return true;
+      }
+      return false;
+    }
+
+    function detectFromProfileLinks() {
+      const scrollers = getScrollableContainers();
+      const anchors = Array.from(document.querySelectorAll('a[href^="/"]'));
+      const candidates = [];
+
+      anchors.forEach(a => {
+        const href = a.getAttribute('href') || '';
+        const m = href.match(/^\/([A-Za-z0-9_.]{1,30})\/?$/);
+        if (!m) return;
+        const seg = m[1].toLowerCase();
+        if (EXCLUDED_PATHS.has(seg)) return;
+        if (!looksLikeUsername(m[1])) return;
+
+        const rect = a.getBoundingClientRect();
+        if (rect.width === 0 && rect.height === 0) return; // hidden
+        if (rect.top > 300) return; // stay near the top of the page
+        if (isInsideScrollable(a, scrollers)) return; // exclude message list / shared posts / chat list
+
+        candidates.push({ username: m[1], top: rect.top });
+      });
+
+      if (!candidates.length) return null;
+      candidates.sort((a, b) => a.top - b.top);
+      return candidates[0].username;
+    }
+
+    function detectFromTextScan() {
+      const scrollers = getScrollableContainers();
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+      let node;
+      const found = [];
+      while ((node = walker.nextNode())) {
+        const text = (node.nodeValue || '').trim();
+        if (!text) continue;
+        const base = text.split('·')[0].trim();
+        if (!looksLikeUsername(base)) continue;
+        const parentEl = node.parentElement;
+        if (!parentEl) continue;
+        const rect = parentEl.getBoundingClientRect();
+        if (rect.width === 0 && rect.height === 0) continue;
+        if (rect.top > 300) continue;
+        if (isInsideScrollable(parentEl, scrollers)) continue;
+        found.push({ username: base, top: rect.top });
+      }
+      if (!found.length) return null;
+      found.sort((a, b) => a.top - b.top);
+      return found[0].username;
+    }
+
+    function runDetection() {
+      let username = detectFromProfileLinks();
+      if (!username) username = detectFromTextScan();
+      
+      if (username && username !== lastDetected) {
+        setDetected(username);
+        setIdDisplay(null);
+        clearManyChatTarget(); // WIPES old ID immediately on chat switch
+        performLookup(username);
+      } else if (!username && lastDetected) {
+        // We navigated away from a chat
+        setDetected(null);
+        setIdDisplay(null);
+        clearManyChatTarget(); // WIPES old ID on exit
+      } else if (!username && !lastDetected) {
+        setDetected(null);
+      }
+    }
+
+    setInterval(runDetection, 1500);
+    const bodyObserver = new MutationObserver(() => {
+      clearTimeout(bodyObserver._t);
+      bodyObserver._t = setTimeout(runDetection, 300);
+    });
+    bodyObserver.observe(document.body, { childList: true, subtree: true });
+
+    wrap.querySelector('#ig-ub-refresh-btn').onclick = () => runDetection();
+
+    setTimeout(runDetection, 1000);
+
+    core.emit('block:ready', { id: 'igUsernameManyChatBridge' });
+  }
+});
+
+/* ============================================================
+   BLOCK: Text Library Height Fix (v1) (v1)
+   ============================================================ */
+/* ============================================================
+   BLOCK: Text Library Height Fix (v3 - Fixes Popout Too)
+   ============================================================ */
+/* ================================================================
+   BLOCK: Text Library Height Fix (Standalone Feature Plugin)
+   - Does NOT modify the Text Library Module block's code.
+   - v2 fixed the docked sidebar card but not the popped-out
+     floating window, because .ig-floating-modal itself only gets
+     an explicit height once the user has manually dragged its
+     resize handle at least once -- before that it's just
+     content-sized (auto), so "height:100%" on .ig-menu-content
+     had nothing definite to resolve against.
+   - v3 gives the floating modal a real default height via CSS.
+     Inline styles (set by the popout module once you actually
+     resize it) still win over this, so manual resizing continues
+     to work exactly as before -- this only sets the *starting*
+     size.
+   - Scoped only to the Text Library card (data-key="text-library-module")
+     so no other card is affected.
+================================================================ */
+LegoCore.registerBlock({
+  id: 'textLibraryHeightFix',
+  init(core) {
+    const style = document.createElement('style');
+    style.id = 'ig-text-lib-height-fix-styles';
+    style.innerHTML = `
+      /* Docked sidebar card */
+      .ig-draggable-menu[data-key="text-library-module"] .ig-menu-content {
+        display: flex;
+        flex-direction: column;
+        height: 60vh;
+        max-height: 80vh;
+        min-height: 200px;
+      }
+      .ig-draggable-menu[data-key="text-library-module"] .ig-tln-container {
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        min-height: 0;
+      }
+      .ig-draggable-menu[data-key="text-library-module"] .ig-tln-tree {
+        max-height: none !important;
+        flex: 1;
+        min-height: 0;
+        overflow-y: auto;
+      }
+
+      /* Popped-out floating window -- give the modal a real default
+         height so its flex children (.ig-menu-content is already
+         flex:1 from the popout module's own CSS) have something to
+         grow into. Inline styles from manual resizing still override
+         this since they come after in the cascade. */
+      .ig-floating-modal[id="ig-float-modal-text-library-module"] {
+        height: 70vh;
+        min-height: 300px;
+      }
+      .ig-floating-modal[id="ig-float-modal-text-library-module"] .ig-tln-container {
+        display: flex;
+        flex-direction: column;
+        flex: 1;
+        min-height: 0;
+      }
+      .ig-floating-modal[id="ig-float-modal-text-library-module"] .ig-tln-tree {
+        max-height: none !important;
+        flex: 1;
+        min-height: 0;
+        overflow-y: auto;
+      }
+    `;
+    document.head.appendChild(style);
+
+    console.log('[TextLibraryHeightFix v3] Text Library tree now fills both the docked card and the popped-out window.');
+    core.emit('block:ready', { id: 'textLibraryHeightFix' });
+  }
+});
+
+/* ============================================================
+   BLOCK: Reset menus (v1)
+   ============================================================ */
+/* ================================================================
+   BLOCK: Floating Menu Rescue Module (Reset Positions)
+   ================================================================ */
+LegoCore.registerBlock({
+  id: 'floatingMenuRescueModule',
+  init(core) {
+    // Create a small, subtle button fixed to the bottom left
+    const resetBtn = document.createElement('button');
+    resetBtn.innerText = '⛑️ Reset Menus';
+    resetBtn.title = 'Click to reset all floating window positions if they get stuck off-screen';
+    
+    resetBtn.style.cssText = `
+      position: fixed;
+      bottom: 12px;
+      left: 12px;
+      z-index: 2147483647;
+      background: rgba(220, 38, 38, 0.7);
+      color: white;
+      border: 1px solid #7f1d1d;
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 11px;
+      font-weight: bold;
+      cursor: pointer;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      transition: opacity 0.2s, background 0.2s;
+      opacity: 0.4;
+    `;
+
+    // Make it fully visible only when hovered so it stays out of the way
+    resetBtn.onmouseover = () => {
+      resetBtn.style.opacity = '1';
+      resetBtn.style.background = 'rgba(220, 38, 38, 1)';
+    };
+    resetBtn.onmouseout = () => {
+      resetBtn.style.opacity = '0.4';
+      resetBtn.style.background = 'rgba(220, 38, 38, 0.7)';
+    };
+
+    resetBtn.onclick = () => {
+      if (confirm("Reset all floating menu positions? This will reload the page.")) {
+        // 1. Clear Popped-out cards
+        localStorage.removeItem('ig_menu_inpage_popouts_v1');
+        
+        // 2. Clear Workspace Profile window
+        localStorage.removeItem('ig_workspace_profile_window_pos_v1');
+        
+        // 3. Clear Text Library Filter window
+        localStorage.removeItem('ig_tl_notion_filter_pos');
+        
+        // Reload to apply the fresh state
+        window.location.reload();
+      }
+    };
+
+    document.body.appendChild(resetBtn);
+    
+    core.emit('block:ready', { id: 'floatingMenuRescueModule' });
+  }
+});
+
+  LegoCore.boot();
+})();
