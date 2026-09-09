@@ -4220,14 +4220,17 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Commands (v7)
+   BLOCK: Commands (v8)
+   ============================================================ */
+/* ============================================================
+   BLOCK: Commands (v8 - Added Image Sets Support)
    ============================================================ */
 /* ================================================================
-   BLOCK: Quick Command Extension (v6 - Automation Send Fix)
+   BLOCK: Quick Command Extension (v8)
    ------------------------------------------------------------
    Standalone plugin -- upgrades the "💬 Quick Chat" card with
-   slash command searches, including Text, Audio, and ManyChat
-   Automations (Flows) with a safety preview confirmation.
+   slash command searches, including Text, Audio, ManyChat Flows, 
+   and Image Sets with safety preview confirmations.
 ================================================================ */
 LegoCore.registerBlock({
   id: 'quickCommandExtension',
@@ -4254,8 +4257,23 @@ LegoCore.registerBlock({
       localStorage.setItem(TEXT_LIB_KEY, JSON.stringify(data));
     }
 
-    function getAllSearchableItems() {
+    // Helper to fetch Image Sets from their isolated IndexedDB
+    function getImageSets() {
       return new Promise(resolve => {
+        const req = indexedDB.open('IG_ImageSets_Core_DB', 1);
+        req.onsuccess = e => {
+          const db = e.target.result;
+          if (!db.objectStoreNames.contains('sets')) { resolve([]); return; }
+          const tx = db.transaction(['sets'], 'readonly');
+          tx.objectStore('sets').getAll().onsuccess = ev => resolve(ev.target.result || []);
+        };
+        req.onerror = () => resolve([]);
+      });
+    }
+
+    function getAllSearchableItems() {
+      return new Promise(async resolve => {
+        const imageSets = await getImageSets();
         withDb(db => {
           const tx = db.transaction(['clips'], 'readonly');
           tx.objectStore('clips').getAll().onsuccess = e => {
@@ -4264,17 +4282,17 @@ LegoCore.registerBlock({
             const textItems = textData.items.filter(i => i.type === 'snippet');
             let mcFlows = [];
             try { mcFlows = JSON.parse(localStorage.getItem(MC_FLOWS_KEY)) || []; } catch (err) {}
-            resolve({ clips, textItems, mcFlows });
+            resolve({ clips, textItems, mcFlows, imageSets });
           };
         });
       });
     }
 
-    function computeMatches(query, mode, clips, textItems, mcFlows) {
+    function computeMatches(query, mode, clips, textItems, mcFlows, imageSets) {
       const q = (query || '').trim().toLowerCase();
       let results = [];
 
-      if (mode !== 'audio' && mode !== 'flow') {
+      if (mode !== 'audio' && mode !== 'flow' && mode !== 'set') {
         textItems.forEach(item => {
           const cmd = (item.customCommand || '').toLowerCase();
           const titleMatch = (item.title || '').toLowerCase().includes(q);
@@ -4282,40 +4300,37 @@ LegoCore.registerBlock({
           const cmdExact = cmd && cmd === q;
           const cmdPrefix = cmd && q.length > 0 && cmd.startsWith(q);
           if (!q || titleMatch || contentMatch || cmdPrefix) {
-            results.push({
-              kind: 'text',
-              item,
-              score: cmdExact ? 100 : cmdPrefix ? 85 : titleMatch ? 50 : 30
-            });
+            results.push({ kind: 'text', item, score: cmdExact ? 100 : cmdPrefix ? 85 : titleMatch ? 50 : 30 });
           }
         });
       }
 
-      if (mode !== 'text' && mode !== 'flow') {
+      if (mode !== 'text' && mode !== 'flow' && mode !== 'set') {
         clips.forEach(clip => {
           const cmd = (clip.customCommand || '').toLowerCase();
           const nameMatch = (clip.name || '').toLowerCase().includes(q);
           const cmdExact = cmd && cmd === q;
           const cmdPrefix = cmd && q.length > 0 && cmd.startsWith(q);
           if (!q || nameMatch || cmdPrefix) {
-            results.push({
-              kind: 'audio',
-              item: clip,
-              score: cmdExact ? 100 : cmdPrefix ? 85 : nameMatch ? 50 : 30
-            });
+            results.push({ kind: 'audio', item: clip, score: cmdExact ? 100 : cmdPrefix ? 85 : nameMatch ? 50 : 30 });
           }
         });
       }
 
-      if (mode !== 'text' && mode !== 'audio') {
+      if (mode !== 'text' && mode !== 'audio' && mode !== 'set') {
         mcFlows.forEach(flow => {
           const nameMatch = (flow.name || '').toLowerCase().includes(q);
           if (!q || nameMatch) {
-            results.push({
-              kind: 'flow',
-              item: flow,
-              score: nameMatch ? 60 : 40
-            });
+            results.push({ kind: 'flow', item: flow, score: nameMatch ? 60 : 40 });
+          }
+        });
+      }
+
+      if (mode !== 'text' && mode !== 'audio' && mode !== 'flow') {
+        imageSets.forEach(set => {
+          const titleMatch = (set.title || '').toLowerCase().includes(q);
+          if (!q || titleMatch) {
+            results.push({ kind: 'set', item: set, score: titleMatch ? 55 : 35 });
           }
         });
       }
@@ -4346,22 +4361,14 @@ LegoCore.registerBlock({
         if (!apiKey) return reject(new Error('No ManyChat API Key found. Configure ManyChat first.'));
         if (!subscriberId) return reject(new Error('No Target Subscriber ID set. Look up user first.'));
 
-        const payload = {
-          subscriber_id: parseInt(subscriberId, 10),
-          flow_ns: flowNs
-        };
+        const payload = { subscriber_id: parseInt(subscriberId, 10), flow_ns: flowNs };
 
-        if (typeof GM_xmlhttpRequest === 'undefined') {
-          return reject(new Error('GM_xmlhttpRequest not available.'));
-        }
+        if (typeof GM_xmlhttpRequest === 'undefined') return reject(new Error('GM_xmlhttpRequest not available.'));
 
         GM_xmlhttpRequest({
           method: 'POST',
           url: 'https://api.manychat.com/fb/sending/sendFlow',
-          headers: {
-            'Authorization': 'Bearer ' + apiKey,
-            'Content-Type': 'application/json'
-          },
+          headers: { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' },
           data: JSON.stringify(payload),
           onload: function (response) {
             if (response.status >= 200 && response.status < 300) resolve();
@@ -4489,7 +4496,7 @@ LegoCore.registerBlock({
 
       const input = oldInput.cloneNode(true);
       oldInput.parentNode.replaceChild(input, oldInput);
-      input.placeholder = 'Type message, or / to search (text/audio/flow)...';
+      input.placeholder = 'Type message, or / to search (text/audio/flow/set)...';
       input.style.paddingRight = '76px';
 
       const sendBtn = oldSendBtn.cloneNode(true);
@@ -4567,6 +4574,7 @@ LegoCore.registerBlock({
       let pendingAudioName = '';
       let pendingFlowNs = null;
       let pendingFlowName = '';
+      let pendingSet = null; // NEW: For Image Sets
       let previewPlayer = null;
 
       // ---------------- Dropdown ----------------
@@ -4604,6 +4612,8 @@ LegoCore.registerBlock({
             row.innerHTML = `<div class="ig-qcx-dd-row-top"><span>${icon}</span><span class="ig-qcx-dd-title">${label}</span></div>`;
           } else if (m.kind === 'flow') {
             row.innerHTML = `<div class="ig-qcx-dd-row-top"><span>🤖</span><span class="ig-qcx-dd-title">${m.item.name}</span></div><div class="ig-qcx-dd-preview">ManyChat Automation</div>`;
+          } else if (m.kind === 'set') {
+            row.innerHTML = `<div class="ig-qcx-dd-row-top"><span>🖼️</span><span class="ig-qcx-dd-title">${m.item.title}</span></div><div class="ig-qcx-dd-preview">${m.item.images.length} image(s)</div>`;
           } else {
             const icon = m.kind === 'text' ? '📝' : '🎵';
             const title = m.kind === 'text' ? m.item.title : m.item.name;
@@ -4651,9 +4661,11 @@ LegoCore.registerBlock({
         else if (lower === 'audio') { mode = 'audio'; q = ''; }
         else if (lower.startsWith('flow ')) { mode = 'flow'; q = remainder.slice(5); }
         else if (lower === 'flow') { mode = 'flow'; q = ''; }
+        else if (lower.startsWith('set ')) { mode = 'set'; q = remainder.slice(4); }
+        else if (lower === 'set') { mode = 'set'; q = ''; }
 
-        const { clips, textItems, mcFlows } = await getAllSearchableItems();
-        matches = computeMatches(q, mode, clips, textItems, mcFlows);
+        const { clips, textItems, mcFlows, imageSets } = await getAllSearchableItems();
+        matches = computeMatches(q, mode, clips, textItems, mcFlows, imageSets);
         selectedIndex = 0;
         openDropdown();
       }
@@ -4676,6 +4688,15 @@ LegoCore.registerBlock({
           input.value = '';
           closeDropdown();
           showFlowPreview();
+          input.focus();
+          return;
+        }
+
+        if (m.kind === 'set') {
+          pendingSet = m.item;
+          input.value = '';
+          closeDropdown();
+          showSetPreview();
           input.focus();
           return;
         }
@@ -4708,12 +4729,19 @@ LegoCore.registerBlock({
         previewLabel.innerText = '🎵 ' + pendingAudioName;
         previewPlayBtn.style.display = '';
       }
+
+      function showSetPreview() {
+        previewBar.style.display = 'flex';
+        previewLabel.innerText = `🖼️ ${pendingSet.title} (${pendingSet.images.length} img)`;
+        previewPlayBtn.style.display = 'none';
+      }
       
       function clearPending() {
         pendingAudioBlob = null;
         pendingAudioName = '';
         pendingFlowNs = null;
         pendingFlowName = '';
+        pendingSet = null;
         previewBar.style.display = 'none';
         if (previewPlayer) { previewPlayer.pause(); previewPlayer = null; }
         previewPlayBtn.innerText = '▶️';
@@ -4765,6 +4793,35 @@ LegoCore.registerBlock({
       }
 
       // ---------------- Sending ----------------
+      function sendImageSet(setObj, btnEl) {
+        const chatZone = document.querySelector('div[contenteditable="true"]') || document.querySelector('form');
+        if (!chatZone) { alert("Open an active Instagram chat window first."); return; }
+
+        const original = btnEl.innerText;
+        btnEl.innerText = '⏳';
+        const dt = new DataTransfer();
+
+        setObj.images.forEach((imgData, i) => {
+          const ext = imgData.type ? imgData.type.split('/')[1] : 'jpeg';
+          const fileObj = new File([imgData.blob], `image_${i}.${ext}`, { type: imgData.type || 'image/jpeg' });
+          dt.items.add(fileObj);
+        });
+
+        ['dragenter', 'dragover', 'drop'].forEach(eventType => {
+          chatZone.dispatchEvent(new DragEvent(eventType, {
+            bubbles: true, cancelable: true, dataTransfer: dt
+          }));
+        });
+
+        setTimeout(() => { 
+          btnEl.innerText = '✅'; 
+          setTimeout(() => {
+            btnEl.innerText = original; 
+            clearPending();
+          }, 1000); 
+        }, 200);
+      }
+
       function sendText(text) {
         const chatZone = document.querySelector('div[contenteditable="true"]');
         if (!chatZone) { alert("Open an active Instagram chat window first."); return; }
@@ -4794,6 +4851,11 @@ LegoCore.registerBlock({
         if (pendingAudioBlob) {
           core.injectClipToChat(pendingAudioBlob, pendingAudioName);
           clearPending();
+          return;
+        }
+        
+        if (pendingSet) {
+          sendImageSet(pendingSet, sendBtn);
           return;
         }
         
@@ -4848,12 +4910,11 @@ LegoCore.registerBlock({
           if (e.key === 'ArrowUp') { e.preventDefault(); selectedIndex = (selectedIndex - 1 + matches.length) % matches.length; renderDropdown(); return; }
           if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); pickSelected(); return; }
           if (e.key === 'Escape') { e.preventDefault(); closeDropdown(); return; }
-          // Removed the dangling return here so typing still flows normally
         }
         
         if (e.key === 'Enter' && !e.shiftKey) {
           e.preventDefault();
-          e.stopPropagation(); // Stop Instagram from interfering
+          e.stopPropagation(); 
           
           const saveMatch = input.value.match(/^\/save\s+audio\s+([^.]+)\.(.*)$/i);
           if (saveMatch) {
@@ -4864,7 +4925,7 @@ LegoCore.registerBlock({
           return;
         }
         if (e.key === 'Escape') {
-          if (pendingAudioBlob || pendingFlowNs) clearPending();
+          if (pendingAudioBlob || pendingFlowNs || pendingSet) clearPending();
         }
       });
 
