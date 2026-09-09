@@ -2,10 +2,12 @@
 // @name         Instagram Lego Toolkit
 // @namespace    https://node-builder.local/
 // @version      1.0.0
-// @description  Compiled by Node Builder -- 23 block(s): Quick Message Recorder, Sidebar Plugin Manager, Recorder Studio, Audio Library, Dual Sidebar UI Shell, menuCollapseModule, Menu Panel Switcher Module, Menu Card Pop-out Module, Header Toolbar Organizer Module, Workspace Profile & Visibility Manager, Instagram Resizer Feature, Sidebar-to-Resizer Sync, Quick Chat Box, Text Library Module (Saved Snippets), image manager, Highlighter, Commands, Reorder Module, text sync Google Sheets, ManyChat Integration, ManyChat Username Detector, Text Library Height Fix (v1), Reset menus
+// @description  Compiled by Node Builder -- 24 block(s): Quick Message Recorder, Sidebar Plugin Manager, Recorder Studio, Audio Library, Dual Sidebar UI Shell, menuCollapseModule, Menu Panel Switcher Module, Menu Card Pop-out Module, Header Toolbar Organizer Module, Workspace Profile & Visibility Manager, Instagram Resizer Feature, Sidebar-to-Resizer Sync, Quick Chat Box, Text Library Module (Saved Snippets), image manager, Highlighter, Commands, Reorder Module, text sync Google Sheets, ManyChat Integration, ManyChat Username Detector, Text Library Height Fix (v1), Reset menus, Image Library
 // @author       You
 // @match        https://www.instagram.com/*
 // @grant        GM_xmlhttpRequest
+// @connect      docs.google.com
+// @require      https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -6650,6 +6652,405 @@ LegoCore.registerBlock({
     document.body.appendChild(resetBtn);
     
     core.emit('block:ready', { id: 'floatingMenuRescueModule' });
+  }
+});
+
+/* ============================================================
+   BLOCK: Image Library (v1)
+   ============================================================ */
+/* ============================================================
+   BLOCK: Image Sets Library (v1)
+   ============================================================ */
+LegoCore.registerBlock({
+  id: 'imageSetsLibraryModule',
+  init(core) {
+    const DB_NAME = 'IG_ImageSets_Core_DB';
+    const DB_VERSION = 1;
+    let db = null;
+    let draggedItem = null;
+
+    // 1. Initialize IndexedDB
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    request.onerror = e => console.error("[ImageSets] DB Error:", e);
+    request.onupgradeneeded = e => {
+      const database = e.target.result;
+      if (!database.objectStoreNames.contains('sets')) {
+        const store = database.createObjectStore('sets', { keyPath: 'id' });
+        store.createIndex('order', 'order', { unique: false });
+      }
+    };
+    request.onsuccess = e => {
+      db = e.target.result;
+      renderTree();
+    };
+
+    // 2. Core Styles
+    const style = document.createElement('style');
+    style.id = 'ig-image-sets-styles';
+    style.innerHTML = `
+      .ig-isl-container { display: flex; flex-direction: column; gap: 8px; font-family: -apple-system, sans-serif; font-size: 11px; flex: 1; min-height: 0; }
+      .ig-isl-header-btns { display: flex; gap: 4px; }
+      .ig-isl-hbtn { flex: 1; background: var(--igls-surface-2, #1c1c23); color: #e2e8f0; border: 1px solid #334155; border-radius: 4px; padding: 6px 4px; font-size: 10px; font-weight: bold; cursor: pointer; transition: 0.2s; text-align: center; }
+      .ig-isl-hbtn:hover { background: #334155; color: #fff; }
+
+      .ig-isl-tree { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; padding-right: 2px; }
+      .ig-isl-tree::-webkit-scrollbar { width: 4px; }
+      .ig-isl-tree::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+
+      .ig-isl-row { display: flex; align-items: center; padding: 6px 8px; border-bottom: 1px solid rgba(255,255,255,0.03); background: rgba(255,255,255,0.01); cursor: grab; transition: background 0.2s; }
+      .ig-isl-row:hover { background: rgba(255,255,255,0.05); }
+      .ig-isl-row.alt { background: rgba(255,255,255,0.02); }
+      .ig-isl-row:active { cursor: grabbing; }
+
+      .ig-isl-grip { color: #475569; font-size: 10px; cursor: grab; margin-right: 6px; flex-shrink: 0; }
+      .ig-isl-title { flex: 1; font-size: 11px; color: #f8fafc; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
+      .ig-isl-count-badge { font-size: 9px; background: rgba(255,255,255,0.1); color: #c9a876; padding: 2px 6px; border-radius: 8px; font-weight: bold; margin: 0 8px; flex-shrink: 0; }
+
+      .ig-isl-actions { display: flex; gap: 4px; align-items: center; flex-shrink: 0; }
+      .ig-isl-btn { background: transparent; border: none; color: #64748b; cursor: pointer; font-size: 11px; padding: 3px 6px; border-radius: 4px; transition: 0.2s; }
+      .ig-isl-btn:hover { background: rgba(255,255,255,0.1); color: #fff; }
+      .ig-isl-send-btn { background: #10b981; color: #fff; border-radius: 4px; padding: 4px 8px; font-weight: bold; font-size: 10px; }
+      .ig-isl-send-btn:hover { background: #059669; color: #fff; }
+
+      .ig-isl-drop-top { border-top: 2px solid #10b981 !important; }
+      .ig-isl-drop-bottom { border-bottom: 2px solid #10b981 !important; }
+
+      /* Modals */
+      .ig-isl-modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 2147483647; display: flex; justify-content: center; align-items: center; }
+      .ig-isl-modal { background: #0f172a; border: 1px solid #334155; border-radius: 8px; width: 360px; max-height: 90vh; display: flex; flex-direction: column; box-shadow: 0 10px 25px rgba(0,0,0,0.5); overflow: hidden; }
+      .ig-isl-modal-header { padding: 16px; border-bottom: 1px solid #334155; display: flex; justify-content: space-between; align-items: center; }
+      .ig-isl-modal-header h3 { margin: 0; font-size: 14px; color: #fff; }
+      .ig-isl-modal-body { padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; flex: 1; }
+      .ig-isl-modal-footer { padding: 12px 16px; border-top: 1px solid #334155; display: flex; justify-content: space-between; background: #1e293b; }
+
+      .ig-isl-input { width: 100%; background: #1e293b; border: 1px solid #475569; color: #fff; padding: 8px; border-radius: 4px; font-size: 12px; box-sizing: border-box; outline: none; }
+      .ig-isl-input:focus { border-color: #6366f1; }
+      
+      .ig-isl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(70px, 1fr)); gap: 8px; margin-top: 8px; }
+      .ig-isl-thumb-wrap { position: relative; aspect-ratio: 1; background: #1e293b; border: 1px solid #334155; border-radius: 4px; overflow: hidden; }
+      .ig-isl-thumb-wrap img { width: 100%; height: 100%; object-fit: cover; }
+      .ig-isl-thumb-del { position: absolute; top: 2px; right: 2px; background: rgba(220,38,38,0.9); color: #fff; border: none; width: 18px; height: 18px; border-radius: 3px; font-size: 10px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
+      .ig-isl-thumb-del:hover { background: #b91c1c; }
+    `;
+    document.head.appendChild(style);
+
+    // 3. UI Shell
+    const libUI = document.createElement('div');
+    libUI.className = 'ig-isl-container';
+    libUI.innerHTML = `
+      <div class="ig-isl-header-btns">
+        <button id="ig-isl-new-set" class="ig-isl-hbtn">➕ New Image Set</button>
+      </div>
+      <div id="ig-isl-tree" class="ig-isl-tree"></div>
+    `;
+
+    // 4. Compression Helper
+    function compressThumbnail(file, maxSize = 200) {
+      return new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          const img = new Image();
+          img.onload = () => {
+            const canvas = document.createElement('canvas');
+            let w = img.width, h = img.height;
+            if (w > maxSize || h > maxSize) {
+              const ratio = Math.min(maxSize / w, maxSize / h);
+              w *= ratio; h *= ratio;
+            }
+            canvas.width = w; canvas.height = h;
+            canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+            resolve(canvas.toDataURL('image/jpeg', 0.6));
+          };
+          img.src = e.target.result;
+        };
+        reader.readAsDataURL(file);
+      });
+    }
+
+    // 5. Editor Modal
+    function openSetEditor(existingSet) {
+      const isEdit = !!existingSet;
+      // Copy array so we can safely edit drafts without affecting the DB until Save
+      let draftImages = isEdit ? [...existingSet.images] : []; 
+      
+      const overlay = document.createElement('div');
+      overlay.className = 'ig-isl-modal-overlay';
+      overlay.innerHTML = `
+        <div class="ig-isl-modal">
+          <div class="ig-isl-modal-header">
+            <h3>${isEdit ? '✏️ Edit Image Set' : '🖼️ New Image Set'}</h3>
+            <button id="ig-isl-close" style="background:none; border:none; color:#94a3b8; cursor:pointer;">✕</button>
+          </div>
+          <div class="ig-isl-modal-body">
+            <div>
+              <div style="font-size:11px; font-weight:bold; color:#94a3b8; margin-bottom:4px;">Set Title:</div>
+              <input type="text" id="ig-isl-title" class="ig-isl-input" placeholder="e.g. Welcome Package..." value="${isEdit ? existingSet.title : ''}">
+            </div>
+            <div>
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+                <div style="font-size:11px; font-weight:bold; color:#94a3b8;">Images: <span id="ig-isl-count">0</span></div>
+                <button id="ig-isl-add-imgs" style="background:#334155; color:#fff; border:none; padding:4px 8px; border-radius:4px; font-size:10px; cursor:pointer;">➕ Add Files</button>
+                <input type="file" id="ig-isl-file-input" accept="image/*" multiple style="display:none;">
+              </div>
+              <div id="ig-isl-grid" class="ig-isl-grid"></div>
+            </div>
+          </div>
+          <div class="ig-isl-modal-footer">
+            <div style="display:flex; gap:8px;">
+              ${isEdit ? '<button id="ig-isl-delete" style="background:#dc2626; color:#fff; border:none; padding:6px 12px; border-radius:4px; font-weight:bold; cursor:pointer;">🗑️ Delete Set</button>' : '<div></div>'}
+            </div>
+            <div style="display:flex; gap:8px;">
+              <button id="ig-isl-cancel" style="background:transparent; color:#94a3b8; border:none; cursor:pointer; font-weight:bold;">Cancel</button>
+              <button id="ig-isl-save" style="background:#6366f1; color:#fff; border:none; padding:6px 12px; border-radius:4px; font-weight:bold; cursor:pointer;">💾 Save</button>
+            </div>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(overlay);
+
+      const gridEl = overlay.querySelector('#ig-isl-grid');
+      const countEl = overlay.querySelector('#ig-isl-count');
+      const titleInput = overlay.querySelector('#ig-isl-title');
+      const fileInput = overlay.querySelector('#ig-isl-file-input');
+
+      function renderGrid() {
+        gridEl.innerHTML = '';
+        countEl.innerText = draftImages.length;
+        draftImages.forEach((imgObj, idx) => {
+          const wrap = document.createElement('div');
+          wrap.className = 'ig-isl-thumb-wrap';
+          wrap.innerHTML = `
+            <img src="${imgObj.thumb}" alt="thumb">
+            <button class="ig-isl-thumb-del" data-idx="${idx}">✕</button>
+          `;
+          wrap.querySelector('.ig-isl-thumb-del').onclick = () => {
+            draftImages.splice(idx, 1);
+            renderGrid();
+          };
+          gridEl.appendChild(wrap);
+        });
+      }
+      renderGrid();
+
+      overlay.querySelector('#ig-isl-add-imgs').onclick = () => fileInput.click();
+
+      fileInput.onchange = async (e) => {
+        const files = Array.from(e.target.files);
+        if (!files.length) return;
+        const addBtn = overlay.querySelector('#ig-isl-add-imgs');
+        addBtn.innerText = '⏳ Processing...';
+        addBtn.disabled = true;
+
+        for (let file of files) {
+          const thumb = await compressThumbnail(file);
+          draftImages.push({
+            id: 'img_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5),
+            type: file.type,
+            blob: file,
+            thumb: thumb
+          });
+        }
+        fileInput.value = '';
+        addBtn.innerText = '➕ Add Files';
+        addBtn.disabled = false;
+        renderGrid();
+      };
+
+      const closeModal = () => overlay.remove();
+      overlay.querySelector('#ig-isl-close').onclick = closeModal;
+      overlay.querySelector('#ig-isl-cancel').onclick = closeModal;
+
+      if (isEdit) {
+        overlay.querySelector('#ig-isl-delete').onclick = () => {
+          if (!confirm("Permanently delete this entire image set?")) return;
+          const tx = db.transaction(['sets'], 'readwrite');
+          tx.objectStore('sets').delete(existingSet.id);
+          tx.oncomplete = () => { renderTree(); closeModal(); };
+        };
+      }
+
+      overlay.querySelector('#ig-isl-save').onclick = () => {
+        const title = titleInput.value.trim() || 'Untitled Set';
+        if (!draftImages.length) {
+          alert("Please add at least one image to save a set.");
+          return;
+        }
+        const tx = db.transaction(['sets'], 'readwrite');
+        const store = tx.objectStore('sets');
+        
+        if (isEdit) {
+          existingSet.title = title;
+          existingSet.images = draftImages;
+          store.put(existingSet);
+        } else {
+          const countReq = store.count();
+          countReq.onsuccess = () => {
+            store.add({
+              id: 'set_' + Date.now(),
+              title: title,
+              images: draftImages,
+              order: countReq.result
+            });
+          };
+        }
+        tx.oncomplete = () => { renderTree(); closeModal(); };
+      };
+    }
+
+    libUI.querySelector('#ig-isl-new-set').onclick = () => openSetEditor(null);
+
+    // 6. Preview Modal (Read Only)
+    function openPreviewModal(setObj) {
+      const overlay = document.createElement('div');
+      overlay.className = 'ig-isl-modal-overlay';
+      
+      const thumbsHtml = setObj.images.map(img => 
+        `<div class="ig-isl-thumb-wrap"><img src="${img.thumb}" alt="thumb"></div>`
+      ).join('');
+
+      overlay.innerHTML = `
+        <div class="ig-isl-modal">
+          <div class="ig-isl-modal-header">
+            <h3>👁️ Preview: ${setObj.title}</h3>
+            <button id="ig-isl-close-prev" style="background:none; border:none; color:#94a3b8; cursor:pointer;">✕</button>
+          </div>
+          <div class="ig-isl-modal-body">
+            <div class="ig-isl-grid">${thumbsHtml}</div>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(overlay);
+      
+      const close = () => overlay.remove();
+      overlay.querySelector('#ig-isl-close-prev').onclick = close;
+      overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
+    }
+
+    // 7. Drag & Drop Reordering Logic
+    function handleDragStart(e, id) { 
+      draggedItem = id; 
+      e.dataTransfer.effectAllowed = 'move'; 
+      setTimeout(() => e.target.style.opacity = '0.3', 0); 
+    }
+    function handleDragOver(e, id) {
+      e.preventDefault(); e.stopPropagation();
+      const targetEl = e.currentTarget;
+      document.querySelectorAll('.ig-isl-drop-top, .ig-isl-drop-bottom').forEach(el => el.classList.remove('ig-isl-drop-top', 'ig-isl-drop-bottom'));
+      if (!draggedItem || draggedItem === id) return;
+      const rect = targetEl.getBoundingClientRect(); 
+      const y = e.clientY - rect.top; 
+      if (y < rect.height / 2) targetEl.classList.add('ig-isl-drop-top');
+      else targetEl.classList.add('ig-isl-drop-bottom');
+    }
+    function handleDrop(e, targetId) {
+      e.preventDefault(); e.stopPropagation();
+      if (!draggedItem || draggedItem === targetId) return;
+      
+      const targetEl = e.currentTarget; 
+      const rect = targetEl.getBoundingClientRect(); 
+      const y = e.clientY - rect.top; 
+      
+      const tx = db.transaction(['sets'], 'readwrite');
+      const store = tx.objectStore('sets');
+      store.getAll().onsuccess = ev => {
+        const sets = ev.target.result.sort((a,b) => (a.order || 0) - (b.order || 0));
+        const dragIdx = sets.findIndex(s => s.id === draggedItem);
+        const targetIdx = sets.findIndex(s => s.id === targetId);
+        
+        if (dragIdx > -1 && targetIdx > -1) {
+          const [moved] = sets.splice(dragIdx, 1);
+          if (y < rect.height / 2) sets.splice(targetIdx, 0, moved); // Drop top
+          else sets.splice(targetIdx + 1, 0, moved); // Drop bottom
+          
+          sets.forEach((s, i) => { s.order = i; store.put(s); });
+        }
+      };
+      tx.oncomplete = () => { draggedItem = null; renderTree(); };
+    }
+
+    // 8. Injection Send Engine
+    function sendImageSet(setObj, btnEl) {
+      const chatZone = document.querySelector('div[contenteditable="true"]') || document.querySelector('form');
+      if (!chatZone) { alert("Open an active Instagram chat window first."); return; }
+
+      btnEl.innerText = '⏳';
+      const dt = new DataTransfer();
+
+      setObj.images.forEach((imgData, i) => {
+        const ext = imgData.type ? imgData.type.split('/')[1] : 'jpeg';
+        const fileObj = new File([imgData.blob], `image_${i}.${ext}`, { type: imgData.type || 'image/jpeg' });
+        dt.items.add(fileObj);
+      });
+
+      ['dragenter', 'dragover', 'drop'].forEach(eventType => {
+        chatZone.dispatchEvent(new DragEvent(eventType, {
+          bubbles: true, cancelable: true, dataTransfer: dt
+        }));
+      });
+
+      setTimeout(() => { btnEl.innerText = '✅'; setTimeout(() => btnEl.innerText = '📤 Send', 1000); }, 200);
+    }
+
+    // 9. Main Render
+    function renderTree() {
+      if (!db) return;
+      const tree = libUI.querySelector('#ig-isl-tree');
+      tree.innerHTML = '';
+
+      const tx = db.transaction(['sets'], 'readonly');
+      tx.objectStore('sets').getAll().onsuccess = e => {
+        const sets = (e.target.result || []).sort((a,b) => (a.order || 0) - (b.order || 0));
+        
+        if (!sets.length) {
+          tree.innerHTML = '<div style="padding:12px; color:#94a3b8; font-size:10px; text-align:center;">No Image Sets yet. Click New to bundle images together.</div>';
+          return;
+        }
+
+        sets.forEach((set, idx) => {
+          const row = document.createElement('div');
+          row.className = `ig-isl-row ${idx % 2 === 0 ? 'alt' : ''}`;
+          row.draggable = true;
+
+          row.innerHTML = `
+            <span class="ig-isl-grip">⠿</span>
+            <span class="ig-isl-title" title="${set.title}">${set.title}</span>
+            <span class="ig-isl-count-badge">🖼️ ${set.images.length}</span>
+            <div class="ig-isl-actions">
+              <button class="ig-isl-btn prev-btn" title="Preview Contents">👁️</button>
+              <button class="ig-isl-btn edit-btn" title="Edit Set">✏️</button>
+              <button class="ig-isl-send-btn" title="Send all images in this set">📤 Send</button>
+            </div>
+          `;
+
+          // Drag Bindings
+          row.addEventListener('dragstart', (ev) => handleDragStart(ev, set.id));
+          row.addEventListener('dragend', (ev) => { ev.target.style.opacity = '1'; draggedItem = null; });
+          row.addEventListener('dragover', (ev) => handleDragOver(ev, set.id));
+          row.addEventListener('dragleave', (ev) => ev.currentTarget.classList.remove('ig-isl-drop-top', 'ig-isl-drop-bottom'));
+          row.addEventListener('drop', (ev) => handleDrop(ev, set.id));
+
+          // Action Bindings
+          row.querySelector('.prev-btn').onclick = () => openPreviewModal(set);
+          row.querySelector('.edit-btn').onclick = () => openSetEditor(set);
+          row.querySelector('.ig-isl-send-btn').onclick = (ev) => sendImageSet(set, ev.target);
+
+          tree.appendChild(row);
+        });
+      };
+    }
+
+    // 10. Mount to Sidebar
+    function mountCard(attemptsLeft = 10) {
+      if (typeof core.registerMenu === 'function') {
+        core.registerMenu('left', '🖼️ Image Sets', libUI, '⠿', 'image-sets-library');
+        console.log('[ImageSetsLibrary] Grouped List UI loaded.');
+      } else if (attemptsLeft > 0) {
+        setTimeout(() => mountCard(attemptsLeft - 1), 200);
+      }
+    }
+    mountCard();
+
+    core.emit('block:ready', { id: 'imageSetsLibraryModule' });
   }
 });
 
