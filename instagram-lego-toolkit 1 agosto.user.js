@@ -2,7 +2,7 @@
 // @name         Instagram Lego Toolkit
 // @namespace    https://node-builder.local/
 // @version      1.0.0
-// @description  Compiled by Node Builder -- 24 block(s): Quick Message Recorder, Sidebar Plugin Manager, Recorder Studio, Audio Library, Dual Sidebar UI Shell, menuCollapseModule, Menu Panel Switcher Module, Menu Card Pop-out Module, Header Toolbar Organizer Module, Workspace Profile & Visibility Manager, Instagram Resizer Feature, Sidebar-to-Resizer Sync, Quick Chat Box, Text Library Module (Saved Snippets), image manager, Highlighter, Commands, Reorder Module, text sync Google Sheets, ManyChat Integration, ManyChat Username Detector, Text Library Height Fix (v1), Reset menus, Image Library
+// @description  Compiled by Node Builder -- 26 block(s): Quick Message Recorder, Sidebar Plugin Manager, Recorder Studio, Audio Library, Dual Sidebar UI Shell, menuCollapseModule, Menu Panel Switcher Module, Menu Card Pop-out Module, Header Toolbar Organizer Module, Workspace Profile & Visibility Manager, Instagram Resizer Feature, Sidebar-to-Resizer Sync, Quick Chat Box, Text Library Module (Saved Snippets), image manager, Highlighter, Commands, Reorder Module, text sync Google Sheets, ManyChat Integration, ManyChat Username Detector, Text Library Height Fix (v1), Reset menus, Image Library, Emoji Module, Cursor Focus
 // @author       You
 // @match        https://www.instagram.com/*
 // @grant        GM_xmlhttpRequest
@@ -17,10 +17,14 @@
 /* ============================================================
    CORE ENGINE
    ============================================================ */
+/* ============================================================
+   CORE ENGINE
+   ============================================================ */
 /* ================================================================
    CORE ENGINE: Instagram Soundboard & Chat Infrastructure
    Handles IndexedDB storage, audio recording, silence trimming,
    hotkey configurations, and chat injection bridges.
+   Now includes Universal Focus Overwatch Hammer.
 ================================================================ */
 const LegoCore = (function () {
     let db;
@@ -178,41 +182,44 @@ const LegoCore = (function () {
             headerElement.style.cursor = "grab";
             document.removeEventListener('mousemove', onMouseMove);
             document.removeEventListener('mouseup', onMouseUp);
-            const rect = panelElement.getBoundingClientRect();
-            localStorage.setItem(storageKey, JSON.stringify({ bottom: 'auto', left: `${rect.left}px`, top: `${rect.top}px` }));
+            if (storageKey) {
+                const rect = panelElement.getBoundingClientRect();
+                localStorage.setItem(storageKey, JSON.stringify({ bottom: 'auto', left: `${rect.left}px`, top: `${rect.top}px` }));
+            }
         }
     }
 
     function makeIsolatedDraggable(panel, header, storageKey) {
-        let dragging = false, startX, startY, initL, initT;
-        header.onmousedown = e => {
-            if (e.button !== 0) return;
-            dragging = true;
-            header.style.cursor = "grabbing";
-            startX = e.clientX; startY = e.clientY;
-            const rect = panel.getBoundingClientRect();
-            initL = rect.left; initT = rect.top;
-            panel.style.bottom = "auto"; panel.style.right = "auto";
-            panel.style.left = `${initL}px`; panel.style.top = `${initT}px`;
+        makeDraggable(panel, header, storageKey);
+    }
 
-            document.addEventListener('mousemove', onMove);
-            document.addEventListener('mouseup', onUp);
-            e.preventDefault();
-        };
-        function onMove(e) {
-            if (!dragging) return;
-            panel.style.left = `${initL + (e.clientX - startX)}px`;
-            panel.style.top = `${initT + (e.clientY - startY)}px`;
-        }
-        function onUp() {
-            if (!dragging) return;
-            dragging = false;
-            header.style.cursor = "grab";
-            document.removeEventListener('mousemove', onMouseMove);
-            document.removeEventListener('mouseup', onUp);
-            const rect = panel.getBoundingClientRect();
-            localStorage.setItem(storageKey, JSON.stringify({ bottom: 'auto', left: `${rect.left}px`, top: `${rect.top}px` }));
-        }
+    // --- NEW: Universal Focus Overwatch Hammer ---
+    let overwatchTimeout = null;
+    let overwatchInterval = null;
+
+    function enableFocusOverwatch(durationMs = 4000) {
+        if (overwatchInterval) clearInterval(overwatchInterval);
+        if (overwatchTimeout) clearTimeout(overwatchTimeout);
+
+        const liveInput = document.getElementById('ig-quick-chat-input');
+        if (!liveInput) return;
+
+        // Hammer the focus aggressively every 50ms
+        overwatchInterval = setInterval(() => {
+            const prefs = JSON.parse(localStorage.getItem('ig_quick_chat_prefs_v1')) || { keepFocus: true };
+            if (!prefs.keepFocus) {
+                clearInterval(overwatchInterval);
+                return;
+            }
+            if (document.activeElement !== liveInput) {
+                liveInput.focus();
+            }
+        }, 50);
+
+        // Turn off the hammer after the duration expires
+        overwatchTimeout = setTimeout(() => {
+            clearInterval(overwatchInterval);
+        }, durationMs);
     }
 
     // Block Registry
@@ -236,6 +243,7 @@ const LegoCore = (function () {
         injectTextToChat,
         makeDraggable,
         makeIsolatedDraggable,
+        enableFocusOverwatch,
         boot
     };
 
@@ -2041,14 +2049,10 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Menu Card Pop-out Module (v4)
+   BLOCK: Menu Card Pop-out Module (v6)
    ============================================================ */
 /* ============================================================
-   BLOCK: Menu Card Pop-out Module (v4) — Corner resize (width +
-   height together) from the bottom-right corner, and height-only
-   resize from the bottom edge, plus the existing width-only side
-   edges. All driven by custom JS now (not the native CSS `resize`
-   handle), so nothing fights over who controls the height.
+   BLOCK: Menu Card Pop-out Module (v6 - Draggable Icons & Emojis)
    ============================================================ */
 LegoCore.registerBlock({
   id: 'menuInPagePopoutModule',
@@ -2068,7 +2072,17 @@ LegoCore.registerBlock({
       } catch (e) {}
     }
 
-    // Inject CSS for popout button and floating window chrome
+    // Helper to extract an emoji or the first letter from a title
+    function extractIcon(text) {
+      if (!text) return '⠿';
+      const emojiMatch = text.match(/[\p{Emoji_Presentation}\p{Extended_Pictographic}]/u);
+      if (emojiMatch) return emojiMatch[0];
+      const charMatch = text.match(/[A-Za-z0-9]/);
+      if (charMatch) return charMatch[0].toUpperCase();
+      return '⠿';
+    }
+
+    // Inject CSS for popout button, floating window chrome, and iconified state
     const style = document.createElement('style');
     style.id = 'ig-inpage-popout-styles';
     style.innerHTML = `
@@ -2108,6 +2122,7 @@ LegoCore.registerBlock({
         min-height: 150px;
         max-height: 95vh;
         overflow: hidden;
+        transition: border-radius 0.2s;
       }
 
       .ig-floating-modal .ig-menu-header {
@@ -2117,7 +2132,6 @@ LegoCore.registerBlock({
         cursor: grab;
         flex-shrink: 0;
       }
-
       .ig-floating-modal .ig-menu-header:active {
         cursor: grabbing;
       }
@@ -2131,57 +2145,55 @@ LegoCore.registerBlock({
         resize: none;
       }
 
-      /* Width-only resize handles on the left and right edges */
-      .ig-floating-resizer {
-        position: absolute;
-        top: 0;
-        width: 6px;
-        height: 100%;
-        cursor: ew-resize;
-        z-index: 2;
-      }
+      /* Resizers */
+      .ig-floating-resizer { position: absolute; top: 0; width: 6px; height: 100%; cursor: ew-resize; z-index: 2; }
       .ig-floating-resizer.left { left: 0; }
       .ig-floating-resizer.right { right: 0; }
-      .ig-floating-resizer:hover, .ig-floating-resizer.active {
-        background: rgba(201, 168, 118, 0.3);
-      }
+      .ig-floating-resizer:hover, .ig-floating-resizer.active { background: rgba(201, 168, 118, 0.3); }
 
-      /* Height-only resize strip along the bottom edge */
-      .ig-floating-resizer-bottom {
-        position: absolute;
-        left: 0;
-        bottom: 0;
-        width: 100%;
-        height: 6px;
-        cursor: ns-resize;
-        z-index: 2;
-      }
-      .ig-floating-resizer-bottom:hover, .ig-floating-resizer-bottom.active {
-        background: rgba(201, 168, 118, 0.3);
-      }
+      .ig-floating-resizer-bottom { position: absolute; left: 0; bottom: 0; width: 100%; height: 6px; cursor: ns-resize; z-index: 2; }
+      .ig-floating-resizer-bottom:hover, .ig-floating-resizer-bottom.active { background: rgba(201, 168, 118, 0.3); }
 
-      /* Corner handle: resizes width + height together */
-      .ig-floating-resizer-corner {
-        position: absolute;
-        right: 0;
-        bottom: 0;
-        width: 14px;
-        height: 14px;
-        cursor: nwse-resize;
-        z-index: 3;
-      }
+      .ig-floating-resizer-corner { position: absolute; right: 0; bottom: 0; width: 14px; height: 14px; cursor: nwse-resize; z-index: 3; }
       .ig-floating-resizer-corner::after {
-        content: '';
-        position: absolute;
-        right: 3px;
-        bottom: 3px;
-        width: 7px;
-        height: 7px;
-        background: linear-gradient(135deg, transparent 50%, rgba(255,255,255,0.35) 50%);
-        border-radius: 1px;
+        content: ''; position: absolute; right: 3px; bottom: 3px; width: 7px; height: 7px;
+        background: linear-gradient(135deg, transparent 50%, rgba(255,255,255,0.35) 50%); border-radius: 1px;
       }
       .ig-floating-resizer-corner:hover::after, .ig-floating-resizer-corner.active::after {
         background: linear-gradient(135deg, transparent 50%, var(--igls-accent, #c9a876) 50%);
+      }
+
+      /* === MINIMIZED (TINY ICON) STATE === */
+      .ig-floating-modal.is-iconified {
+        width: 45px !important;
+        height: 45px !important;
+        min-width: 0 !important;
+        min-height: 0 !important;
+        border-radius: 12px;
+        cursor: grab;
+      }
+      .ig-floating-modal.is-iconified:active {
+        cursor: grabbing;
+      }
+      /* Hide all normal contents when iconified */
+      .ig-floating-modal.is-iconified > * {
+        display: none !important;
+      }
+      /* Show the extracted Emoji/Letter */
+      .ig-floating-modal.is-iconified::before {
+        content: attr(data-icon);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 100%;
+        height: 100%;
+        font-size: 20px;
+        color: var(--igls-accent, #c9a876);
+        background: var(--igls-surface, #17171d);
+        border-radius: 11px; /* inner radius */
+      }
+      .ig-floating-modal.is-iconified:hover::before {
+        background: var(--igls-surface-2, #1c1c23);
       }
     `;
     document.head.appendChild(style);
@@ -2203,10 +2215,20 @@ LegoCore.registerBlock({
       if (savedHeight) modal.style.height = savedHeight + 'px';
       modal.style.position = 'fixed';
 
+      // Extract Icon and set it for minimized mode
+      const titleSpan = card.querySelector('.ig-menu-header span:first-child');
+      const icon = extractIcon(titleSpan ? titleSpan.innerText : key);
+      modal.setAttribute('data-icon', icon);
+
+      // Restore iconified state if saved
+      if (savedPos.iconified) {
+        modal.classList.add('is-iconified');
+      }
+
       const header = card.querySelector('.ig-menu-header').cloneNode(true);
       const content = card.querySelector('.ig-menu-content');
 
-      // Replace popout button on floating header with dock-back button
+      // Swap popout button for dock back button
       const popBtn = header.querySelector('.ig-popout-btn');
       if (popBtn) {
         popBtn.innerText = '📥';
@@ -2221,13 +2243,21 @@ LegoCore.registerBlock({
       const switchBtn = header.querySelector('.ig-switch-panel-btn');
       if (switchBtn) switchBtn.style.display = 'none';
 
-      modal.appendChild(header);
+      // Attach listener to minimize button
+      const collapseBtn = header.querySelector('.ig-collapse-btn');
+      if (collapseBtn) {
+        collapseBtn.innerText = '−';
+        collapseBtn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          modal.classList.add('is-iconified');
+          popoutStates[key] = Object.assign({}, popoutStates[key], { iconified: true });
+          saveStates();
+        });
+      }
 
-      // Move actual DOM content to modal to preserve active listeners/references
+      modal.appendChild(header);
       modal.appendChild(content);
 
-      // Resize handles: left/right = width only, bottom = height only,
-      // corner = width + height together
       const leftResizer = document.createElement('div');
       leftResizer.className = 'ig-floating-resizer left';
       const rightResizer = document.createElement('div');
@@ -2242,14 +2272,9 @@ LegoCore.registerBlock({
       modal.appendChild(cornerResizer);
 
       document.body.appendChild(modal);
-
       card.classList.add('is-popped-out');
 
-      // Make modal draggable across the page
-      makeModalDraggable(modal, header, key);
-
-      // Make modal resizable: sides = width only, bottom = height only,
-      // corner = both at once
+      makeModalDraggable(modal, key);
       makeModalResizable(modal, leftResizer, rightResizer, bottomResizer, cornerResizer, key);
     }
 
@@ -2269,13 +2294,24 @@ LegoCore.registerBlock({
       saveStates();
     }
 
-    function makeModalDraggable(modal, header, key) {
+    // Completely rewritten to handle dragging from both header AND the minimized icon
+    function makeModalDraggable(modal, key) {
       let isDragging = false;
       let startX, startY, initLeft, initTop;
+      let moved = false; // Used to distinguish between a "click" and a "drag"
 
-      header.addEventListener('mousedown', (e) => {
-        if (e.button !== 0 || e.target.tagName === 'BUTTON') return;
+      modal.addEventListener('mousedown', (e) => {
+        // Only accept left-click and ignore nested buttons (like minimize, dock, etc)
+        if (e.button !== 0 || e.target.closest('button')) return;
+
+        const isHeaderClick = e.target.closest('.ig-menu-header');
+        const isIconified = modal.classList.contains('is-iconified');
+
+        // Only start drag if we click the header, OR if the whole window is currently a tiny icon
+        if (!isHeaderClick && !isIconified) return;
+
         isDragging = true;
+        moved = false;
         startX = e.clientX;
         startY = e.clientY;
         initLeft = modal.offsetLeft;
@@ -2288,23 +2324,37 @@ LegoCore.registerBlock({
 
       function onMouseMove(e) {
         if (!isDragging) return;
-        const newLeft = initLeft + (e.clientX - startX);
-        const newTop = initTop + (e.clientY - startY);
-        modal.style.left = newLeft + 'px';
-        modal.style.top = newTop + 'px';
+        const dx = e.clientX - startX;
+        const dy = e.clientY - startY;
+
+        // If mouse moves more than 3px, we register this as a drag, not a click
+        if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
+          moved = true;
+        }
+
+        modal.style.left = (initLeft + dx) + 'px';
+        modal.style.top = (initTop + dy) + 'px';
       }
 
-      function onMouseUp() {
+      function onMouseUp(e) {
         if (!isDragging) return;
         isDragging = false;
         document.removeEventListener('mousemove', onMouseMove);
         document.removeEventListener('mouseup', onMouseUp);
 
-        const key2 = key;
-        popoutStates[key2] = Object.assign({}, popoutStates[key2], {
-          top: modal.offsetTop,
-          left: modal.offsetLeft
-        });
+        const isIconified = modal.classList.contains('is-iconified');
+
+        // If it was a tiny icon and we didn't drag it around, it was a click to Expand
+        if (isIconified && !moved) {
+          modal.classList.remove('is-iconified');
+          popoutStates[key] = Object.assign({}, popoutStates[key], { iconified: false });
+        } else {
+          // Otherwise, just save its new position
+          popoutStates[key] = Object.assign({}, popoutStates[key], {
+            top: modal.offsetTop,
+            left: modal.offsetLeft
+          });
+        }
         saveStates();
       }
     }
@@ -2315,7 +2365,7 @@ LegoCore.registerBlock({
 
       function startResize(mode) {
         return function (e) {
-          if (e.button !== 0) return;
+          if (e.button !== 0 || modal.classList.contains('is-iconified')) return;
           e.preventDefault();
           e.stopPropagation();
 
@@ -2335,8 +2385,6 @@ LegoCore.registerBlock({
             const dx = ev.clientX - startX;
             const dy = ev.clientY - startY;
 
-            // Width: right edge and corner grow rightward; left edge grows
-            // leftward (and shifts the modal's left position to compensate).
             if (mode === 'right' || mode === 'corner') {
               const newWidth = Math.max(MIN_WIDTH, startWidth + dx);
               modal.style.width = newWidth + 'px';
@@ -2347,7 +2395,6 @@ LegoCore.registerBlock({
               modal.style.left = (startLeft - widthDelta) + 'px';
             }
 
-            // Height: bottom edge and corner both grow downward.
             if (mode === 'bottom' || mode === 'corner') {
               const newHeight = Math.max(MIN_HEIGHT, startHeight + dy);
               modal.style.height = newHeight + 'px';
@@ -2394,11 +2441,10 @@ LegoCore.registerBlock({
       btn.addEventListener('click', (e) => {
         e.stopPropagation();
         createFloatingWindow(card);
-        popoutStates[key] = popoutStates[key] || { top: 120, left: 220, width: 300 };
+        popoutStates[key] = popoutStates[key] || { top: 120, left: 220, width: 300, iconified: false };
         saveStates();
       });
 
-      // Insert button in header
       const switchBtn = header.querySelector('.ig-switch-panel-btn');
       const collapseBtn = header.querySelector('.ig-collapse-btn');
       const dragHandle = header.querySelector('.ig-drag-handle');
@@ -2413,7 +2459,6 @@ LegoCore.registerBlock({
         header.appendChild(btn);
       }
 
-      // If previously saved as popped-out, restore floating state on page load
       if (popoutStates[key]) {
         setTimeout(() => createFloatingWindow(card), 100);
       }
@@ -2422,9 +2467,7 @@ LegoCore.registerBlock({
     function attachToContainer(containerId) {
       const container = document.getElementById(containerId);
       if (!container) return;
-
       container.querySelectorAll('.ig-draggable-menu').forEach(processCard);
-
       const observer = new MutationObserver(() => {
         container.querySelectorAll('.ig-draggable-menu').forEach(processCard);
       });
@@ -2444,74 +2487,30 @@ LegoCore.registerBlock({
     }
 
     initWatcher(10);
-    console.log('[MenuInPagePopoutModule] Floating in-page windows enabled (horizontally resizable).');
+    console.log('[MenuInPagePopoutModule] Floating windows enabled (with draggable emoji icons).');
     core.emit('block:ready', { id: 'menuInPagePopoutModule' });
   }
 });
 
 /* ============================================================
-   BLOCK: Header Toolbar Organizer Module (v1)
+   BLOCK: Header Toolbar Organizer Module (v3)
    ============================================================ */
 /* ============================================================
-   BLOCK: Header Toolbar Organizer Module (v2 - No Move Handle)
+   BLOCK: Header Toolbar Organizer Module (v3 - Gear Grouping)
    ============================================================ */
-/* ================================================================
-   BLOCK: Header Toolbar Organizer (Standalone Feature Plugin)
-   - Removes the redundant move/drag handle icon
-   - Groups remaining action buttons (Pop-out, Switch, Collapse)
-     into a clean, unified toolbar pill
-   - Retains full drag-reorder functionality on the header area
-================================================================ */
 LegoCore.registerBlock({
   id: 'headerToolbarOrganizerModule',
   init(core) {
-    // Inject CSS to restyle buttons and hide old drag icons
     const style = document.createElement('style');
     style.id = 'ig-header-toolbar-styles';
     style.innerHTML = `
-      /* Hide standalone move/drag handle icons across all menus */
-      .ig-drag-handle {
-        display: none !important;
+      .ig-drag-handle { display: none !important; }
+      .ig-card-toolbar { display: flex; align-items: center; gap: 2px; background: rgba(255, 255, 255, 0.05); border: 1px solid var(--igls-border, rgba(255, 255, 255, 0.08)); border-radius: 6px; padding: 2px; margin-left: auto; }
+      .ig-card-toolbar button, .ig-card-toolbar .ig-popout-btn, .ig-card-toolbar .ig-switch-panel-btn, .ig-card-toolbar .ig-collapse-btn {
+        background: transparent !important; border: none !important; color: var(--igls-text-dim, #96949c) !important; cursor: pointer !important; font-size: 11px !important; line-height: 1 !important; padding: 4px 6px !important; margin: 0 !important; border-radius: 4px !important; display: inline-flex !important; align-items: center !important; justify-content: center !important; transition: color 0.15s, background 0.15s !important;
       }
-
-      /* Unified Header Toolbar Container */
-      .ig-card-toolbar {
-        display: flex;
-        align-items: center;
-        gap: 2px;
-        background: rgba(255, 255, 255, 0.05);
-        border: 1px solid var(--igls-border, rgba(255, 255, 255, 0.08));
-        border-radius: 6px;
-        padding: 2px;
-        margin-left: auto;
-      }
-
-      /* Base Style for All Action Buttons inside Toolbar */
-      .ig-card-toolbar button,
-      .ig-card-toolbar .ig-popout-btn,
-      .ig-card-toolbar .ig-switch-panel-btn,
-      .ig-card-toolbar .ig-collapse-btn {
-        background: transparent !important;
-        border: none !important;
-        color: var(--igls-text-dim, #96949c) !important;
-        cursor: pointer !important;
-        font-size: 11px !important;
-        line-height: 1 !important;
-        padding: 4px 6px !important;
-        margin: 0 !important;
-        border-radius: 4px !important;
-        display: inline-flex !important;
-        align-items: center !important;
-        justify-content: center !important;
-        transition: color 0.15s, background 0.15s !important;
-      }
-
-      .ig-card-toolbar button:hover,
-      .ig-card-toolbar .ig-popout-btn:hover,
-      .ig-card-toolbar .ig-switch-panel-btn:hover,
-      .ig-card-toolbar .ig-collapse-btn:hover {
-        color: var(--igls-accent, #c9a876) !important;
-        background: rgba(255, 255, 255, 0.1) !important;
+      .ig-card-toolbar button:hover, .ig-card-toolbar .ig-popout-btn:hover, .ig-card-toolbar .ig-switch-panel-btn:hover, .ig-card-toolbar .ig-collapse-btn:hover {
+        color: var(--igls-accent, #c9a876) !important; background: rgba(255, 255, 255, 0.1) !important;
       }
     `;
     document.head.appendChild(style);
@@ -2520,13 +2519,9 @@ LegoCore.registerBlock({
       const header = card.querySelector('.ig-menu-header');
       if (!header) return;
 
-      // 1. Remove/hide existing move handles
       const dragHandle = header.querySelector('.ig-drag-handle');
-      if (dragHandle) {
-        dragHandle.remove();
-      }
+      if (dragHandle) dragHandle.remove();
 
-      // 2. Check or create toolbar container
       let toolbar = header.querySelector('.ig-card-toolbar');
       if (!toolbar) {
         toolbar = document.createElement('div');
@@ -2534,33 +2529,35 @@ LegoCore.registerBlock({
         header.appendChild(toolbar);
       }
 
-      // 3. Collect action buttons
-      const popBtn = header.querySelector('.ig-popout-btn');
-      const switchBtn = header.querySelector('.ig-switch-panel-btn');
-      const collapseBtn = header.querySelector('.ig-collapse-btn');
+      // Group ALL action buttons into the pill, including the gears
+      const actions = [
+        header.querySelector('.ig-popout-btn'),
+        header.querySelector('.ig-switch-panel-btn'),
+        header.querySelector('.ig-collapse-btn'),
+        header.querySelector('.ig-mc-gear-btn'),
+        header.querySelector('.ig-qcx-gear-btn')
+      ];
 
-      // 4. Move controls into the toolbar pill
-      if (popBtn && popBtn.parentElement !== toolbar) toolbar.appendChild(popBtn);
-      if (switchBtn && switchBtn.parentElement !== toolbar) toolbar.appendChild(switchBtn);
-      if (collapseBtn && collapseBtn.parentElement !== toolbar) toolbar.appendChild(collapseBtn);
+      actions.forEach(btn => {
+          if (btn && btn.parentElement !== toolbar) {
+              toolbar.appendChild(btn);
+          }
+      });
     }
 
     function attachToContainer(containerId) {
       const container = document.getElementById(containerId);
       if (!container) return;
-
       container.querySelectorAll('.ig-draggable-menu').forEach(organizeCardHeader);
-
       const observer = new MutationObserver(() => {
         container.querySelectorAll('.ig-draggable-menu').forEach(organizeCardHeader);
       });
       observer.observe(container, { childList: true, subtree: true });
     }
 
-    function initWatcher(attempts) {
+    function initWatcher(attempts = 10) {
       const left = document.getElementById('ig-left-menu-container');
       const right = document.getElementById('ig-right-menu-container');
-
       if (left && right) {
         attachToContainer('ig-left-menu-container');
         attachToContainer('ig-right-menu-container');
@@ -2569,8 +2566,7 @@ LegoCore.registerBlock({
       }
     }
 
-    initWatcher(10);
-    console.log('[HeaderToolbarOrganizerModule] Move button removed & controls organized.');
+    initWatcher();
     core.emit('block:ready', { id: 'headerToolbarOrganizerModule' });
   }
 });
@@ -2590,15 +2586,15 @@ LegoCore.registerBlock({
     let profileData = {
       activeProfile: 'Default',
       profiles: {
-        'Default': {}, 
+        'Default': {},
         'Quick Message Only': { 'audio-quick': true, 'audio-rec': false, 'audio-lib': false, 'command-center-launcher': false },
         'Studio Workstation': { 'audio-quick': false, 'audio-rec': true, 'audio-lib': true, 'command-center-launcher': true },
         'Library Focus': { 'audio-quick': false, 'audio-rec': false, 'audio-lib': true, 'command-center-launcher': true }
       },
-      hiddenCards: {} 
+      hiddenCards: {}
     };
 
-    let windowPos = { top: 60, left: 90 }; 
+    let windowPos = { top: 60, left: 90 };
 
     try {
       const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
@@ -2773,7 +2769,7 @@ LegoCore.registerBlock({
         if (confirm(`Are you sure you want to delete profile "${current}"?`)) {
           delete profileData.profiles[current];
           profileData.activeProfile = 'Default';
-          profileData.hiddenCards = {}; 
+          profileData.hiddenCards = {};
           applyVisibility(); saveProfiles(); win.remove(); openProfileWindow();
         }
       };
@@ -2859,9 +2855,9 @@ LegoCore.registerBlock({
   id: 'igPageResizerFeature',
   init(core) {
     const STATE_KEY = 'ig_page_resizer_state_v2';
-    
+
     let resizerState = JSON.parse(localStorage.getItem(STATE_KEY)) || {
-      enabled: false, editing: false, leftWidth: 156, rightWidth: 248, leftOffset: null, rightOffset: null 
+      enabled: false, editing: false, leftWidth: 156, rightWidth: 248, leftOffset: null, rightOffset: null
     };
 
     function saveState() {
@@ -2909,7 +2905,7 @@ LegoCore.registerBlock({
         transition: background 0.15s, border-color 0.15s; flex: 1;
       }
       .ig-resizer-code-btn:hover { background: rgba(255,255,255,0.1); border-color: var(--igls-accent, #c9a876); }
-      
+
       /* Precision Controls UI */
       .ig-prec-container {
         font-size: 10px; color: var(--igls-text-dim, #96949c);
@@ -2973,7 +2969,7 @@ LegoCore.registerBlock({
 
     function updateCardUI() {
       const toggleResizingBtn = document.getElementById('ig-toggle-resizing-btn');
-      if (!toggleResizingBtn) return; 
+      if (!toggleResizingBtn) return;
 
       const toggleEditingBtn = document.getElementById('ig-toggle-editing-btn');
       const statusText = document.getElementById('ig-resizer-status-text');
@@ -2986,7 +2982,7 @@ LegoCore.registerBlock({
       toggleEditingBtn.style.color = resizerState.editing ? '#fff' : 'var(--igls-text, #ece9e4)';
       statusText.innerText = `Status: ${resizerState.enabled ? (resizerState.editing ? 'RESIZING ACTIVE (Editing)' : 'RESIZING ACTIVE (Locked)') : 'RESIZING OFF'}`;
       statusText.className = `ig-resizer-status ${resizerState.enabled ? 'is-on' : 'is-off'}`;
-      
+
       valLeft.innerText = resizerState.leftWidth;
       valRight.innerText = resizerState.rightWidth;
     }
@@ -2994,7 +2990,7 @@ LegoCore.registerBlock({
     core.on('profile-window:opened', ({ container }) => {
       const section = document.createElement('div');
       section.className = 'ig-profile-section';
-      
+
       section.innerHTML = `
         <span class="ig-profile-section-title">Webpage Resizer</span>
         <div class="ig-resizer-status ${resizerState.enabled ? 'is-on' : 'is-off'}" id="ig-resizer-status-text">
@@ -3004,17 +3000,17 @@ LegoCore.registerBlock({
           <button class="ig-profile-action-btn" id="ig-toggle-resizing-btn" style="flex:1; padding:8px;"></button>
           <button class="ig-profile-action-btn" id="ig-toggle-editing-btn" style="flex:1; padding:8px;"></button>
         </div>
-        
+
         <!-- Precision Taps & Hold Area -->
         <div class="ig-prec-container">
           <div style="display:flex; align-items:center; gap:4px;">
-            <span style="width:24px;">Left:</span> 
+            <span style="width:24px;">Left:</span>
             <span id="ig-val-left" style="color:#fff; font-weight:bold; width:24px;">${resizerState.leftWidth}</span>
             <button class="ig-prec-btn" data-target="left" data-dir="-1">-</button>
             <button class="ig-prec-btn" data-target="left" data-dir="1">+</button>
           </div>
           <div style="display:flex; align-items:center; gap:4px;">
-            <span style="width:28px;">Right:</span> 
+            <span style="width:28px;">Right:</span>
             <span id="ig-val-right" style="color:#fff; font-weight:bold; width:24px;">${resizerState.rightWidth}</span>
             <button class="ig-prec-btn" data-target="right" data-dir="-1">-</button>
             <button class="ig-prec-btn" data-target="right" data-dir="1">+</button>
@@ -3069,14 +3065,14 @@ LegoCore.registerBlock({
             return;
           }
           e.preventDefault();
-          
+
           adjustWidth(target, dir); // Immediate tap
-          
+
           // Wait 300ms, then rapid continuous adjustment
           holdTimeout = setTimeout(() => {
             holdInterval = setInterval(() => {
               adjustWidth(target, dir);
-            }, 25); 
+            }, 25);
           }, 300);
         };
 
@@ -3138,7 +3134,7 @@ LegoCore.registerBlock({
       if (!activeDragHandle || !resizerState.enabled || !resizerState.editing) return;
       if (activeDragHandle === 'left') resizerState.leftWidth = Math.min(500, Math.max(50, e.clientX));
       else if (activeDragHandle === 'right') resizerState.rightWidth = Math.min(500, Math.max(50, window.innerWidth - e.clientX));
-      
+
       applyPageDimensions();
       updateCardUI();
     });
@@ -3162,7 +3158,7 @@ LegoCore.registerBlock({
     });
 
     if (resizerState.leftOffset === null) {
-      setTimeout(recalculateOffsets, 500); 
+      setTimeout(recalculateOffsets, 500);
     }
     applyPageDimensions();
 
@@ -3200,10 +3196,10 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Quick Chat Box (v3)
+   BLOCK: Quick Chat Box (v5)
    ============================================================ */
 /* ============================================================
-   BLOCK: Quick Chat Box (Sidebar Text Injector with Aggressive Focus Lock)
+   BLOCK: Quick Chat Box (v5 - Sentinel Managed)
    ============================================================ */
 LegoCore.registerBlock({
   id: 'quickChatBoxPlugin',
@@ -3211,24 +3207,21 @@ LegoCore.registerBlock({
     const PREF_KEY = 'ig_quick_chat_prefs_v1';
     const EFFECTS_KEY = 'ig_quick_effects_enabled_v1';
     let prefs = JSON.parse(localStorage.getItem(PREF_KEY)) || { keepFocus: true };
-    let effectsEnabled = localStorage.getItem(EFFECTS_KEY) !== 'false'; // default true
+    let effectsEnabled = localStorage.getItem(EFFECTS_KEY) !== 'false';
 
-    // 1. Build the UI
     const chatUI = document.createElement('div');
     chatUI.style.cssText = 'display: flex; flex-direction: column; gap: 8px;';
-    
     chatUI.innerHTML = `
-      <textarea id="ig-quick-chat-input" placeholder="Type message... (Enter to send, Shift+Enter for new line)" 
+      <textarea id="ig-quick-chat-input" placeholder="Type message... (Enter to send, Shift+Enter for new line)"
         style="width: 100%; min-height: 65px; max-height: 250px; background: #0f172a; color: #fff; border: 1px solid #334155; border-radius: 6px; padding: 8px; font-size: 12px; resize: vertical; outline: none; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; box-sizing: border-box; line-height: 1.4; transition: border 0.2s;"></textarea>
-      
       <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px;">
          <label style="color:var(--igls-text-dim, #96949c); font-size:10px; cursor:pointer; display:flex; align-items:center; gap:4px; user-select:none;">
            <input type="checkbox" id="ig-qc-keep-focus" ${prefs.keepFocus ? 'checked' : ''}> Keep Focus (Rapid Fire)
          </label>
-         <label style="color:var(--igls-text-dim, #96949c); font-size:9px; cursor:pointer; display:flex; align-items:center; gap:3px; user-select:none;" title="Disables silence-trim processing on quick voice clips for faster sending">
+         <label style="color:var(--igls-text-dim, #96949c); font-size:9px; cursor:pointer; display:flex; align-items:center; gap:3px; user-select:none;">
            <input type="checkbox" id="ig-qc-effects-chk" style="width:11px; height:11px;" ${effectsEnabled ? 'checked' : ''}> Effects
          </label>
-         <button id="ig-quick-chat-send" class="ig-base-btn" style="background: #10b981; color: white; border: none; border-radius: 6px; padding: 5px 12px; font-weight: bold; cursor: pointer; transition: filter 0.2s; width:auto;">📤 Send</button>
+         <button id="ig-quick-chat-send" class="ig-base-btn" style="background: #10b981; color: white; border: none; border-radius: 6px; padding: 5px 12px; font-weight: bold; cursor: pointer; width:auto;">📤 Send</button>
       </div>
     `;
 
@@ -3237,7 +3230,6 @@ LegoCore.registerBlock({
     const focusChk = chatUI.querySelector('#ig-qc-keep-focus');
     const effectsChk = chatUI.querySelector('#ig-qc-effects-chk');
 
-    // 2. Save preferences when toggles change
     focusChk.onchange = (e) => {
         prefs.keepFocus = e.target.checked;
         localStorage.setItem(PREF_KEY, JSON.stringify(prefs));
@@ -3247,84 +3239,46 @@ LegoCore.registerBlock({
         localStorage.setItem(EFFECTS_KEY, String(effectsEnabled));
     };
 
-    // 3. Focus styling for UX
     inputField.addEventListener('focus', () => inputField.style.borderColor = '#6366f1');
     inputField.addEventListener('blur', () => inputField.style.borderColor = '#334155');
-    sendBtn.addEventListener('mouseover', () => sendBtn.style.filter = 'brightness(1.1)');
-    sendBtn.addEventListener('mouseout', () => sendBtn.style.filter = 'none');
 
-    // 4. Define the sending & aggressive refocusing logic
     function sendMessage() {
-      const text = inputField.value.trim();
+      const liveInput = document.getElementById('ig-quick-chat-input');
+      if (!liveInput) return;
+      const text = liveInput.value.trim();
       if (!text) return;
-
       const chatZone = document.querySelector('div[contenteditable="true"]');
-      if (!chatZone) {
-        alert("Open an active Instagram chat window first.");
-        return;
-      }
+      if (!chatZone) { alert("Open an active Instagram chat window first."); return; }
 
-      // Visual feedback & clear input immediately so user can keep typing
-      inputField.value = '';
+      liveInput.value = '';
       const originalText = sendBtn.innerText;
       sendBtn.innerText = '✅ Sent!';
-      sendBtn.style.background = '#059669'; 
-      setTimeout(() => {
-        sendBtn.innerText = originalText;
-        sendBtn.style.background = '#10b981';
-      }, 1000);
+      sendBtn.style.background = '#059669';
+      setTimeout(() => { sendBtn.innerText = originalText; sendBtn.style.background = '#10b981'; }, 1000);
 
-      // Give Instagram focus just long enough to paste the text
       chatZone.focus();
       document.execCommand('insertText', false, text);
 
-      // Wait 100ms for Instagram to register the text before hitting enter
       setTimeout(() => {
-        const enterEvent = new KeyboardEvent('keydown', {
-          key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true
-        });
+        const enterEvent = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true });
         chatZone.dispatchEvent(enterEvent);
-
-        // AGGRESSIVE FOCUS LOCK:
-        // Instagram's React components usually try to steal focus back AFTER the enter event.
-        // We pulse the focus command 5 times over 100ms to guarantee we win the tug-of-war.
-        if (prefs.keepFocus) {
-          inputField.focus();
-          let attempts = 0;
-          const focusLock = setInterval(() => {
-            inputField.focus();
-            attempts++;
-            if (attempts > 5) clearInterval(focusLock);
-          }, 20); 
-        }
-
-      }, 100); 
+        core.enableFocusOverwatch(2000); // Hand over to the Sentinel!
+      }, 100);
     }
 
-    // 5. Attach Event Listeners
     sendBtn.onclick = sendMessage;
-
     inputField.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault(); // Prevents adding a new line
-        sendMessage();
-      }
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
     });
 
-    // 6. Mount to the Sidebar Plugin Registry
-    function mountCard(attemptsLeft) {
-      attemptsLeft = attemptsLeft === undefined ? 10 : attemptsLeft;
+    function mountCard(attemptsLeft = 10) {
       if (typeof core.registerMenu === 'function') {
         core.registerMenu('right', '💬 Quick Chat', chatUI, '⠿', 'quick-chat-box');
       } else if (attemptsLeft > 0) {
         setTimeout(() => mountCard(attemptsLeft - 1), 200);
-      } else {
-        console.warn('[QuickChatBoxPlugin] Could not find core.registerMenu.');
       }
     }
-    
     mountCard();
-    console.log('[QuickChatBoxPlugin] Sidebar chat box loaded with Aggressive Focus Lock + Effects toggle.');
     core.emit('block:ready', { id: 'quickChatBoxPlugin' });
   }
 });
@@ -3842,18 +3796,18 @@ LegoCore.registerBlock({
    ============================================================ */
 /* ============================================================
    BLOCK: Text Library Image Manager (Right-Side Icon & Viewer)
-   - Completely separate extension. 
+   - Completely separate extension.
    - Handles file uploading, compression, and hover viewing.
    ============================================================ */
 LegoCore.registerBlock({
   id: 'textLibraryImageManager',
   init(core) {
     const PRO_KEY = 'ig_text_library_pro_v1';
-    
+
     const style = document.createElement('style');
     style.innerHTML = `
-      .ig-tln-thumb-btn { 
-        background: transparent; border: none; font-size: 11px; cursor: pointer; 
+      .ig-tln-thumb-btn {
+        background: transparent; border: none; font-size: 11px; cursor: pointer;
         padding: 4px; border-radius: 4px; transition: 0.1s; margin-right: 2px;
       }
       .ig-tln-thumb-btn:hover { background: rgba(255,255,255,0.1); }
@@ -3896,24 +3850,24 @@ LegoCore.registerBlock({
       contentArea.querySelectorAll('.ig-tln-snippet').forEach(row => {
         const id = row.dataset.id;
         const item = libraryData.items.find(i => i.id === id);
-        
+
         if (item && item.thumbnail && !row.querySelector('.ig-tln-thumb-btn')) {
           const actionsDiv = row.querySelector('.ig-tln-actions');
           const btn = document.createElement('button');
           btn.className = 'ig-tln-thumb-btn ig-tln-thumb-icon';
           btn.title = 'Hold to view thumbnail';
           btn.innerText = '🖼️';
-          
+
           btn.onmousedown = (e) => {
             e.stopPropagation();
             thumbViewerImg.src = item.thumbnail;
-            thumbViewer.style.left = (e.clientX - 265) + 'px'; 
+            thumbViewer.style.left = (e.clientX - 265) + 'px';
             thumbViewer.style.top = (e.clientY + 10) + 'px';
             thumbViewer.style.display = 'block';
           };
           const hide = () => thumbViewer.style.display = 'none';
           btn.onmouseup = hide; btn.onmouseleave = hide; btn.onclick = e => e.stopPropagation();
-          
+
           actionsDiv.insertBefore(btn, actionsDiv.firstChild);
         }
       });
@@ -3926,11 +3880,11 @@ LegoCore.registerBlock({
             const overlay = node;
             const modal = overlay.querySelector('#ig-tlp-modal-box');
             const tagSection = Array.from(modal.querySelectorAll('div')).find(d => d.innerText.includes('Assign Tags:'));
-            
+
             if (!tagSection || modal.querySelector('#ig-tlc-thumb-upload')) return;
 
             const currentThumb = overlay.dataset.thumbnail || '';
-            
+
             const thumbUI = document.createElement('div');
             thumbUI.innerHTML = `
               <div style="font-size:11px; font-weight:bold; color:#94a3b8; margin-top:4px;">Thumbnail Image (Optional):</div>
@@ -3940,7 +3894,7 @@ LegoCore.registerBlock({
               </div>
               <img id="ig-tlc-thumb-preview" src="${currentThumb}" style="max-height:40px; border-radius:4px; display:${currentThumb ? 'block' : 'none'}; object-fit:contain; margin-top:4px;">
             `;
-            
+
             modal.insertBefore(thumbUI, tagSection);
 
             const upload = thumbUI.querySelector('#ig-tlc-thumb-upload');
@@ -3951,7 +3905,7 @@ LegoCore.registerBlock({
               const file = e.target.files[0];
               if (file) {
                 compressImage(file, 400, (base64) => {
-                  overlay.dataset.thumbnail = base64; 
+                  overlay.dataset.thumbnail = base64;
                   preview.src = base64;
                   preview.style.display = 'block';
                   clear.style.display = 'block';
@@ -3960,7 +3914,7 @@ LegoCore.registerBlock({
             };
 
             clear.onclick = () => {
-              overlay.dataset.thumbnail = 'CLEAR'; 
+              overlay.dataset.thumbnail = 'CLEAR';
               preview.style.display = 'none';
               clear.style.display = 'none';
               upload.value = '';
@@ -4220,18 +4174,11 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Commands (v8)
+   BLOCK: Commands (v15)
    ============================================================ */
 /* ============================================================
-   BLOCK: Commands (v8 - Added Image Sets Support)
+   BLOCK: Commands (v15 - Click Shield Fix)
    ============================================================ */
-/* ================================================================
-   BLOCK: Quick Command Extension (v8)
-   ------------------------------------------------------------
-   Standalone plugin -- upgrades the "💬 Quick Chat" card with
-   slash command searches, including Text, Audio, ManyChat Flows, 
-   and Image Sets with safety preview confirmations.
-================================================================ */
 LegoCore.registerBlock({
   id: 'quickCommandExtension',
   init(core) {
@@ -4241,7 +4188,9 @@ LegoCore.registerBlock({
     const MC_API_KEY = 'mc_api_key_v1';
     const MC_TARGET_KEY = 'mc_target_subscriber_v1';
 
-    // ---------------- Data helpers ----------------
+    let emojiDict = JSON.parse(localStorage.getItem('ig_emoji_dict_v1')) || [];
+    core.on('emoji:updated', (newDict) => { emojiDict = newDict; });
+
     function withDb(cb) {
       const existing = core.getDb();
       if (existing) { cb(existing); return; }
@@ -4252,12 +4201,8 @@ LegoCore.registerBlock({
       try { return JSON.parse(localStorage.getItem(TEXT_LIB_KEY)) || { items: [], tags: [] }; }
       catch (e) { return { items: [], tags: [] }; }
     }
+    function saveTextLibraryData(data) { localStorage.setItem(TEXT_LIB_KEY, JSON.stringify(data)); }
 
-    function saveTextLibraryData(data) {
-      localStorage.setItem(TEXT_LIB_KEY, JSON.stringify(data));
-    }
-
-    // Helper to fetch Image Sets from their isolated IndexedDB
     function getImageSets() {
       return new Promise(resolve => {
         const req = indexedDB.open('IG_ImageSets_Core_DB', 1);
@@ -4304,7 +4249,6 @@ LegoCore.registerBlock({
           }
         });
       }
-
       if (mode !== 'text' && mode !== 'flow' && mode !== 'set') {
         clips.forEach(clip => {
           const cmd = (clip.customCommand || '').toLowerCase();
@@ -4316,7 +4260,6 @@ LegoCore.registerBlock({
           }
         });
       }
-
       if (mode !== 'text' && mode !== 'audio' && mode !== 'set') {
         mcFlows.forEach(flow => {
           const nameMatch = (flow.name || '').toLowerCase().includes(q);
@@ -4325,7 +4268,6 @@ LegoCore.registerBlock({
           }
         });
       }
-
       if (mode !== 'text' && mode !== 'audio' && mode !== 'flow') {
         imageSets.forEach(set => {
           const titleMatch = (set.title || '').toLowerCase().includes(q);
@@ -4356,7 +4298,13 @@ LegoCore.registerBlock({
     function sendManyChatFlow(flowNs) {
       return new Promise((resolve, reject) => {
         const apiKey = localStorage.getItem(MC_API_KEY) || '';
-        const subscriberId = localStorage.getItem(MC_TARGET_KEY) || '';
+        let subscriberId = '';
+        const targetInput = document.getElementById('ig-mc-target-input');
+        if (targetInput && targetInput.value.trim()) {
+          subscriberId = targetInput.value.trim();
+        } else {
+          subscriberId = localStorage.getItem(MC_TARGET_KEY) || '';
+        }
 
         if (!apiKey) return reject(new Error('No ManyChat API Key found. Configure ManyChat first.'));
         if (!subscriberId) return reject(new Error('No Target Subscriber ID set. Look up user first.'));
@@ -4364,10 +4312,8 @@ LegoCore.registerBlock({
         const payload = { subscriber_id: parseInt(subscriberId, 10), flow_ns: flowNs };
 
         if (typeof GM_xmlhttpRequest === 'undefined') return reject(new Error('GM_xmlhttpRequest not available.'));
-
         GM_xmlhttpRequest({
-          method: 'POST',
-          url: 'https://api.manychat.com/fb/sending/sendFlow',
+          method: 'POST', url: 'https://api.manychat.com/fb/sending/sendFlow',
           headers: { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' },
           data: JSON.stringify(payload),
           onload: function (response) {
@@ -4379,7 +4325,6 @@ LegoCore.registerBlock({
       });
     }
 
-    // Silence-trim helpers
     async function detectAndTrimSilence(blob, cutStart, cutEnd, customThreshold) {
       try {
         const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -4419,16 +4364,13 @@ LegoCore.registerBlock({
       return wav;
     }
 
-    // ---------------- Styles ----------------
     const style = document.createElement('style');
     style.id = 'ig-qcx-styles';
     style.innerHTML = `
       .ig-qcx-wrapper { position: relative; }
-
       .ig-qcx-dropdown { position: fixed; max-height: 260px; overflow-y: auto; background: #0f172a; border: 1px solid #334155; border-radius: 8px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); z-index: 2147483647; display: none; flex-direction: column; padding: 4px; gap: 2px; }
       .ig-qcx-dropdown::-webkit-scrollbar { width: 4px; }
       .ig-qcx-dropdown::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
-
       .ig-qcx-dd-row { padding: 6px 8px; border-radius: 5px; cursor: pointer; transition: background 0.1s; }
       .ig-qcx-dd-row:hover { background: rgba(255,255,255,0.06); }
       .ig-qcx-dd-row.selected { background: #6366f1; }
@@ -4437,30 +4379,19 @@ LegoCore.registerBlock({
       .ig-qcx-dd-cmd { font-size: 9px; background: rgba(255,255,255,0.12); color: #c9a876; padding: 1px 6px; border-radius: 8px; font-weight: bold; flex-shrink: 0; }
       .ig-qcx-dd-preview { font-size: 10px; color: #94a3b8; margin-top: 2px; padding-left: 20px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .ig-qcx-dd-empty { padding: 10px; text-align: center; color: #94a3b8; font-size: 10px; }
-
-      .ig-qcx-audio-row { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
-
-      .ig-qcx-overlay-row {
-        position: absolute; top: 6px; right: 6px; left: 6px;
-        display: flex; align-items: center; justify-content: flex-end; gap: 4px;
-        pointer-events: none;
-      }
+      .ig-qcx-overlay-row { position: absolute; top: 6px; right: 6px; left: 6px; display: flex; align-items: center; justify-content: flex-end; gap: 4px; pointer-events: none; }
       .ig-qcx-overlay-row > * { pointer-events: auto; }
-
       .ig-qcx-record-btn { background: #dc2626; border: none; color: white; font-size: 11px; width: 26px; height: 26px; border-radius: 50%; cursor: pointer; display: flex; align-items: center; justify-content: center; flex-shrink: 0; transition: 0.15s; box-shadow: 0 1px 4px rgba(0,0,0,0.4); }
       .ig-qcx-record-btn:hover { filter: brightness(1.1); }
       .ig-qcx-record-btn.recording { background: #7f1d1d; animation: ig-qcx-pulse 1s infinite; }
       .ig-qcx-record-btn:disabled { opacity: 0.6; cursor: default; }
       @keyframes ig-qcx-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
-
       .ig-qcx-preview-bar { flex: 1; min-width: 0; display: flex; align-items: center; gap: 4px; background: rgba(15, 23, 42, 0.95); border: 1px solid #334155; border-radius: 6px; padding: 3px 6px; box-shadow: 0 1px 4px rgba(0,0,0,0.4); }
       .ig-qcx-preview-label { flex: 1; min-width: 0; font-size: 10px; font-weight: bold; color: #fff; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .ig-qcx-icon-btn { background: transparent; border: none; color: var(--igls-text-dim, #96949c); cursor: pointer; font-size: 12px; padding: 2px 5px; border-radius: 4px; transition: 0.15s; flex-shrink: 0; }
       .ig-qcx-icon-btn:hover { color: var(--igls-accent, #c9a876); background: rgba(255,255,255,0.1); }
-
       .ig-qcx-gear-btn { background: transparent; border: none; color: var(--igls-text-dim, #96949c); cursor: pointer; font-size: 12px; padding: 2px 5px; border-radius: 4px; transition: 0.15s; }
       .ig-qcx-gear-btn:hover { color: var(--igls-accent, #c9a876); background: rgba(255,255,255,0.1); }
-
       .ig-qcx-modal-overlay { position: fixed; top:0; left:0; right:0; bottom:0; background: rgba(0,0,0,0.6); z-index: 2147483647; display: flex; justify-content: center; align-items: center; }
       .ig-qcx-modal { background: #0f172a; border: 1px solid #334155; border-radius: 8px; width: 380px; max-height: 80vh; padding: 16px; display: flex; flex-direction: column; gap: 10px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
       .ig-qcx-modal h3 { margin: 0; font-size: 14px; color: #fff; }
@@ -4474,7 +4405,6 @@ LegoCore.registerBlock({
     `;
     document.head.appendChild(style);
 
-    // ---------------- Attach to the existing Quick Chat card ----------------
     let enhanced = false;
 
     function tryEnhance() {
@@ -4492,11 +4422,9 @@ LegoCore.registerBlock({
     }
 
     function enhanceCard(card, oldInput, oldSendBtn, header) {
-      const keepFocusChk = card.querySelector('#ig-qc-keep-focus');
-
       const input = oldInput.cloneNode(true);
       oldInput.parentNode.replaceChild(input, oldInput);
-      input.placeholder = 'Type message, or / to search (text/audio/flow/set)...';
+      input.placeholder = 'Type message, or / to search, or : for emojis...';
       input.style.paddingRight = '76px';
 
       const sendBtn = oldSendBtn.cloneNode(true);
@@ -4559,25 +4487,23 @@ LegoCore.registerBlock({
       gearBtn.className = 'ig-qcx-gear-btn';
       gearBtn.title = 'Configure custom commands';
       gearBtn.innerText = '⚙️';
-      const toolbar = header.querySelector('.ig-card-toolbar');
-      const dragHandle = header.querySelector('.ig-drag-handle');
-      if (toolbar) toolbar.insertBefore(gearBtn, toolbar.firstChild);
-      else if (dragHandle) header.insertBefore(gearBtn, dragHandle);
-      else header.appendChild(gearBtn);
 
-      // ---------------- State ----------------
+      header.appendChild(gearBtn);
+
       let dropdownOpen = false;
       let matches = [];
       let selectedIndex = 0;
-      
+
+      let isEmojiMode = false;
+      let emojiStartIndex = -1;
+
       let pendingAudioBlob = null;
       let pendingAudioName = '';
       let pendingFlowNs = null;
       let pendingFlowName = '';
-      let pendingSet = null; // NEW: For Image Sets
+      let pendingSet = null;
       let previewPlayer = null;
 
-      // ---------------- Dropdown ----------------
       function openDropdown() {
         dropdownOpen = true;
         positionDropdown();
@@ -4588,15 +4514,15 @@ LegoCore.registerBlock({
       }
       function closeDropdown() {
         dropdownOpen = false;
+        isEmojiMode = false;
         dropdownEl.style.display = 'none';
         matches = [];
         selectedIndex = 0;
         window.removeEventListener('scroll', onViewportChange, true);
         window.removeEventListener('resize', onViewportChange);
       }
-      function onViewportChange() {
-        if (dropdownOpen) positionDropdown();
-      }
+      function onViewportChange() { if (dropdownOpen) positionDropdown(); }
+
       function renderDropdown() {
         dropdownEl.innerHTML = '';
         if (!matches.length) {
@@ -4606,7 +4532,10 @@ LegoCore.registerBlock({
         matches.forEach((m, idx) => {
           const row = document.createElement('div');
           row.className = 'ig-qcx-dd-row' + (idx === selectedIndex ? ' selected' : '');
-          if (m.kind === 'folder' || m.kind === 'folder-new') {
+
+          if (m.kind === 'emoji') {
+            row.innerHTML = `<div class="ig-qcx-dd-row-top"><span style="font-size:16px;">${m.item.e}</span><span class="ig-qcx-dd-title" style="font-family:monospace;">:${m.item.k}</span></div>`;
+          } else if (m.kind === 'folder' || m.kind === 'folder-new') {
             const icon = m.kind === 'folder-new' ? '➕' : '📁';
             const label = m.kind === 'folder-new' ? `Create "${m.name}"` : m.name;
             row.innerHTML = `<div class="ig-qcx-dd-row-top"><span>${icon}</span><span class="ig-qcx-dd-title">${label}</span></div>`;
@@ -4629,7 +4558,29 @@ LegoCore.registerBlock({
 
       async function recomputeMatches() {
         const val = input.value;
+        const cursor = input.selectionStart;
+        const textBefore = val.slice(0, cursor);
 
+        // 1. EMOJI CHECK
+        const emojiMatch = textBefore.match(/(?:^|\s):([a-zA-Z0-9_]*)$/);
+        if (emojiMatch) {
+          isEmojiMode = true;
+          emojiStartIndex = cursor - emojiMatch[1].length - 1;
+          const q = emojiMatch[1].toLowerCase();
+
+          matches = emojiDict.filter(item => item.k.includes(q)).map(item => ({
+            kind: 'emoji', item: item
+          }));
+
+          selectedIndex = 0;
+          if (matches.length > 0) openDropdown();
+          else closeDropdown();
+          return;
+        }
+
+        isEmojiMode = false;
+
+        // 2. SAVE FOLDER CHECK
         const saveFolderMatch = val.match(/^\/save\s+audio\s+([^.]*)$/i);
         if (saveFolderMatch) {
           const rawQuery = saveFolderMatch[1].trim();
@@ -4644,11 +4595,9 @@ LegoCore.registerBlock({
           openDropdown();
           return;
         }
-        if (/^\/save\s+audio\s+[^.]+\..*$/i.test(val)) {
-          closeDropdown();
-          return;
-        }
+        if (/^\/save\s+audio\s+[^.]+\..*$/i.test(val)) { closeDropdown(); return; }
 
+        // 3. REGULAR COMMAND CHECK
         if (!val.startsWith('/')) { closeDropdown(); return; }
 
         const remainder = val.slice(1);
@@ -4673,7 +4622,23 @@ LegoCore.registerBlock({
       function pickSelected() {
         if (!matches.length) return;
         const m = matches[selectedIndex];
-        
+
+        // EMOJI REPLACEMENT
+        if (isEmojiMode && m.kind === 'emoji') {
+          const val = input.value;
+          const cursor = input.selectionStart;
+          const before = val.substring(0, emojiStartIndex);
+          const after = val.substring(cursor);
+          const insert = m.item.e + ' ';
+
+          input.value = before + insert + after;
+          closeDropdown();
+          input.focus();
+          const newPos = emojiStartIndex + insert.length;
+          input.setSelectionRange(newPos, newPos);
+          return;
+        }
+
         if (m.kind === 'folder' || m.kind === 'folder-new') {
           input.value = `/save audio ${m.name}.`;
           closeDropdown();
@@ -4681,144 +4646,77 @@ LegoCore.registerBlock({
           input.setSelectionRange(input.value.length, input.value.length);
           return;
         }
-        
         if (m.kind === 'flow') {
-          pendingFlowNs = m.item.flow_ns;
-          pendingFlowName = m.item.name;
-          input.value = '';
-          closeDropdown();
-          showFlowPreview();
-          input.focus();
-          return;
+          pendingFlowNs = m.item.flow_ns; pendingFlowName = m.item.name;
+          input.value = ''; closeDropdown(); showFlowPreview(); input.focus(); return;
         }
-
         if (m.kind === 'set') {
-          pendingSet = m.item;
-          input.value = '';
-          closeDropdown();
-          showSetPreview();
-          input.focus();
-          return;
+          pendingSet = m.item; input.value = ''; closeDropdown(); showSetPreview(); input.focus(); return;
         }
-
         if (m.kind === 'text') {
-          input.value = m.item.text;
-          clearPending();
-          closeDropdown();
-          input.focus();
+          input.value = m.item.text; clearPending(); closeDropdown(); input.focus();
           input.setSelectionRange(input.value.length, input.value.length);
         } else {
-          pendingAudioBlob = m.item.blob;
-          pendingAudioName = m.item.name;
-          input.value = '';
-          closeDropdown();
-          showAudioPreview();
-          input.focus();
+          pendingAudioBlob = m.item.blob; pendingAudioName = m.item.name;
+          input.value = ''; closeDropdown(); showAudioPreview(); input.focus();
         }
       }
 
-      // ---------------- Preview bar ----------------
-      function showFlowPreview() {
-        previewBar.style.display = 'flex';
-        previewLabel.innerText = '🤖 ' + pendingFlowName;
-        previewPlayBtn.style.display = 'none';
-      }
-      
-      function showAudioPreview() {
-        previewBar.style.display = 'flex';
-        previewLabel.innerText = '🎵 ' + pendingAudioName;
-        previewPlayBtn.style.display = '';
-      }
-
-      function showSetPreview() {
-        previewBar.style.display = 'flex';
-        previewLabel.innerText = `🖼️ ${pendingSet.title} (${pendingSet.images.length} img)`;
-        previewPlayBtn.style.display = 'none';
-      }
-      
+      function showFlowPreview() { previewBar.style.display = 'flex'; previewLabel.innerText = '🤖 ' + pendingFlowName; previewPlayBtn.style.display = 'none'; }
+      function showAudioPreview() { previewBar.style.display = 'flex'; previewLabel.innerText = '🎵 ' + pendingAudioName; previewPlayBtn.style.display = ''; }
+      function showSetPreview() { previewBar.style.display = 'flex'; previewLabel.innerText = `🖼️ ${pendingSet.title} (${pendingSet.images.length} img)`; previewPlayBtn.style.display = 'none'; }
       function clearPending() {
-        pendingAudioBlob = null;
-        pendingAudioName = '';
-        pendingFlowNs = null;
-        pendingFlowName = '';
-        pendingSet = null;
+        pendingAudioBlob = null; pendingAudioName = ''; pendingFlowNs = null; pendingFlowName = ''; pendingSet = null;
         previewBar.style.display = 'none';
         if (previewPlayer) { previewPlayer.pause(); previewPlayer = null; }
-        previewPlayBtn.innerText = '▶️';
-        previewPlayBtn.style.display = '';
+        previewPlayBtn.innerText = '▶️'; previewPlayBtn.style.display = '';
       }
 
       previewPlayBtn.onclick = () => {
         if (!pendingAudioBlob) return;
         if (!previewPlayer) {
           previewPlayer = new Audio(URL.createObjectURL(pendingAudioBlob));
-          previewPlayBtn.innerText = '⏹️';
-          previewPlayer.play();
+          previewPlayBtn.innerText = '⏹️'; previewPlayer.play();
           previewPlayer.onended = () => { previewPlayBtn.innerText = '▶️'; previewPlayer = null; };
         } else {
-          previewPlayer.pause();
-          previewPlayer = null;
-          previewPlayBtn.innerText = '▶️';
+          previewPlayer.pause(); previewPlayer = null; previewPlayBtn.innerText = '▶️';
         }
       };
-      
       previewDiscardBtn.onclick = () => clearPending();
 
-      // ---------------- Save recorded/picked audio into the Library ----------------
       function saveAudioToLibrary(folder, name) {
-        if (!pendingAudioBlob) {
-          alert("No audio loaded to save yet. Record one with 🔴, or pull one up with /audio first.");
-          return;
-        }
-        const finalFolder = folder || 'General';
-        const finalName = name || ('clip_' + Date.now());
+        if (!pendingAudioBlob) { alert("No audio loaded to save yet."); return; }
+        const finalFolder = folder || 'General'; const finalName = name || ('clip_' + Date.now());
         withDb(db => {
           const tx = db.transaction(['folders', 'clips'], 'readwrite');
           tx.objectStore('folders').put({ name: finalFolder });
           const store = tx.objectStore('clips');
           const countReq = store.count();
-          countReq.onsuccess = () => {
-            store.add({ name: finalName, folder: finalFolder, color: '#0095f6', order: countReq.result, blob: pendingAudioBlob, customCommand: '' });
-          };
+          countReq.onsuccess = () => { store.add({ name: finalName, folder: finalFolder, color: '#0095f6', order: countReq.result, blob: pendingAudioBlob, customCommand: '' }); };
           tx.oncomplete = () => {
-            core.emit('folders:refresh');
-            core.emit('library:refresh');
-            input.value = '';
+            core.emit('folders:refresh'); core.emit('library:refresh'); input.value = '';
             previewLabel.innerText = '✅ Saved to ' + finalFolder + ' / ' + finalName;
-            setTimeout(() => {
-              if (pendingAudioBlob) previewLabel.innerText = '🎵 ' + pendingAudioName;
-            }, 1400);
+            setTimeout(() => { if (pendingAudioBlob) previewLabel.innerText = '🎵 ' + pendingAudioName; }, 1400);
           };
         });
       }
 
-      // ---------------- Sending ----------------
       function sendImageSet(setObj, btnEl) {
         const chatZone = document.querySelector('div[contenteditable="true"]') || document.querySelector('form');
         if (!chatZone) { alert("Open an active Instagram chat window first."); return; }
-
-        const original = btnEl.innerText;
-        btnEl.innerText = '⏳';
+        const original = btnEl.innerText; btnEl.innerText = '⏳';
         const dt = new DataTransfer();
-
         setObj.images.forEach((imgData, i) => {
           const ext = imgData.type ? imgData.type.split('/')[1] : 'jpeg';
           const fileObj = new File([imgData.blob], `image_${i}.${ext}`, { type: imgData.type || 'image/jpeg' });
           dt.items.add(fileObj);
         });
-
         ['dragenter', 'dragover', 'drop'].forEach(eventType => {
-          chatZone.dispatchEvent(new DragEvent(eventType, {
-            bubbles: true, cancelable: true, dataTransfer: dt
-          }));
+          chatZone.dispatchEvent(new DragEvent(eventType, { bubbles: true, cancelable: true, dataTransfer: dt }));
         });
-
-        setTimeout(() => { 
-          btnEl.innerText = '✅'; 
-          setTimeout(() => {
-            btnEl.innerText = original; 
-            clearPending();
-          }, 1000); 
+        setTimeout(() => {
+          btnEl.innerText = '✅';
+          setTimeout(() => { btnEl.innerText = original; clearPending(); core.enableFocusOverwatch(4000); }, 1000);
         }, 200);
       }
 
@@ -4829,169 +4727,132 @@ LegoCore.registerBlock({
         chatZone.focus();
         document.execCommand('insertText', false, text);
 
-        setTimeout(() => {
-          const enterEvent = new KeyboardEvent('keydown', {
-            key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true
-          });
-          chatZone.dispatchEvent(enterEvent);
+        chatZone.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
 
-          if (keepFocusChk && keepFocusChk.checked) {
-            input.focus();
-            let attempts = 0;
-            const focusLock = setInterval(() => {
-              input.focus();
-              attempts++;
-              if (attempts > 5) clearInterval(focusLock);
-            }, 20);
+        setTimeout(() => {
+          const keyOpts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
+          chatZone.dispatchEvent(new KeyboardEvent('keydown', keyOpts));
+          chatZone.dispatchEvent(new KeyboardEvent('keypress', keyOpts));
+          chatZone.dispatchEvent(new KeyboardEvent('keyup', keyOpts));
+
+          const footer = chatZone.closest('footer') || chatZone.parentElement.parentElement.parentElement;
+          if (footer) {
+             const buttons = Array.from(footer.querySelectorAll('button, div[role="button"]'));
+             for (let btn of buttons) {
+                 const textContent = (btn.textContent || '').toLowerCase();
+                 if (textContent.includes('send') || textContent.includes('enviar') || (btn.querySelector('svg') && !btn.querySelector('svg').getAttribute('aria-label')?.toLowerCase().includes('emoji'))) {
+                     btn.click();
+                 }
+             }
           }
-        }, 100);
+
+          core.enableFocusOverwatch(4000);
+        }, 150);
       }
 
       function sendCurrent() {
         if (pendingAudioBlob) {
           core.injectClipToChat(pendingAudioBlob, pendingAudioName);
           clearPending();
+          core.enableFocusOverwatch(4000);
           return;
         }
-        
-        if (pendingSet) {
-          sendImageSet(pendingSet, sendBtn);
-          return;
-        }
-        
+        if (pendingSet) { sendImageSet(pendingSet, sendBtn); return; }
         if (pendingFlowNs) {
-          const original = sendBtn.innerText;
-          sendBtn.innerText = '⏳';
-          previewLabel.innerText = '🤖 Sending...';
-          
+          const original = sendBtn.innerText; sendBtn.innerText = '⏳'; previewLabel.innerText = '🤖 Sending...';
           sendManyChatFlow(pendingFlowNs)
             .then(() => {
-              sendBtn.innerText = '✅';
-              previewLabel.innerText = '✅ Sent!';
-              setTimeout(() => { 
-                sendBtn.innerText = original; 
-                clearPending(); 
-              }, 1500);
-            })
-            .catch(err => {
+              sendBtn.innerText = '✅'; previewLabel.innerText = '✅ Sent!';
+              setTimeout(() => { sendBtn.innerText = original; clearPending(); core.enableFocusOverwatch(4000); }, 1500);
+            }).catch(err => {
               alert('Failed to send automation: ' + err.message);
-              sendBtn.innerText = '❌';
-              previewLabel.innerText = '❌ Failed';
-              setTimeout(() => { 
-                sendBtn.innerText = original; 
-                previewLabel.innerText = '🤖 ' + pendingFlowName;
-              }, 1500);
+              sendBtn.innerText = '❌'; previewLabel.innerText = '❌ Failed';
+              setTimeout(() => { sendBtn.innerText = original; previewLabel.innerText = '🤖 ' + pendingFlowName; core.enableFocusOverwatch(4000); }, 1500);
             });
           return;
         }
-        
         const text = input.value.trim();
         if (!text) return;
-
         input.value = '';
         const original = sendBtn.innerText;
-        sendBtn.innerText = '✅';
-        sendBtn.style.background = '#059669';
-        setTimeout(() => {
-          sendBtn.innerText = original;
-          sendBtn.style.background = '#10b981';
-        }, 1000);
-
+        sendBtn.innerText = '✅'; sendBtn.style.background = '#059669';
+        setTimeout(() => { sendBtn.innerText = original; sendBtn.style.background = '#10b981'; }, 1000);
         sendText(text);
       }
       sendBtn.onclick = sendCurrent;
 
-      // ---------------- Input events ----------------
       input.addEventListener('input', () => { recomputeMatches(); });
 
       input.addEventListener('keydown', (e) => {
         if (dropdownOpen) {
           if (e.key === 'ArrowDown') { e.preventDefault(); selectedIndex = (selectedIndex + 1) % matches.length; renderDropdown(); return; }
           if (e.key === 'ArrowUp') { e.preventDefault(); selectedIndex = (selectedIndex - 1 + matches.length) % matches.length; renderDropdown(); return; }
-          if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); pickSelected(); return; }
+          if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); e.stopPropagation(); pickSelected(); return; }
           if (e.key === 'Escape') { e.preventDefault(); closeDropdown(); return; }
         }
-        
         if (e.key === 'Enter' && !e.shiftKey) {
-          e.preventDefault();
-          e.stopPropagation(); 
-          
+          e.preventDefault(); e.stopPropagation();
           const saveMatch = input.value.match(/^\/save\s+audio\s+([^.]+)\.(.*)$/i);
-          if (saveMatch) {
-            saveAudioToLibrary(saveMatch[1].trim(), saveMatch[2].trim());
-            return;
-          }
-          sendCurrent();
-          return;
+          if (saveMatch) { saveAudioToLibrary(saveMatch[1].trim(), saveMatch[2].trim()); return; }
+          sendCurrent(); return;
         }
-        if (e.key === 'Escape') {
-          if (pendingAudioBlob || pendingFlowNs || pendingSet) clearPending();
-        }
+        if (e.key === 'Escape') { if (pendingAudioBlob || pendingFlowNs || pendingSet) clearPending(); }
       });
 
       document.addEventListener('click', (e) => {
         if (dropdownOpen && !wrapper.contains(e.target) && !dropdownEl.contains(e.target)) closeDropdown();
       });
 
-      // ---------------- Recording ----------------
-      let mediaRecorder;
-      let audioChunks = [];
-      let isRecording = false;
-
+      let mediaRecorder; let audioChunks = []; let isRecording = false;
       navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
         mediaRecorder = new MediaRecorder(stream);
         mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
         mediaRecorder.onstop = async () => {
           let blob = new Blob(audioChunks, { type: 'audio/mp4' });
           audioChunks = [];
-
           const effectsEnabled = localStorage.getItem(EFFECTS_KEY) !== 'false';
           const trimStart = effectsEnabled && localStorage.getItem('sb_quick_autotrim_start') === 'true';
           const trimEnd = effectsEnabled && localStorage.getItem('sb_quick_autotrim_end') === 'true';
           const threshold = localStorage.getItem('sb_quick_silence_threshold') || '0.035';
           const autoSend = localStorage.getItem('sb_quick_autosend') === 'true';
 
-          if (trimStart || trimEnd) {
-            blob = await detectAndTrimSilence(blob, trimStart, trimEnd, threshold);
-          }
-
-          pendingAudioBlob = blob;
-          pendingAudioName = 'quick_audio_' + Date.now();
+          if (trimStart || trimEnd) blob = await detectAndTrimSilence(blob, trimStart, trimEnd, threshold);
+          pendingAudioBlob = blob; pendingAudioName = 'quick_audio_' + Date.now();
           showAudioPreview();
-
-          if (autoSend) {
-            core.injectClipToChat(pendingAudioBlob, pendingAudioName);
-            clearPending();
-          }
+          if (autoSend) { core.injectClipToChat(pendingAudioBlob, pendingAudioName); clearPending(); core.enableFocusOverwatch(4000); }
         };
       }).catch(err => console.warn("[QuickCommandExtension] Mic error:", err));
 
       recordBtn.onclick = () => {
         if (!mediaRecorder) { alert("Microphone not initialized."); return; }
         if (!isRecording) {
-          clearPending();
-          audioChunks = [];
-          mediaRecorder.start();
-          isRecording = true;
-          recordBtn.classList.add('recording');
-          recordBtn.innerText = '⏹️';
+          clearPending(); audioChunks = []; mediaRecorder.start(); isRecording = true;
+          recordBtn.classList.add('recording'); recordBtn.innerText = '⏹️';
         } else {
           const lagMs = parseInt(localStorage.getItem('sb_quick_trailing_lag')) || 800;
-          recordBtn.innerText = '⏳';
-          recordBtn.disabled = true;
+          recordBtn.innerText = '⏳'; recordBtn.disabled = true;
           setTimeout(() => {
             if (mediaRecorder.state === 'recording') mediaRecorder.stop();
-            isRecording = false;
-            recordBtn.classList.remove('recording');
-            recordBtn.innerText = '🔴';
-            recordBtn.disabled = false;
+            isRecording = false; recordBtn.classList.remove('recording'); recordBtn.innerText = '🔴'; recordBtn.disabled = false;
           }, lagMs);
         }
       };
 
-      // ---------------- Command manager (gear icon) ----------------
-      gearBtn.onclick = async (e) => {
+      // ----------------------------------------------------
+      // THE CLICK SHIELD (Stops drag mechanics from eating clicks)
+      // ----------------------------------------------------
+      document.addEventListener('mousedown', (e) => {
+          if (e.target.closest('.ig-qcx-gear-btn')) {
+              e.stopPropagation();
+          }
+      }, true);
+
+      document.addEventListener('click', async (e) => {
+        if (!e.target.closest('.ig-qcx-gear-btn')) return;
         e.stopPropagation();
+
+        if (document.querySelector('.ig-qcx-modal-overlay')) return;
+
         const overlay = document.createElement('div');
         overlay.className = 'ig-qcx-modal-overlay';
         overlay.innerHTML = `
@@ -5014,52 +4875,31 @@ LegoCore.registerBlock({
         function renderMgrList() {
           const term = searchEl.value.toLowerCase();
           listEl.innerHTML = '';
+          const combined = [ ...textItems.map(i => ({ kind: 'text', item: i })), ...clips.map(c => ({ kind: 'audio', item: c })) ]
+            .filter(x => { const name = x.kind === 'text' ? x.item.title : x.item.name; return !term || (name || '').toLowerCase().includes(term); });
 
-          const combined = [
-            ...textItems.map(i => ({ kind: 'text', item: i })),
-            ...clips.map(c => ({ kind: 'audio', item: c }))
-          ].filter(x => {
-            const name = x.kind === 'text' ? x.item.title : x.item.name;
-            return !term || (name || '').toLowerCase().includes(term);
-          });
-
-          if (!combined.length) {
-            listEl.innerHTML = '<div style="padding:10px; text-align:center; color:#94a3b8; font-size:10px;">Nothing found.</div>';
-            return;
-          }
+          if (!combined.length) { listEl.innerHTML = '<div style="padding:10px; text-align:center; color:#94a3b8; font-size:10px;">Nothing found.</div>'; return; }
 
           combined.forEach(x => {
-            const row = document.createElement('div');
-            row.className = 'ig-qcx-mgr-row';
+            const row = document.createElement('div'); row.className = 'ig-qcx-mgr-row';
             const name = x.kind === 'text' ? x.item.title : x.item.name;
             const icon = x.kind === 'text' ? '📝' : '🎵';
             row.innerHTML = `
-              <span>${icon}</span>
-              <span class="ig-qcx-mgr-name" title="${name}">${name}</span>
-              <span style="opacity:0.5;">/</span>
+              <span>${icon}</span><span class="ig-qcx-mgr-name" title="${name}">${name}</span><span style="opacity:0.5;">/</span>
               <input type="text" class="ig-qcx-mgr-cmd-input" placeholder="command" value="${x.item.customCommand || ''}">
             `;
             const cmdInput = row.querySelector('.ig-qcx-mgr-cmd-input');
             cmdInput.onchange = () => {
               const val = cmdInput.value.trim().replace(/^\/+/, '');
               if (x.kind === 'text') {
-                const data = getTextLibraryData();
-                const found = data.items.find(i => i.id === x.item.id);
-                if (found) {
-                  found.customCommand = val;
-                  saveTextLibraryData(data);
-                  x.item.customCommand = val;
-                }
+                const data = getTextLibraryData(); const found = data.items.find(i => i.id === x.item.id);
+                if (found) { found.customCommand = val; saveTextLibraryData(data); x.item.customCommand = val; }
               } else {
                 withDb(db => {
                   const tx = db.transaction(['clips'], 'readwrite');
                   tx.objectStore('clips').get(x.item.id).onsuccess = ev => {
                     const c = ev.target.result;
-                    if (c) {
-                      c.customCommand = val;
-                      tx.objectStore('clips').put(c);
-                      x.item.customCommand = val;
-                    }
+                    if (c) { c.customCommand = val; tx.objectStore('clips').put(c); x.item.customCommand = val; }
                   };
                 });
               }
@@ -5067,10 +4907,8 @@ LegoCore.registerBlock({
             listEl.appendChild(row);
           });
         }
-
-        renderMgrList();
-        searchEl.oninput = renderMgrList;
-      };
+        renderMgrList(); searchEl.oninput = renderMgrList;
+      });
     }
 
     function initWatcher(attempts) {
@@ -5221,15 +5059,15 @@ LegoCore.registerBlock({
 
       const observer = new MutationObserver(() => {
         // FIX: Pause observer to prevent infinite loop during DOM appendChild operations
-        observer.disconnect(); 
-        
+        observer.disconnect();
+
         container.querySelectorAll('.ig-draggable-menu').forEach(card => processCard(card, side, container));
         applyStoredOrder(container, side);
-        
+
         // Resume observer after DOM is settled
-        observer.observe(container, { childList: true }); 
+        observer.observe(container, { childList: true });
       });
-      
+
       observer.observe(container, { childList: true });
     }
 
@@ -5356,7 +5194,7 @@ LegoCore.registerBlock({
       overlay.innerHTML = `
         <div class="ig-tlp-modal" style="width:400px; max-width:90vw;">
           <h3>☁️ Google Sheets Sync</h3>
-          
+
           <div style="background:rgba(255,255,255,0.05); padding:10px; border-radius:6px; margin-top:4px;">
             <div style="font-size:11px; color:#94a3b8; margin-bottom:8px;">1. Export your current library to a CSV file to upload into Google Sheets.</div>
             <button id="ig-sync-export-btn" style="background:#0284c7; color:#fff; border:none; padding:8px 12px; border-radius:4px; font-weight:bold; cursor:pointer; width:100%;">📤 Export to CSV</button>
@@ -5377,25 +5215,25 @@ LegoCore.registerBlock({
       // --- EXPORT LOGIC (unchanged -- this part never touched the network) ---
       overlay.querySelector('#ig-sync-export-btn').onclick = () => {
         const data = JSON.parse(localStorage.getItem(PRO_KEY)) || { items: [], tags: [] };
-        
+
         const folders = {};
         data.items.filter(i => i.type === 'folder').forEach(f => folders[f.id] = f.name);
-        
+
         const tags = {};
         data.tags.forEach(t => tags[t.id] = t.name);
 
         let csvContent = 'Name,Group,Tags,Command,Description\n';
-        
+
         data.items.filter(i => i.type === 'snippet').forEach(snip => {
           const fName = folders[snip.parentId] || 'General';
           const tNames = (snip.tags || []).map(tid => tags[tid]).filter(Boolean).join('|');
-          
+
           const title = escapeCSV(snip.title);
           const folder = escapeCSV(fName);
           const tagStr = escapeCSV(tNames);
           const cmd = escapeCSV(snip.customCommand || '');
           const desc = escapeCSV(snip.text || '');
-          
+
           csvContent += `${title},${folder},${tagStr},${cmd},${desc}\n`;
         });
 
@@ -5421,7 +5259,7 @@ LegoCore.registerBlock({
         // Extract Document ID & Sheet GID
         const match = urlInput.match(/\/d\/([a-zA-Z0-9-_]+)/);
         if (!match) return alert("Invalid Google Sheets URL. Make sure you copy the full browser link.");
-        
+
         const docId = match[1];
         const gidMatch = urlInput.match(/gid=([0-9]+)/);
         const gidParam = gidMatch ? `&gid=${gidMatch[1]}` : '';
@@ -5547,14 +5385,10 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: ManyChat Integration (v4)
+   BLOCK: ManyChat Integration (v6)
    ============================================================ */
 /* ============================================================
-   BLOCK: ManyChat Integration (v9 - No Email/Phone, Username Display)
-   ------------------------------------------------------------
-   - Removed manual Find by Email/Phone buttons.
-   - Now displays the detected @username next to the status dot 
-     when a user is matched, reading directly from the Bridge.
+   BLOCK: ManyChat Integration (v11 - Click Shield Fix)
    ============================================================ */
 LegoCore.registerBlock({
   id: 'manychatModule',
@@ -5580,7 +5414,7 @@ LegoCore.registerBlock({
     let collapsedFolders = new Set();
     try { collapsedFolders = new Set(JSON.parse(localStorage.getItem(COLLAPSED_FOLDERS_KEY)) || []); } catch (e) {}
 
-    let targetCollapsed = localStorage.getItem(TARGET_COLLAPSE_KEY) !== 'false'; // default true
+    let targetCollapsed = localStorage.getItem(TARGET_COLLAPSE_KEY) !== 'false';
 
     function saveFlows() { localStorage.setItem(FLOWS_STORAGE, JSON.stringify(flows)); }
     function saveTargetId(val) { targetSubscriberId = val; localStorage.setItem(TARGET_ID_STORAGE, val); }
@@ -5590,59 +5424,30 @@ LegoCore.registerBlock({
     function gmRequest(url, options) {
       return new Promise((resolve, reject) => {
         const defaults = {
-          method: 'GET',
-          headers: {
-            'Authorization': 'Bearer ' + apiKey,
-            'Content-Type': 'application/json'
-          },
-          url: url,
+          method: 'GET', headers: { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' }, url: url,
           onload: function(response) {
             try {
               const data = JSON.parse(response.responseText);
-              if (response.status >= 200 && response.status < 300) {
-                resolve(data);
-              } else {
-                const detail = data && (data.message || data.error || JSON.stringify(data)) || response.statusText;
-                reject(new Error('API error (' + response.status + '): ' + detail));
-              }
-            } catch (e) {
-              reject(new Error('Failed to parse response: ' + e.message));
-            }
+              if (response.status >= 200 && response.status < 300) resolve(data);
+              else reject(new Error('API error (' + response.status + '): ' + (data && (data.message || data.error || JSON.stringify(data)) || response.statusText)));
+            } catch (e) { reject(new Error('Failed to parse response: ' + e.message)); }
           },
-          onerror: function(response) {
-            reject(new Error('Network error: ' + (response.statusText || 'Unknown error')));
-          },
-          ontimeout: function() {
-            reject(new Error('Request timed out'));
-          }
+          onerror: function(response) { reject(new Error('Network error: ' + (response.statusText || 'Unknown error'))); },
+          ontimeout: function() { reject(new Error('Request timed out')); }
         };
-
         const merged = Object.assign({}, defaults, options || {});
-        if (typeof GM_xmlhttpRequest !== 'undefined') {
-          GM_xmlhttpRequest(merged);
-        } else {
-          reject(new Error('GM_xmlhttpRequest not available. Add @grant GM_xmlhttpRequest to your userscript header.'));
-        }
+        if (typeof GM_xmlhttpRequest !== 'undefined') GM_xmlhttpRequest(merged);
+        else reject(new Error('GM_xmlhttpRequest not available. Add @grant GM_xmlhttpRequest to your userscript header.'));
       });
     }
 
     async function mcRequest(path, options) {
-      if (!apiKey) {
-        throw new Error('No API Key saved yet.');
-      }
+      if (!apiKey) throw new Error('No API Key saved yet.');
       const fixedOptions = Object.assign({}, options);
-      if (fixedOptions.body) {
-        fixedOptions.data = fixedOptions.body;
-        delete fixedOptions.body;
-      }
+      if (fixedOptions.body) { fixedOptions.data = fixedOptions.body; delete fixedOptions.body; }
       return gmRequest(API_BASE + path, fixedOptions);
     }
 
-    function logDebug(title, data) {
-      console.log('%c[ManyChat Debug] ' + title, 'color: #6366f1; font-weight: bold;', data);
-    }
-
-    // Styles
     const style = document.createElement('style');
     style.id = 'ig-mc-module-styles';
     style.innerHTML = `
@@ -5678,17 +5483,11 @@ LegoCore.registerBlock({
       .ig-mc-flow-edit { background:transparent; border:none; color:#64748b; cursor:pointer; font-size:11px; padding:2px 4px; flex-shrink:0; transition:0.15s; }
       .ig-mc-flow-edit:hover { color:var(--igls-accent, #c9a876); }
       .ig-mc-empty { padding:14px; text-align:center; font-size:10.5px; color:#64748b; }
-
-      /* Header gear icon */
       .ig-mc-gear-btn { background: transparent; border: none; color: var(--igls-text-dim, #96949c); cursor: pointer; font-size: 12px; padding: 2px 5px; border-radius: 4px; transition: 0.15s; }
       .ig-mc-gear-btn:hover { color: var(--igls-accent, #c9a876); background: rgba(255,255,255,0.08); }
-
-      /* Settings modal */
       .ig-mc-modal-overlay { position: fixed; top:0; left:0; right:0; bottom:0; background: rgba(0,0,0,0.6); z-index: 2147483647; display: flex; justify-content: center; align-items: center; }
       .ig-mc-modal { background: #0f172a; border: 1px solid #334155; border-radius: 8px; width: 320px; padding: 16px; display: flex; flex-direction: column; gap: 10px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
       .ig-mc-modal h3 { margin: 0; font-size: 14px; color: #fff; }
-
-      /* Collapsible Target Subscriber pill */
       .ig-mc-target-toggle { display:flex; align-items:center; gap:7px; cursor:pointer; padding:2px; user-select:none; }
       .ig-mc-target-dot { width:8px; height:8px; border-radius:50%; background:#475569; flex-shrink:0; transition:0.15s; }
       .ig-mc-target-dot.on { background:#10b981; box-shadow:0 0 6px rgba(16,185,129,0.6); }
@@ -5696,8 +5495,6 @@ LegoCore.registerBlock({
       .ig-mc-target-caret { font-size:9px; color:#64748b; transition:transform 0.2s; }
       .ig-mc-target-caret.open { transform: rotate(90deg); }
       .ig-mc-target-detail { flex-direction:column; gap:6px; margin-top:4px; }
-
-      /* Automations header + folders -- tightened spacing */
       .ig-mc-automations-header { margin-bottom: -2px; }
       .ig-mc-folder-head { display:flex; align-items:center; gap:6px; font-weight:bold; font-size:10.5px; color:#94a3b8; padding:5px 4px; background:rgba(0,0,0,0.2); border-bottom:1px solid rgba(255,255,255,0.05); cursor:pointer; user-select:none; border-radius:4px; }
       .ig-mc-caret { font-size:9px; padding:2px; width:12px; text-align:center; transition: transform .2s; flex-shrink:0; }
@@ -5707,13 +5504,10 @@ LegoCore.registerBlock({
       .ig-mc-folder-del { background:transparent; border:none; color:#64748b; cursor:pointer; font-size:10px; padding:2px 4px; margin-left:4px; }
       .ig-mc-folder-del:hover { color:#f87171; }
       .ig-mc-flow-folder-select { font-size:9px !important; padding:3px 4px !important; }
-
-      /* Edit/Preview Flow modal */
       .ig-mc-edit-flow-id-box { background:rgba(0,0,0,0.3); border:1px solid #334155; border-radius:4px; padding:6px 8px; font-size:10px; color:#94a3b8; font-family:monospace; word-break:break-all; line-height:1.4; max-height:80px; overflow-y:auto; }
     `;
     document.head.appendChild(style);
 
-    // UI
     const wrap = document.createElement('div');
     wrap.className = 'ig-mc-wrap';
     wrap.innerHTML = `
@@ -5727,7 +5521,6 @@ LegoCore.registerBlock({
           <input type="text" id="ig-mc-target-input" class="ig-mc-input" placeholder="Subscriber ID..." value="${targetSubscriberId ? targetSubscriberId.replace(/"/g, '&quot;') : ''}">
         </div>
       </div>
-
       <div class="ig-mc-section">
         <div class="ig-mc-row ig-mc-automations-header" style="justify-content:space-between; flex-wrap:wrap; gap:4px;">
           <span class="ig-mc-label">Automations</span>
@@ -5751,9 +5544,7 @@ LegoCore.registerBlock({
     }
     mountCard();
 
-    // ---------------- Header gear icon (settings modal trigger) ----------------
-    function attachHeaderGear(attempts) {
-      attempts = attempts === undefined ? 20 : attempts;
+    function attachHeaderGear(attempts = 20) {
       const card = document.querySelector('.ig-draggable-menu[data-key="manychat-module"]');
       const header = card && card.querySelector('.ig-menu-header');
       if (!header) {
@@ -5766,18 +5557,29 @@ LegoCore.registerBlock({
       gearBtn.className = 'ig-mc-gear-btn';
       gearBtn.title = 'ManyChat Settings (API Key)';
       gearBtn.innerText = '⚙️';
-      gearBtn.addEventListener('mousedown', e => e.stopPropagation());
-      gearBtn.addEventListener('click', (e) => { e.stopPropagation(); openSettingsModal(); });
 
-      const dragHandle = header.querySelector('.ig-drag-handle');
-      if (dragHandle) header.insertBefore(gearBtn, dragHandle);
-      else header.appendChild(gearBtn);
+      header.appendChild(gearBtn);
     }
     attachHeaderGear();
 
+    // ----------------------------------------------------
+    // THE CLICK SHIELD (Stops drag mechanics from eating clicks)
+    // ----------------------------------------------------
+    document.addEventListener('mousedown', (e) => {
+        if (e.target.closest('.ig-mc-gear-btn')) {
+            e.stopPropagation();
+        }
+    }, true);
+
+    document.addEventListener('click', (e) => {
+      if (e.target.closest('.ig-mc-gear-btn')) {
+        e.stopPropagation();
+        openSettingsModal();
+      }
+    });
+
     function openSettingsModal() {
       if (document.getElementById('ig-mc-settings-modal')) return;
-
       const overlay = document.createElement('div');
       overlay.className = 'ig-mc-modal-overlay';
       overlay.id = 'ig-mc-settings-modal';
@@ -5818,7 +5620,6 @@ LegoCore.registerBlock({
       };
     }
 
-    // ---------------- Collapsible Target Subscriber ID ----------------
     const targetToggle = wrap.querySelector('#ig-mc-target-toggle');
     const targetDetail = wrap.querySelector('#ig-mc-target-detail');
     const targetDot = wrap.querySelector('#ig-mc-target-dot');
@@ -5828,26 +5629,16 @@ LegoCore.registerBlock({
     const msgBox = wrap.querySelector('#ig-mc-msg-box');
     const flowListEl = wrap.querySelector('#ig-mc-flow-list');
 
-    function applyTargetCollapse() {
-      targetDetail.style.display = targetCollapsed ? 'none' : 'flex';
-      targetCaret.classList.toggle('open', !targetCollapsed);
-    }
+    function applyTargetCollapse() { targetDetail.style.display = targetCollapsed ? 'none' : 'flex'; targetCaret.classList.toggle('open', !targetCollapsed); }
     applyTargetCollapse();
-
-    targetToggle.onclick = () => {
-      targetCollapsed = !targetCollapsed;
-      localStorage.setItem(TARGET_COLLAPSE_KEY, String(targetCollapsed));
-      applyTargetCollapse();
-    };
+    targetToggle.onclick = () => { targetCollapsed = !targetCollapsed; localStorage.setItem(TARGET_COLLAPSE_KEY, String(targetCollapsed)); applyTargetCollapse(); };
 
     function updateTargetStatus() {
       const has = !!targetInput.value.trim();
       targetDot.classList.toggle('on', has);
-      
       let displayTxt = has ? 'User detected' : 'User not detected';
-      
+
       if (has) {
-         // Attempt to read the username from the Bridge block UI to show it inline
          const bridgeDetected = document.getElementById('ig-ub-detected');
          if (bridgeDetected && bridgeDetected.textContent && bridgeDetected.textContent.startsWith('@')) {
              displayTxt = `Detected: ${bridgeDetected.textContent}`;
@@ -5856,102 +5647,61 @@ LegoCore.registerBlock({
       targetStatusText.textContent = displayTxt;
     }
     updateTargetStatus();
+    targetInput.addEventListener('input', () => { saveTargetId(targetInput.value.trim()); updateTargetStatus(); });
 
-    targetInput.addEventListener('input', () => {
-      saveTargetId(targetInput.value.trim());
-      updateTargetStatus();
-    });
+    function showMessage(text, type) { msgBox.textContent = text; msgBox.className = 'ig-mc-msg' + (type ? ' ' + type : ''); }
 
-    function showMessage(text, type) {
-      msgBox.textContent = text;
-      msgBox.className = 'ig-mc-msg' + (type ? ' ' + type : '');
-    }
-
-    // ---------------- Automations (with folders) ----------------
     function mergeFlows(newFlows) {
       newFlows.forEach(nf => {
         const existingIdx = flows.findIndex(f => f.flow_ns === nf.flow_ns);
-        if (existingIdx === -1) {
-          flows.push(Object.assign({ folder: 'General' }, nf));
-        } else {
-          const existingFolder = flows[existingIdx].folder || 'General';
-          flows[existingIdx] = Object.assign({}, nf, { folder: existingFolder });
-        }
+        if (existingIdx === -1) flows.push(Object.assign({ folder: 'General' }, nf));
+        else flows[existingIdx] = Object.assign({}, nf, { folder: flows[existingIdx].folder || 'General' });
       });
-      saveFlows();
-      renderFlows();
+      saveFlows(); renderFlows();
     }
 
     wrap.querySelector('#ig-mc-fetch-btn').onclick = async () => {
-      const btn = wrap.querySelector('#ig-mc-fetch-btn');
-      const original = btn.innerText;
-      btn.innerText = '⏳ Fetching...';
-      btn.disabled = true;
+      const btn = wrap.querySelector('#ig-mc-fetch-btn'); const original = btn.innerText; btn.innerText = '⏳ Fetching...'; btn.disabled = true;
       showMessage('Fetching automations from ManyChat...', null);
       try {
         const data = await mcRequest('/fb/page/getFlows', { method: 'GET' });
         const rawList = (data && data.data) || [];
-        if (!Array.isArray(rawList) || !rawList.length) {
-          showMessage('Fetched successfully, but no automations came back. Use "Add" instead.', 'error');
-        } else {
-          const mapped = rawList.map(f => ({
-            name: f.name || f.caption || ('Flow ' + (f.ns || f.id)),
-            flow_ns: f.ns || f.flow_ns || f.id
-          })).filter(f => f.flow_ns);
-          mergeFlows(mapped);
-          showMessage('Fetched ' + mapped.length + ' automation(s).', 'success');
+        if (!Array.isArray(rawList) || !rawList.length) showMessage('Fetched successfully, but no automations came back. Use "Add" instead.', 'error');
+        else {
+          const mapped = rawList.map(f => ({ name: f.name || f.caption || ('Flow ' + (f.ns || f.id)), flow_ns: f.ns || f.flow_ns || f.id })).filter(f => f.flow_ns);
+          mergeFlows(mapped); showMessage('Fetched ' + mapped.length + ' automation(s).', 'success');
         }
-      } catch (e) {
-        showMessage((e.message || 'Fetch failed.') + ' -- Use "Add" instead.', 'error');
-      } finally {
-        btn.innerText = original;
-        btn.disabled = false;
-      }
+      } catch (e) { showMessage((e.message || 'Fetch failed.') + ' -- Use "Add" instead.', 'error'); }
+      finally { btn.innerText = original; btn.disabled = false; }
     };
 
     wrap.querySelector('#ig-mc-add-btn').onclick = () => {
-      // Basic prompt since showModal was completely removed
-      const name = prompt('Automation Name (e.g. Welcome Message):');
-      if (!name || !name.trim()) return;
-      const flowNs = prompt('Flow ID (e.g. content20260822180954_359487):');
-      if (!flowNs || !flowNs.trim()) return;
-      
+      const name = prompt('Automation Name (e.g. Welcome Message):'); if (!name || !name.trim()) return;
+      const flowNs = prompt('Flow ID (e.g. content20260822180954_359487):'); if (!flowNs || !flowNs.trim()) return;
       mergeFlows([{ name: name.trim(), flow_ns: flowNs.trim() }]);
       showMessage('✅ Added "' + name + '". Verify the ID is correct via the ✏️ edit icon!', 'success');
     };
 
     wrap.querySelector('#ig-mc-new-folder-btn').onclick = () => {
-      const name = prompt('New folder name:');
-      if (!name || !name.trim()) return;
-      const trimmed = name.trim();
-      if (!folders.includes(trimmed)) {
-        folders.push(trimmed);
-        saveFolders();
-      }
+      const name = prompt('New folder name:'); if (!name || !name.trim()) return;
+      const trimmed = name.trim(); if (!folders.includes(trimmed)) { folders.push(trimmed); saveFolders(); }
       renderFlows();
     };
 
-    // ---------------- Edit/Preview Flow modal ----------------
     function openEditFlowModal(flow) {
       if (document.getElementById('ig-mc-edit-flow-modal')) return;
-
-      const overlay = document.createElement('div');
-      overlay.className = 'ig-mc-modal-overlay';
-      overlay.id = 'ig-mc-edit-flow-modal';
+      const overlay = document.createElement('div'); overlay.className = 'ig-mc-modal-overlay'; overlay.id = 'ig-mc-edit-flow-modal';
       overlay.innerHTML = `
         <div class="ig-mc-modal" style="width:340px;">
           <div style="display:flex; justify-content:space-between; align-items:center;">
             <h3>✏️ Edit Automation</h3>
             <button id="ig-mc-edit-close" style="background:none; border:none; color:#94a3b8; cursor:pointer; font-size:14px;">✕</button>
           </div>
-
           <span class="ig-mc-label">Name</span>
           <input type="text" id="ig-mc-edit-name-input" class="ig-mc-input" value="${flow.name.replace(/"/g, '&quot;')}">
-
           <span class="ig-mc-label">Flow ID</span>
           <div class="ig-mc-edit-flow-id-box" id="ig-mc-edit-flow-id-preview">${flow.flow_ns}</div>
           <input type="text" id="ig-mc-edit-id-input" class="ig-mc-input" value="${flow.flow_ns.replace(/"/g, '&quot;')}" style="font-family:monospace;">
-
           <div style="display:flex; justify-content:space-between; margin-top:6px;">
             <button id="ig-mc-edit-copy" class="ig-mc-btn ig-mc-btn-small">📋 Copy ID</button>
             <button id="ig-mc-edit-save" class="ig-mc-btn ig-mc-btn-primary">💾 Save</button>
@@ -5959,90 +5709,43 @@ LegoCore.registerBlock({
         </div>
       `;
       document.body.appendChild(overlay);
-
       overlay.querySelector('#ig-mc-edit-close').onclick = () => overlay.remove();
       overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
-
-      const idInput = overlay.querySelector('#ig-mc-edit-id-input');
-      const idPreview = overlay.querySelector('#ig-mc-edit-flow-id-preview');
+      const idInput = overlay.querySelector('#ig-mc-edit-id-input'); const idPreview = overlay.querySelector('#ig-mc-edit-flow-id-preview');
       idInput.addEventListener('input', () => { idPreview.textContent = idInput.value || '(empty)'; });
-
-      overlay.querySelector('#ig-mc-edit-copy').onclick = () => {
-        navigator.clipboard.writeText(idInput.value).then(() => {
-          showMessage('Flow ID copied to clipboard.', 'success');
-        }).catch(() => {});
-      };
-
+      overlay.querySelector('#ig-mc-edit-copy').onclick = () => { navigator.clipboard.writeText(idInput.value).then(() => { showMessage('Flow ID copied to clipboard.', 'success'); }).catch(() => {}); };
       overlay.querySelector('#ig-mc-edit-save').onclick = () => {
-        const newName = overlay.querySelector('#ig-mc-edit-name-input').value.trim();
-        const newId = idInput.value.trim();
+        const newName = overlay.querySelector('#ig-mc-edit-name-input').value.trim(); const newId = idInput.value.trim();
         if (!newName || !newId) { alert('Name and Flow ID cannot be empty.'); return; }
-        flow.name = newName;
-        flow.flow_ns = newId;
-        saveFlows();
-        renderFlows();
-        overlay.remove();
+        flow.name = newName; flow.flow_ns = newId; saveFlows(); renderFlows(); overlay.remove();
       };
     }
 
     async function sendFlow(flow) {
       const subscriberId = targetInput.value.trim();
-      if (!subscriberId) {
-        showMessage('Set a Target Subscriber ID first.', 'error');
-        return;
-      }
-
+      if (!subscriberId) { showMessage('Set a Target Subscriber ID first.', 'error'); return; }
       const numericId = parseInt(subscriberId, 10);
-      if (isNaN(numericId)) {
-        showMessage('Invalid Subscriber ID. Must be a number.', 'error');
-        return;
-      }
-
-      const payload = {
-        subscriber_id: numericId,
-        flow_ns: flow.flow_ns
-      };
-
-      logDebug('Sending Flow', payload);
+      if (isNaN(numericId)) { showMessage('Invalid Subscriber ID. Must be a number.', 'error'); return; }
+      const payload = { subscriber_id: numericId, flow_ns: flow.flow_ns };
       showMessage('Sending "' + flow.name + '"...', null);
       try {
-        await mcRequest('/fb/sending/sendFlow', {
-          method: 'POST',
-          body: JSON.stringify(payload)
-        });
-        logDebug('Send Success', payload);
+        await mcRequest('/fb/sending/sendFlow', { method: 'POST', body: JSON.stringify(payload) });
         showMessage('✅ Sent "' + flow.name + '" to subscriber ' + subscriberId + '.', 'success');
-      } catch (e) {
-        logDebug('Send Error', { message: e.message, payload: payload });
-        showMessage('❌ ' + (e.message || 'Send failed.'), 'error');
-      }
+      } catch (e) { showMessage('❌ ' + (e.message || 'Send failed.'), 'error'); }
     }
 
     function renderFlows() {
       flowListEl.innerHTML = '';
-      if (!flows.length) {
-        flowListEl.innerHTML = '<div class="ig-mc-empty">No automations yet. Fetch from ManyChat or add one manually.</div>';
-        return;
-      }
-
+      if (!flows.length) { flowListEl.innerHTML = '<div class="ig-mc-empty">No automations yet. Fetch from ManyChat or add one manually.</div>'; return; }
       const grouped = {};
-      flows.forEach(f => {
-        const fld = f.folder || 'General';
-        if (!grouped[fld]) grouped[fld] = [];
-        grouped[fld].push(f);
-      });
-
+      flows.forEach(f => { const fld = f.folder || 'General'; if (!grouped[fld]) grouped[fld] = []; grouped[fld].push(f); });
       const orderedFolderNames = folders.slice();
-      Object.keys(grouped).forEach(fld => {
-        if (!orderedFolderNames.includes(fld)) orderedFolderNames.push(fld);
-      });
+      Object.keys(grouped).forEach(fld => { if (!orderedFolderNames.includes(fld)) orderedFolderNames.push(fld); });
 
       orderedFolderNames.forEach(folderName => {
-        const items = grouped[folderName];
-        if (!items || !items.length) return; // hide empty folders from the list; they still exist for assignment
+        const items = grouped[folderName]; if (!items || !items.length) return;
 
         const isCollapsed = collapsedFolders.has(folderName);
-
         const folderHead = document.createElement('div');
         folderHead.className = 'ig-mc-folder-head';
         folderHead.innerHTML = `
@@ -6053,16 +5756,12 @@ LegoCore.registerBlock({
         `;
         folderHead.querySelector('.ig-mc-caret').onclick = (e) => {
           e.stopPropagation();
-          if (collapsedFolders.has(folderName)) collapsedFolders.delete(folderName);
-          else collapsedFolders.add(folderName);
-          saveCollapsedFolders();
-          renderFlows();
+          if (collapsedFolders.has(folderName)) collapsedFolders.delete(folderName); else collapsedFolders.add(folderName);
+          saveCollapsedFolders(); renderFlows();
         };
         folderHead.onclick = () => {
-          if (collapsedFolders.has(folderName)) collapsedFolders.delete(folderName);
-          else collapsedFolders.add(folderName);
-          saveCollapsedFolders();
-          renderFlows();
+          if (collapsedFolders.has(folderName)) collapsedFolders.delete(folderName); else collapsedFolders.add(folderName);
+          saveCollapsedFolders(); renderFlows();
         };
         const delBtn = folderHead.querySelector('.ig-mc-folder-del');
         if (delBtn) {
@@ -6070,10 +5769,7 @@ LegoCore.registerBlock({
             e.stopPropagation();
             if (!confirm('Delete folder "' + folderName + '"? Its automations will move to General.')) return;
             flows.forEach(f => { if ((f.folder || 'General') === folderName) f.folder = 'General'; });
-            folders = folders.filter(f => f !== folderName);
-            saveFlows();
-            saveFolders();
-            renderFlows();
+            folders = folders.filter(f => f !== folderName); saveFlows(); saveFolders(); renderFlows();
           };
         }
         flowListEl.appendChild(folderHead);
@@ -6084,9 +5780,7 @@ LegoCore.registerBlock({
         items.forEach(flow => {
           const row = document.createElement('div');
           row.className = 'ig-mc-flow-row';
-          const folderOptions = folders.map(f =>
-            `<option value="${f}" ${f === (flow.folder || 'General') ? 'selected' : ''}>${f}</option>`
-          ).join('');
+          const folderOptions = folders.map(f => `<option value="${f}" ${f === (flow.folder || 'General') ? 'selected' : ''}>${f}</option>`).join('');
           row.innerHTML = `
             <div class="ig-mc-flow-header">
               <span class="ig-mc-flow-name" title="${flow.name}">${flow.name}</span>
@@ -6103,98 +5797,65 @@ LegoCore.registerBlock({
           `;
           row.querySelector('.ig-mc-send-btn').onclick = () => sendFlow(flow);
           row.querySelector('.ig-mc-flow-edit').onclick = () => openEditFlowModal(flow);
-          row.querySelector('.ig-mc-flow-del').onclick = () => {
-            flows = flows.filter(f => f.flow_ns !== flow.flow_ns);
-            saveFlows();
-            renderFlows();
-          };
-          row.querySelector('.ig-mc-flow-folder-select').onchange = (e) => {
-            flow.folder = e.target.value;
-            saveFlows();
-            renderFlows();
-          };
+          row.querySelector('.ig-mc-flow-del').onclick = () => { flows = flows.filter(f => f.flow_ns !== flow.flow_ns); saveFlows(); renderFlows(); };
+          row.querySelector('.ig-mc-flow-folder-select').onchange = (e) => { flow.folder = e.target.value; saveFlows(); renderFlows(); };
           folderContent.appendChild(row);
         });
-
         flowListEl.appendChild(folderContent);
       });
     }
 
     renderFlows();
-
     core.emit('block:ready', { id: 'manychatModule' });
   }
 });
 
 /* ============================================================
-   BLOCK: ManyChat Username Detector (v3)
+   BLOCK: ManyChat Username Detector (v7)
    ============================================================ */
 /* ============================================================
-   BLOCK: IG Username Detector + Auto ManyChat Lookup (v3.1)
-   ------------------------------------------------------------
-   Standalone plugin -- does NOT modify the ManyChat Integration
-   block's code. Fully automatic: no manual list, no manual
-   Field ID lookup, no button clicks needed once configured.
+   BLOCK: ManyChat Username Detector (v5.0 - Multi-Engine & Debug)
    ============================================================ */
 LegoCore.registerBlock({
   id: 'igUsernameManyChatBridge',
   init(core) {
-    const API_KEY_STORAGE = 'mc_api_key_v1'; // shared with ManyChat module
+    const API_KEY_STORAGE = 'mc_api_key_v1';
     const FIELD_NAME_STORAGE = 'ig_ub_field_name_v1';
     const FIELD_ID_CACHE_STORAGE = 'ig_ub_field_id_cache_v1';
     const MANUAL_USERNAME_STORAGE = 'ig_username_manual_v1';
+    const ENGINE_PREF_STORAGE = 'ig_ub_engine_pref_v1';
     const API_BASE = 'https://api.manychat.com';
 
     let fieldName = localStorage.getItem(FIELD_NAME_STORAGE) || 'Save IG username';
+    let activeEngine = localStorage.getItem(ENGINE_PREF_STORAGE) || '1';
     let lastDetected = '';
     let lastMatchedId = null;
     let lookupInFlight = false;
+    let lastHighlightedEl = null;
 
-    // ---------------- GM_xmlhttpRequest wrapper (self-contained) ----------------
     function gmRequest(url, options) {
       return new Promise((resolve, reject) => {
         const apiKey = localStorage.getItem(API_KEY_STORAGE) || '';
         const defaults = {
-          method: 'GET',
-          headers: {
-            'Authorization': 'Bearer ' + apiKey,
-            'Content-Type': 'application/json'
-          },
+          method: 'GET', headers: { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' },
           url: url,
           onload: function (response) {
             try {
               const data = JSON.parse(response.responseText);
-              if (response.status >= 200 && response.status < 300) {
-                resolve(data);
-              } else {
-                const detail = data && (data.message || data.error || JSON.stringify(data)) || response.statusText;
-                reject(new Error('API error (' + response.status + '): ' + detail));
-              }
-            } catch (e) {
-              reject(new Error('Failed to parse response: ' + e.message));
-            }
+              if (response.status >= 200 && response.status < 300) resolve(data);
+              else reject(new Error('API error (' + response.status + '): ' + (data && (data.message || data.error || JSON.stringify(data)) || response.statusText)));
+            } catch (e) { reject(new Error('Failed to parse response: ' + e.message)); }
           },
-          onerror: function (response) {
-            reject(new Error('Network error: ' + (response.statusText || 'Unknown error')));
-          },
-          ontimeout: function () {
-            reject(new Error('Request timed out'));
-          }
+          onerror: function (response) { reject(new Error('Network error: ' + (response.statusText || 'Unknown error'))); },
+          ontimeout: function () { reject(new Error('Request timed out')); }
         };
         const merged = Object.assign({}, defaults, options || {});
-        if (merged.body) {
-          merged.data = merged.body;
-          delete merged.body;
-        }
-        if (typeof GM_xmlhttpRequest !== 'undefined') {
-          GM_xmlhttpRequest(merged);
-        } else {
-          reject(new Error('GM_xmlhttpRequest not available. Add @grant GM_xmlhttpRequest to your userscript header.'));
-        }
+        if (merged.body) { merged.data = merged.body; delete merged.body; }
+        if (typeof GM_xmlhttpRequest !== 'undefined') GM_xmlhttpRequest(merged);
+        else reject(new Error('GM_xmlhttpRequest not available.'));
       });
     }
 
-    // ---------------- Styles ----------------
     const style = document.createElement('style');
     style.id = 'ig-username-bridge-styles';
     style.innerHTML = `
@@ -6204,8 +5865,8 @@ LegoCore.registerBlock({
       .ig-ub-row { display:flex; gap:6px; align-items:center; }
       .ig-ub-input { flex:1; background:#0f172a; color:#fff; border:1px solid #334155; border-radius:4px; padding:6px 8px; font-size:11px; outline:none; min-width:0; }
       .ig-ub-input:focus { border-color:#6366f1; }
-      .ig-ub-detected { flex:1; background:#0f172a; color:#34d399; border:1px solid #334155; border-radius:4px; padding:6px 8px; font-size:12px; font-weight:bold; font-family:monospace; }
-      .ig-ub-detected.empty { color:#64748b; font-weight:normal; font-family:inherit; font-style:italic; }
+      .ig-ub-detected { flex:1; background:#0f172a; color:#34d399; border:1px solid #334155; border-radius:4px; padding:6px 8px; font-size:12px; font-weight:bold; font-family:monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .ig-ub-detected.empty { color:#f87171; font-weight:normal; font-family:inherit; font-size:10px; white-space:normal; overflow:visible; line-height:1.3; }
       .ig-ub-id-display { flex:1; background:#0f172a; color:#c9a876; border:1px solid #334155; border-radius:4px; padding:6px 8px; font-size:13px; font-weight:bold; font-family:monospace; }
       .ig-ub-id-display.empty { color:#64748b; font-weight:normal; font-family:inherit; font-style:italic; }
       .ig-ub-btn { background:#334155; color:#fff; border:none; border-radius:4px; padding:6px 10px; font-size:10px; font-weight:bold; cursor:pointer; white-space:nowrap; transition:0.15s; }
@@ -6217,57 +5878,57 @@ LegoCore.registerBlock({
       .ig-ub-msg { font-size:10px; color:#94a3b8; padding:4px 2px; line-height:1.4; min-height:12px; max-height:60px; overflow-y:auto; }
       .ig-ub-msg.error { color:#f87171; }
       .ig-ub-msg.success { color:#34d399; }
-      .ig-ub-hint { font-size:9px; color:#64748b; line-height:1.4; }
-      .ig-ub-resolved { font-size:9px; color:#64748b; }
-      .ig-ub-resolved.ok { color:#34d399; }
+      .ig-ub-engine-select { background:#1e293b; color:#fff; border:1px solid #475569; border-radius:4px; padding:4px; font-size:10px; outline:none; cursor:pointer; width:100%; }
     `;
     document.head.appendChild(style);
 
-    // ---------------- UI ----------------
     const wrap = document.createElement('div');
     wrap.className = 'ig-ub-wrap';
     wrap.innerHTML = `
       <div class="ig-ub-section">
-        <span class="ig-ub-label">Detected Username (this chat)</span>
-        <div class="ig-ub-row">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+            <span class="ig-ub-label">Detected Username</span>
+            <select id="ig-ub-engine" class="ig-ub-engine-select" style="width:110px;">
+                <option value="1">Engine 1 (Center)</option>
+                <option value="2">Engine 2 (Highest)</option>
+                <option value="3">Engine 3 (Rightmost)</option>
+                <option value="4">Engine 4 (Link Scan)</option>
+                <option value="5">Engine 5 (2nd Line)</option>
+            </select>
+        </div>
+        <div class="ig-ub-row" style="margin-top:4px;">
           <div id="ig-ub-detected" class="ig-ub-detected empty">Not detected</div>
           <button id="ig-ub-refresh-btn" class="ig-ub-btn ig-ub-btn-small">🔎 Refresh</button>
         </div>
-        <span class="ig-ub-label" style="margin-top:4px;">Manual Override</span>
-        <div class="ig-ub-row">
-          <input type="text" id="ig-ub-manual-input" class="ig-ub-input" placeholder="Type/paste username if detection is wrong...">
+        <div class="ig-ub-row" style="margin-top:4px;">
+          <input type="text" id="ig-ub-manual-input" class="ig-ub-input" placeholder="Manual override @username...">
           <button id="ig-ub-use-manual-btn" class="ig-ub-btn ig-ub-btn-small">Use This</button>
         </div>
       </div>
-
       <div class="ig-ub-section">
         <span class="ig-ub-label">Matched Subscriber ID</span>
-        <div id="ig-ub-id-display" class="ig-ub-id-display empty">No match yet</div>
-        <button id="ig-ub-copy-btn" class="ig-ub-btn ig-ub-btn-small" style="align-self:flex-start;">📋 Copy ID</button>
+        <div class="ig-ub-row">
+            <div id="ig-ub-id-display" class="ig-ub-id-display empty">No match yet</div>
+            <button id="ig-ub-copy-btn" class="ig-ub-btn ig-ub-btn-small">📋 Copy</button>
+        </div>
       </div>
-
       <div class="ig-ub-section">
         <span class="ig-ub-label">ManyChat Custom Field Name</span>
         <div class="ig-ub-row">
           <input type="text" id="ig-ub-field-name-input" class="ig-ub-input" placeholder="e.g. Save IG username" value="${fieldName.replace(/"/g, '&quot;')}">
           <button id="ig-ub-save-field-btn" class="ig-ub-btn ig-ub-btn-small">Save</button>
         </div>
-        <span id="ig-ub-resolved" class="ig-ub-resolved">Not resolved yet.</span>
-        <span class="ig-ub-hint">Type the EXACT name of the Custom Field in ManyChat that stores each subscriber's Instagram username (just the username -- nothing else). The plugin looks up its Field ID automatically.</span>
+        <span id="ig-ub-resolved" class="ig-ub-msg" style="margin-top:2px;">Not resolved yet.</span>
       </div>
-
       <div class="ig-ub-section">
-        <button id="ig-ub-find-btn" class="ig-ub-btn ig-ub-btn-primary" style="width:100%;">🔗 Search Now</button>
+        <button id="ig-ub-find-btn" class="ig-ub-btn ig-ub-btn-primary" style="width:100%;">🔗 Search ManyChat Now</button>
         <div id="ig-ub-msg-box" class="ig-ub-msg"></div>
       </div>
     `;
 
     function mountCard() {
-      if (typeof core.registerMenu === 'function') {
-        core.registerMenu('right', '👤 Chat Username', wrap, '⠿', 'ig-username-bridge');
-      } else {
-        setTimeout(mountCard, 200);
-      }
+      if (typeof core.registerMenu === 'function') core.registerMenu('right', '👤 Chat Username', wrap, '⠿', 'ig-username-bridge');
+      else setTimeout(mountCard, 200);
     }
     mountCard();
 
@@ -6277,95 +5938,72 @@ LegoCore.registerBlock({
     const fieldNameInput = wrap.querySelector('#ig-ub-field-name-input');
     const resolvedEl = wrap.querySelector('#ig-ub-resolved');
     const msgBox = wrap.querySelector('#ig-ub-msg-box');
+    const engineSelect = wrap.querySelector('#ig-ub-engine');
 
-    function showMessage(text, type) {
-      msgBox.textContent = text;
-      msgBox.className = 'ig-ub-msg' + (type ? ' ' + type : '');
-    }
+    engineSelect.value = activeEngine;
+    engineSelect.onchange = (e) => {
+        activeEngine = e.target.value;
+        localStorage.setItem(ENGINE_PREF_STORAGE, activeEngine);
+        runDetection(); // Force run immediately
+    };
 
-    function setDetected(username) {
-      lastDetected = username || '';
-      if (username) {
-        detectedEl.textContent = '@' + username;
+    function showMessage(text, type) { msgBox.textContent = text; msgBox.className = 'ig-ub-msg' + (type ? ' ' + type : ''); }
+
+    function setDetected(matchObj) {
+      if (matchObj && matchObj.user) {
+        lastDetected = matchObj.user;
+        detectedEl.textContent = '@' + matchObj.user;
         detectedEl.classList.remove('empty');
-        manualInput.value = username;
+        manualInput.value = matchObj.user;
       } else {
-        detectedEl.textContent = 'Not detected';
+        lastDetected = '';
+        let debugText = matchObj && matchObj.raw ? matchObj.raw : 'Nothing found.';
+        if (debugText.length > 80) debugText = debugText.substring(0, 80) + '...';
+        detectedEl.textContent = 'Not detected. Reads: ' + debugText;
         detectedEl.classList.add('empty');
       }
     }
 
     function setIdDisplay(id) {
       lastMatchedId = id;
-      if (id) {
-        idDisplayEl.textContent = id;
-        idDisplayEl.classList.remove('empty');
-      } else {
-        idDisplayEl.textContent = 'No match yet';
-        idDisplayEl.classList.add('empty');
-      }
+      if (id) { idDisplayEl.textContent = id; idDisplayEl.classList.remove('empty'); }
+      else { idDisplayEl.textContent = 'No match yet'; idDisplayEl.classList.add('empty'); }
     }
-    
-    // --- NEW: Helper to force-clear the ManyChat box and trigger the red dot ---
+
     function clearManyChatTarget() {
       const targetInput = document.getElementById('ig-mc-target-input');
-      if (targetInput) {
-        targetInput.value = '';
-        targetInput.dispatchEvent(new Event('input', { bubbles: true })); // Triggers red dot
-      }
+      if (targetInput) { targetInput.value = ''; targetInput.dispatchEvent(new Event('input', { bubbles: true })); }
       localStorage.removeItem('mc_target_subscriber_v1');
     }
 
     wrap.querySelector('#ig-ub-copy-btn').onclick = () => {
       if (!lastMatchedId) return;
-      navigator.clipboard.writeText(String(lastMatchedId)).then(() => {
-        showMessage('Copied ' + lastMatchedId + ' to clipboard.', 'success');
-      }).catch(() => {
-        showMessage('Could not copy automatically -- ID is: ' + lastMatchedId, null);
-      });
+      navigator.clipboard.writeText(String(lastMatchedId)).then(() => showMessage('Copied ID.', 'success')).catch(()=>{});
     };
 
     wrap.querySelector('#ig-ub-use-manual-btn').onclick = () => {
       const val = manualInput.value.trim().replace(/^@/, '');
       if (!val) return;
-      setDetected(val);
-      localStorage.setItem(MANUAL_USERNAME_STORAGE, val);
+      setDetected({ user: val, el: null }); localStorage.setItem(MANUAL_USERNAME_STORAGE, val);
       showMessage('Using manual username: @' + val, null);
-      clearManyChatTarget(); // Clear old ID before looking up new manual one
-      performLookup(val);
+      clearManyChatTarget(); performLookup(val);
     };
 
     wrap.querySelector('#ig-ub-save-field-btn').onclick = () => {
-      fieldName = fieldNameInput.value.trim();
-      localStorage.setItem(FIELD_NAME_STORAGE, fieldName);
-      // Clear any cached ID for the OLD name so a rename doesn't stick
-      resolvedEl.textContent = 'Not resolved yet.';
-      resolvedEl.className = 'ig-ub-resolved';
-      showMessage(fieldName ? 'Field name saved. It will be resolved on the next search.' : 'Field name cleared.', 'success');
+      fieldName = fieldNameInput.value.trim(); localStorage.setItem(FIELD_NAME_STORAGE, fieldName);
+      resolvedEl.textContent = 'Field saved.'; resolvedEl.className = 'ig-ub-msg success';
     };
 
-    // ---------------- Field Name -> ID Resolution ----------------
     async function resolveFieldId(name) {
-      let cache = {};
-      try { cache = JSON.parse(localStorage.getItem(FIELD_ID_CACHE_STORAGE)) || {}; } catch (e) {}
+      let cache = {}; try { cache = JSON.parse(localStorage.getItem(FIELD_ID_CACHE_STORAGE)) || {}; } catch (e) {}
       const key = name.trim().toLowerCase();
-      if (cache[key]) {
-        resolvedEl.textContent = 'Resolved: Field ID ' + cache[key] + ' (cached)';
-        resolvedEl.className = 'ig-ub-resolved ok';
-        return cache[key];
-      }
+      if (cache[key]) { resolvedEl.textContent = 'Field ID: ' + cache[key]; return cache[key]; }
       const data = await gmRequest(API_BASE + '/fb/page/getCustomFields', { method: 'GET' });
       const fields = (data && data.data) || [];
       const match = fields.find(f => (f.name || '').trim().toLowerCase() === key);
-      if (!match) {
-        resolvedEl.textContent = 'No field named "' + name + '" found in ManyChat.';
-        resolvedEl.className = 'ig-ub-resolved';
-        throw new Error('No Custom Field named "' + name + '" found in ManyChat. Check the spelling matches exactly.');
-      }
-      cache[key] = match.id;
-      localStorage.setItem(FIELD_ID_CACHE_STORAGE, JSON.stringify(cache));
-      resolvedEl.textContent = 'Resolved: Field ID ' + match.id;
-      resolvedEl.className = 'ig-ub-resolved ok';
+      if (!match) throw new Error('No Custom Field named "' + name + '" found in ManyChat.');
+      cache[key] = match.id; localStorage.setItem(FIELD_ID_CACHE_STORAGE, JSON.stringify(cache));
+      resolvedEl.textContent = 'Field ID: ' + match.id;
       return match.id;
     }
 
@@ -6380,193 +6018,207 @@ LegoCore.registerBlock({
 
     function fillManyChatTarget(subscriberId) {
       const targetInput = document.getElementById('ig-mc-target-input');
-      if (!targetInput) {
-        localStorage.setItem('mc_target_subscriber_v1', String(subscriberId));
-        return false;
-      }
-      targetInput.value = String(subscriberId);
-      targetInput.dispatchEvent(new Event('input', { bubbles: true }));
+      if (!targetInput) { localStorage.setItem('mc_target_subscriber_v1', String(subscriberId)); return false; }
+      targetInput.value = String(subscriberId); targetInput.dispatchEvent(new Event('input', { bubbles: true }));
       return true;
     }
 
     async function performLookup(username) {
       if (!username) return;
-      const apiKey = localStorage.getItem(API_KEY_STORAGE) || '';
-      if (!apiKey) {
-        showMessage('No ManyChat API Key found. Save one in the ManyChat card first.', 'error');
-        return;
-      }
-      if (!fieldName) {
-        showMessage('Set a Custom Field Name first.', 'error');
-        return;
-      }
-      if (lookupInFlight) return; // avoid overlapping requests
+      if (!(localStorage.getItem(API_KEY_STORAGE) || '')) return showMessage('No ManyChat API Key found.', 'error');
+      if (!fieldName) return showMessage('Set a Custom Field Name first.', 'error');
+      if (lookupInFlight) return;
       lookupInFlight = true;
-      const btn = wrap.querySelector('#ig-ub-find-btn');
-      const original = btn.innerText;
-      btn.innerText = '⏳ Searching...';
-      btn.disabled = true;
+      const btn = wrap.querySelector('#ig-ub-find-btn'); const original = btn.innerText; btn.innerText = '⏳ Searching...'; btn.disabled = true;
       showMessage('Searching ManyChat for @' + username + '...', null);
       try {
         const fieldId = await resolveFieldId(fieldName);
         const subscriberId = await findSubscriberByCustomField(fieldId, username);
         if (subscriberId) {
-          setIdDisplay(subscriberId);
-          const filled = fillManyChatTarget(subscriberId);
-          showMessage('✅ Found subscriber ' + subscriberId + (filled ? ' -- ManyChat target updated.' : ' -- saved.'), 'success');
+          setIdDisplay(subscriberId); fillManyChatTarget(subscriberId);
+          showMessage('✅ Found subscriber ' + subscriberId, 'success');
         } else {
-          setIdDisplay(null);
-          clearManyChatTarget(); // Wipe ID if search returns nothing
-          showMessage('No subscriber found with that username in the field. Make sure the flow has actually set it for this contact.', 'error');
+          setIdDisplay(null); clearManyChatTarget();
+          showMessage('No subscriber found with that username.', 'error');
         }
-      } catch (e) {
-        showMessage(e.message || 'Lookup failed.', 'error');
-      } finally {
-        btn.innerText = original;
-        btn.disabled = false;
-        lookupInFlight = false;
-      }
+      } catch (e) { showMessage(e.message || 'Lookup failed.', 'error'); }
+      finally { btn.innerText = original; btn.disabled = false; lookupInFlight = false; }
     }
 
     wrap.querySelector('#ig-ub-find-btn').onclick = () => {
       const username = (manualInput.value.trim() || lastDetected).replace(/^@/, '');
-      if (!username) {
-        showMessage('No username detected or entered.', 'error');
-        return;
-      }
-      clearManyChatTarget();
-      performLookup(username);
+      if (!username) return showMessage('No username detected.', 'error');
+      clearManyChatTarget(); performLookup(username);
     };
 
-    // ---------------- Username Detection ----------------
-    const EXCLUDED_PATHS = new Set([
-      'direct', 'explore', 'reels', 'accounts', 'p', 'stories', 'tv',
-      'about', 'legal', 'privacy', 'terms', 'help', 'developer', 'ads',
-      'business', 'download', 'lite', 'web', 'api', 'graphql'
-    ]);
-    const EXCLUDED_WORDS = new Set([
-      'instagram', 'general', 'requests', 'message', 'messages', 'home',
-      'search', 'notifications', 'create', 'profile', 'more', 'reels',
-      'dashboard', 'view', 'next', 'prev', 'contact'
-    ]);
-
-    function looksLikeUsername(text) {
-      if (!text) return false;
-      const t = text.trim();
-      if (t.length < 2 || t.length > 30) return false;
-      if (!/^[a-z0-9_.]+$/i.test(t)) return false;
-      if (EXCLUDED_WORDS.has(t.toLowerCase())) return false;
-      if (/^\d+$/.test(t)) return false;
-      return true;
+    // --- VISUAL HIGHLIGHTER LOGIC ---
+    function highlightElement(el) {
+      if (lastHighlightedEl && lastHighlightedEl !== el) {
+        lastHighlightedEl.style.outline = lastHighlightedEl.dataset.oldOutline || '';
+        lastHighlightedEl.style.backgroundColor = lastHighlightedEl.dataset.oldBg || '';
+        lastHighlightedEl.classList.remove('ig-ub-highlighted');
+      }
+      if (el && !el.classList.contains('ig-ub-highlighted')) {
+        el.dataset.oldOutline = el.style.outline || '';
+        el.dataset.oldBg = el.style.backgroundColor || '';
+        el.style.outline = '3px solid #10b981';
+        el.style.backgroundColor = 'rgba(16, 185, 129, 0.4)';
+        el.style.borderRadius = '4px';
+        el.classList.add('ig-ub-highlighted');
+        lastHighlightedEl = el;
+      } else if (!el && lastHighlightedEl) {
+        lastHighlightedEl.style.outline = lastHighlightedEl.dataset.oldOutline || '';
+        lastHighlightedEl.style.backgroundColor = lastHighlightedEl.dataset.oldBg || '';
+        lastHighlightedEl.classList.remove('ig-ub-highlighted');
+        lastHighlightedEl = null;
+      }
     }
 
-    // The real header username sits OUTSIDE any scrollable message/list
-    // container -- shared-post embeds and the conversation list itself
-    // are always INSIDE one. This holds true regardless of screen size,
-    // zoom level, or how far the user has scrolled, which pixel-position
-    // heuristics alone can't reliably guarantee.
-    let cachedScrollers = [];
-    let scrollersCachedAt = 0;
-    function getScrollableContainers() {
-      const now = Date.now();
-      if (now - scrollersCachedAt < 3000 && cachedScrollers.length) return cachedScrollers;
-      const scrollers = [];
-      document.querySelectorAll('div').forEach(el => {
-        if (el.clientHeight < 100) return;
-        if (el.scrollHeight <= el.clientHeight + 20) return;
-        const style = getComputedStyle(el);
-        if (style.overflowY === 'auto' || style.overflowY === 'scroll') {
-          scrollers.push(el);
+    // --- THE MULTI-ENGINE SCANNER ---
+    function getChatHeaderData() {
+        const EXCLUDED = new Set(['instagram', 'general', 'requests', 'message', 'messages', 'home', 'search', 'notifications', 'create', 'profile', 'more', 'reels', 'dashboard', 'view', 'next', 'prev', 'contact', 'active', 'online', 'seen', 'typing', 'today', 'yesterday', 'now', 'sent', 'details', 'explore', 'direct', 'inbox', 'reply', 'new', 'admin', 'moderator', 'you']);
+
+        // Strict typography check for IG usernames
+        const isStrictUsername = (text) => text.length >= 2 && text.length <= 30 && /^[a-z0-9_.]+$/.test(text) && /[a-z]/.test(text) && !EXCLUDED.has(text) && !/^\d+[smhdwy]?$/.test(text);
+
+        const candidates = [];
+        const debugReads = []; // Store raw reads for UI debug output
+
+        // Grab text nodes deeply
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+        let node;
+        while ((node = walker.nextNode())) {
+            const el = node.parentElement;
+            if (!el) continue;
+
+            const rect = el.getBoundingClientRect();
+
+            // GLOBAL FILTER: Must be in top 200px. Must be past left sidebar (> 300px).
+            if (rect.width === 0 || rect.height === 0 || rect.top < 0 || rect.top > 200 || rect.left < 300) continue;
+
+            const rawText = (node.nodeValue || '').trim();
+            if (!rawText) continue;
+
+            // Strip invisible chars & dots
+            const text = rawText.replace(/[\u200B-\u200D\uFEFF]/g, '').split('·')[0].trim();
+            if (!text) continue;
+
+            debugReads.push(text);
+
+            if (isStrictUsername(text)) {
+                candidates.push({ user: text, top: rect.top, left: rect.left, el: el, raw: text });
+            }
         }
-      });
-      cachedScrollers = scrollers;
-      scrollersCachedAt = now;
-      return scrollers;
-    }
-    function isInsideScrollable(el, scrollers) {
-      for (let i = 0; i < scrollers.length; i++) {
-        if (scrollers[i] !== el && scrollers[i].contains(el)) return true;
-      }
-      return false;
-    }
 
-    function detectFromProfileLinks() {
-      const scrollers = getScrollableContainers();
-      const anchors = Array.from(document.querySelectorAll('a[href^="/"]'));
-      const candidates = [];
+        const engine = activeEngine; // "1", "2", "3", "4", "5"
+        let chosen = null;
 
-      anchors.forEach(a => {
-        const href = a.getAttribute('href') || '';
-        const m = href.match(/^\/([A-Za-z0-9_.]{1,30})\/?$/);
-        if (!m) return;
-        const seg = m[1].toLowerCase();
-        if (EXCLUDED_PATHS.has(seg)) return;
-        if (!looksLikeUsername(m[1])) return;
+        // --- ENGINE 1: Center Header (Finds the element closest to the middle of the chat pane) ---
+        if (engine === '1') {
+            if (candidates.length > 0) {
+                // Approximate center of the right half of the screen
+                const targetCenterX = window.innerWidth / 2 + 150;
+                candidates.sort((a, b) => Math.abs(a.left - targetCenterX) - Math.abs(b.left - targetCenterX));
+                chosen = candidates[0];
+            }
+        }
 
-        const rect = a.getBoundingClientRect();
-        if (rect.width === 0 && rect.height === 0) return; // hidden
-        if (rect.top > 300) return; // stay near the top of the page
-        if (isInsideScrollable(a, scrollers)) return; // exclude message list / shared posts / chat list
+        // --- ENGINE 2: Highest Node (Closest to top of screen) ---
+        else if (engine === '2') {
+            if (candidates.length > 0) {
+                candidates.sort((a, b) => a.top - b.top);
+                chosen = candidates[0];
+            }
+        }
 
-        candidates.push({ username: m[1], top: rect.top });
-      });
+        // --- ENGINE 3: Right-most Node (Furthest to the right) ---
+        else if (engine === '3') {
+            if (candidates.length > 0) {
+                candidates.sort((a, b) => b.left - a.left);
+                chosen = candidates[0];
+            }
+        }
 
-      if (!candidates.length) return null;
-      candidates.sort((a, b) => a.top - b.top);
-      return candidates[0].username;
-    }
+        // --- ENGINE 4: Link Scanner (Looks only at <a href> tags) ---
+        else if (engine === '4') {
+            const linkCandidates = [];
+            document.querySelectorAll('a[href]').forEach(a => {
+                const rect = a.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0 || rect.top < 0 || rect.top > 200 || rect.left < 300) return;
+                const m = a.getAttribute('href').match(/^\/([a-z0-9_.]+)\/?$/i);
+                if (m) {
+                    const uname = m[1].toLowerCase();
+                    debugReads.push('Link:' + uname);
+                    if (isStrictUsername(uname)) linkCandidates.push({ user: uname, top: rect.top, left: rect.left, el: a, raw: uname });
+                }
+            });
+            if (linkCandidates.length > 0) {
+                // Sort links by highest up
+                linkCandidates.sort((a, b) => a.top - b.top);
+                chosen = linkCandidates[0];
+            }
+        }
 
-    function detectFromTextScan() {
-      const scrollers = getScrollableContainers();
-      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
-      let node;
-      const found = [];
-      while ((node = walker.nextNode())) {
-        const text = (node.nodeValue || '').trim();
-        if (!text) continue;
-        const base = text.split('·')[0].trim();
-        if (!looksLikeUsername(base)) continue;
-        const parentEl = node.parentElement;
-        if (!parentEl) continue;
-        const rect = parentEl.getBoundingClientRect();
-        if (rect.width === 0 && rect.height === 0) continue;
-        if (rect.top > 300) continue;
-        if (isInsideScrollable(parentEl, scrollers)) continue;
-        found.push({ username: base, top: rect.top });
-      }
-      if (!found.length) return null;
-      found.sort((a, b) => a.top - b.top);
-      return found[0].username;
+        // --- ENGINE 5: 2nd Line Extractor ---
+        else if (engine === '5') {
+            const blockCandidates = [];
+            const blocks = document.querySelectorAll('h1, h2, h3, h4, span, div[dir="auto"], div[role="button"]');
+            for (let el of blocks) {
+                const rect = el.getBoundingClientRect();
+                if (rect.width === 0 || rect.height === 0 || rect.top < 0 || rect.top > 180 || rect.left < 300) continue;
+
+                const lines = (el.innerText || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+                if (lines.length > 1) {
+                    const secondLine = lines[1].split('·')[0].trim().toLowerCase();
+                    debugReads.push('Line2:' + secondLine);
+                    if (isStrictUsername(secondLine)) {
+                        blockCandidates.push({ user: secondLine, top: rect.top, left: rect.left, el: el, raw: secondLine });
+                    }
+                }
+            }
+            if (blockCandidates.length > 0) {
+                blockCandidates.sort((a, b) => (b.el.offsetWidth * b.el.offsetHeight) - (a.el.offsetWidth * a.el.offsetHeight));
+                chosen = blockCandidates[0];
+            }
+        }
+
+        if (!chosen) {
+            // Provide a clean debug string so the user knows what text nodes it actually saw
+            const cleanDebug = [...new Set(debugReads)].filter(t => t.length > 1).slice(0, 5).join(' | ');
+            return { user: null, el: null, raw: cleanDebug || "No text matching criteria found" };
+        }
+
+        return chosen;
     }
 
     function runDetection() {
-      let username = detectFromProfileLinks();
-      if (!username) username = detectFromTextScan();
-      
+      const match = getChatHeaderData();
+      const username = match ? match.user : null;
+      const el = match ? match.el : null;
+
       if (username && username !== lastDetected) {
-        setDetected(username);
+        setDetected(match);
         setIdDisplay(null);
-        clearManyChatTarget(); // WIPES old ID immediately on chat switch
+        clearManyChatTarget();
         performLookup(username);
+        highlightElement(el);
       } else if (!username && lastDetected) {
-        // We navigated away from a chat
-        setDetected(null);
+        setDetected(match);
         setIdDisplay(null);
-        clearManyChatTarget(); // WIPES old ID on exit
+        clearManyChatTarget();
+        highlightElement(null);
+      } else if (username && username === lastDetected) {
+        // Keep highlight alive
+        highlightElement(el);
       } else if (!username && !lastDetected) {
-        setDetected(null);
+        // Update debug string continuously
+        setDetected(match);
+        highlightElement(null);
       }
     }
 
     setInterval(runDetection, 1500);
-    const bodyObserver = new MutationObserver(() => {
-      clearTimeout(bodyObserver._t);
-      bodyObserver._t = setTimeout(runDetection, 300);
-    });
-    bodyObserver.observe(document.body, { childList: true, subtree: true });
-
     wrap.querySelector('#ig-ub-refresh-btn').onclick = () => runDetection();
-
     setTimeout(runDetection, 1000);
 
     core.emit('block:ready', { id: 'igUsernameManyChatBridge' });
@@ -6665,7 +6317,7 @@ LegoCore.registerBlock({
     const resetBtn = document.createElement('button');
     resetBtn.innerText = '⛑️ Reset Menus';
     resetBtn.title = 'Click to reset all floating window positions if they get stuck off-screen';
-    
+
     resetBtn.style.cssText = `
       position: fixed;
       bottom: 12px;
@@ -6698,20 +6350,20 @@ LegoCore.registerBlock({
       if (confirm("Reset all floating menu positions? This will reload the page.")) {
         // 1. Clear Popped-out cards
         localStorage.removeItem('ig_menu_inpage_popouts_v1');
-        
+
         // 2. Clear Workspace Profile window
         localStorage.removeItem('ig_workspace_profile_window_pos_v1');
-        
+
         // 3. Clear Text Library Filter window
         localStorage.removeItem('ig_tl_notion_filter_pos');
-        
+
         // Reload to apply the fresh state
         window.location.reload();
       }
     };
 
     document.body.appendChild(resetBtn);
-    
+
     core.emit('block:ready', { id: 'floatingMenuRescueModule' });
   }
 });
@@ -6786,7 +6438,7 @@ LegoCore.registerBlock({
 
       .ig-isl-input { width: 100%; background: #1e293b; border: 1px solid #475569; color: #fff; padding: 8px; border-radius: 4px; font-size: 12px; box-sizing: border-box; outline: none; }
       .ig-isl-input:focus { border-color: #6366f1; }
-      
+
       .ig-isl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(70px, 1fr)); gap: 8px; margin-top: 8px; }
       .ig-isl-thumb-wrap { position: relative; aspect-ratio: 1; background: #1e293b; border: 1px solid #334155; border-radius: 4px; overflow: hidden; }
       .ig-isl-thumb-wrap img { width: 100%; height: 100%; object-fit: cover; }
@@ -6832,8 +6484,8 @@ LegoCore.registerBlock({
     function openSetEditor(existingSet) {
       const isEdit = !!existingSet;
       // Copy array so we can safely edit drafts without affecting the DB until Save
-      let draftImages = isEdit ? [...existingSet.images] : []; 
-      
+      let draftImages = isEdit ? [...existingSet.images] : [];
+
       const overlay = document.createElement('div');
       overlay.className = 'ig-isl-modal-overlay';
       overlay.innerHTML = `
@@ -6938,7 +6590,7 @@ LegoCore.registerBlock({
         }
         const tx = db.transaction(['sets'], 'readwrite');
         const store = tx.objectStore('sets');
-        
+
         if (isEdit) {
           existingSet.title = title;
           existingSet.images = draftImages;
@@ -6964,8 +6616,8 @@ LegoCore.registerBlock({
     function openPreviewModal(setObj) {
       const overlay = document.createElement('div');
       overlay.className = 'ig-isl-modal-overlay';
-      
-      const thumbsHtml = setObj.images.map(img => 
+
+      const thumbsHtml = setObj.images.map(img =>
         `<div class="ig-isl-thumb-wrap"><img src="${img.thumb}" alt="thumb"></div>`
       ).join('');
 
@@ -6981,48 +6633,48 @@ LegoCore.registerBlock({
         </div>
       `;
       document.body.appendChild(overlay);
-      
+
       const close = () => overlay.remove();
       overlay.querySelector('#ig-isl-close-prev').onclick = close;
       overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
     }
 
     // 7. Drag & Drop Reordering Logic
-    function handleDragStart(e, id) { 
-      draggedItem = id; 
-      e.dataTransfer.effectAllowed = 'move'; 
-      setTimeout(() => e.target.style.opacity = '0.3', 0); 
+    function handleDragStart(e, id) {
+      draggedItem = id;
+      e.dataTransfer.effectAllowed = 'move';
+      setTimeout(() => e.target.style.opacity = '0.3', 0);
     }
     function handleDragOver(e, id) {
       e.preventDefault(); e.stopPropagation();
       const targetEl = e.currentTarget;
       document.querySelectorAll('.ig-isl-drop-top, .ig-isl-drop-bottom').forEach(el => el.classList.remove('ig-isl-drop-top', 'ig-isl-drop-bottom'));
       if (!draggedItem || draggedItem === id) return;
-      const rect = targetEl.getBoundingClientRect(); 
-      const y = e.clientY - rect.top; 
+      const rect = targetEl.getBoundingClientRect();
+      const y = e.clientY - rect.top;
       if (y < rect.height / 2) targetEl.classList.add('ig-isl-drop-top');
       else targetEl.classList.add('ig-isl-drop-bottom');
     }
     function handleDrop(e, targetId) {
       e.preventDefault(); e.stopPropagation();
       if (!draggedItem || draggedItem === targetId) return;
-      
-      const targetEl = e.currentTarget; 
-      const rect = targetEl.getBoundingClientRect(); 
-      const y = e.clientY - rect.top; 
-      
+
+      const targetEl = e.currentTarget;
+      const rect = targetEl.getBoundingClientRect();
+      const y = e.clientY - rect.top;
+
       const tx = db.transaction(['sets'], 'readwrite');
       const store = tx.objectStore('sets');
       store.getAll().onsuccess = ev => {
         const sets = ev.target.result.sort((a,b) => (a.order || 0) - (b.order || 0));
         const dragIdx = sets.findIndex(s => s.id === draggedItem);
         const targetIdx = sets.findIndex(s => s.id === targetId);
-        
+
         if (dragIdx > -1 && targetIdx > -1) {
           const [moved] = sets.splice(dragIdx, 1);
           if (y < rect.height / 2) sets.splice(targetIdx, 0, moved); // Drop top
           else sets.splice(targetIdx + 1, 0, moved); // Drop bottom
-          
+
           sets.forEach((s, i) => { s.order = i; store.put(s); });
         }
       };
@@ -7061,7 +6713,7 @@ LegoCore.registerBlock({
       const tx = db.transaction(['sets'], 'readonly');
       tx.objectStore('sets').getAll().onsuccess = e => {
         const sets = (e.target.result || []).sort((a,b) => (a.order || 0) - (b.order || 0));
-        
+
         if (!sets.length) {
           tree.innerHTML = '<div style="padding:12px; color:#94a3b8; font-size:10px; text-align:center;">No Image Sets yet. Click New to bundle images together.</div>';
           return;
@@ -7112,6 +6764,270 @@ LegoCore.registerBlock({
     mountCard();
 
     core.emit('block:ready', { id: 'imageSetsLibraryModule' });
+  }
+});
+
+/* ============================================================
+   BLOCK: Emoji Module (v1)
+   ============================================================ */
+/* ============================================================
+   BLOCK: Emoji Settings Module (v1)
+   ============================================================ */
+LegoCore.registerBlock({
+  id: 'emojiSettingsModule',
+  init(core) {
+    const STORAGE_KEY = 'ig_emoji_dict_v1';
+
+    const defaultEmojis = [
+      { e: '😀', k: 'happy' }, { e: '😂', k: 'laugh' }, { e: '🤣', k: 'rofl' },
+      { e: '😍', k: 'hearteyes' }, { e: '🥰', k: 'love' }, { e: '😊', k: 'smile' },
+      { e: '🙏', k: 'pray' }, { e: '👍', k: 'thumbsup' }, { e: '👎', k: 'thumbsdown' },
+      { e: '🔥', k: 'fire' }, { e: '❤️', k: 'heart' }, { e: '💔', k: 'brokenheart' },
+      { e: '✨', k: 'sparkles' }, { e: '💯', k: '100' }, { e: '✅', k: 'check' },
+      { e: '❌', k: 'x' }, { e: '💀', k: 'skull' }, { e: '😭', k: 'cry' },
+      { e: '👀', k: 'eyes' }, { e: '🙌', k: 'praise' }, { e: '🤔', k: 'think' },
+      { e: '😎', k: 'cool' }, { e: '😉', k: 'wink' }, { e: '🤷', k: 'shrug' },
+      { e: '🤦', k: 'facepalm' }, { e: '🎉', k: 'party' }, { e: '👏', k: 'clap' },
+      { e: '🤝', k: 'deal' }, { e: '🚀', k: 'rocket' }, { e: '💡', k: 'idea' }
+    ];
+
+    let dict = [];
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      if (saved) dict = JSON.parse(saved);
+      else dict = defaultEmojis;
+    } catch(e) { dict = defaultEmojis; }
+
+    function saveDict() {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(dict));
+      core.emit('emoji:updated', dict); // Alert Quick Command to update
+      renderList();
+    }
+
+    const style = document.createElement('style');
+    style.innerHTML = `
+      .ig-emj-wrap { display:flex; flex-direction:column; gap:10px; font-family:-apple-system,sans-serif; font-size:11px; color:#fff; }
+      .ig-emj-input-row { display:flex; gap:4px; align-items:center; background:#18181b; padding:8px; border-radius:6px; border:1px solid #334155; }
+      .ig-emj-input { background:#0f172a; color:#fff; border:1px solid #334155; border-radius:4px; padding:6px; font-size:11px; outline:none; }
+      .ig-emj-input:focus { border-color:#6366f1; }
+      .ig-emj-btn { background:#10b981; color:#fff; border:none; border-radius:4px; padding:6px 10px; font-weight:bold; cursor:pointer; }
+      .ig-emj-btn:hover { background:#059669; }
+      .ig-emj-list { display:flex; flex-direction:column; gap:4px; max-height:220px; overflow-y:auto; padding-right:4px; }
+      .ig-emj-list::-webkit-scrollbar { width:4px; }
+      .ig-emj-list::-webkit-scrollbar-thumb { background:#334155; border-radius:4px; }
+      .ig-emj-row { display:flex; align-items:center; justify-content:space-between; background:rgba(255,255,255,0.03); padding:4px 8px; border-radius:5px; border:1px solid rgba(255,255,255,0.05); }
+      .ig-emj-symbol { font-size:16px; margin-right:8px; }
+      .ig-emj-keyword { color:#c9a876; font-weight:bold; font-family:monospace; }
+      .ig-emj-del { background:transparent; border:none; color:#64748b; cursor:pointer; font-size:10px; }
+      .ig-emj-del:hover { color:#f87171; }
+    `;
+    document.head.appendChild(style);
+
+    const wrap = document.createElement('div');
+    wrap.className = 'ig-emj-wrap';
+    wrap.innerHTML = `
+      <div class="ig-emj-input-row">
+        <input type="text" id="ig-emj-val" class="ig-emj-input" placeholder="😀" style="width:30px; text-align:center;" maxlength="4">
+        <input type="text" id="ig-emj-key" class="ig-emj-input" placeholder="keyword (e.g. happy)" style="flex:1;">
+        <button id="ig-emj-add" class="ig-emj-btn">➕</button>
+      </div>
+      <div id="ig-emj-list" class="ig-emj-list"></div>
+    `;
+
+    function renderList() {
+      const listEl = wrap.querySelector('#ig-emj-list');
+      listEl.innerHTML = '';
+      dict.forEach((item, index) => {
+        const row = document.createElement('div');
+        row.className = 'ig-emj-row';
+        row.innerHTML = `
+          <div><span class="ig-emj-symbol">${item.e}</span> <span class="ig-emj-keyword">:${item.k}</span></div>
+          <button class="ig-emj-del" data-idx="${index}">✕</button>
+        `;
+        row.querySelector('.ig-emj-del').onclick = () => {
+          dict.splice(index, 1);
+          saveDict();
+        };
+        listEl.appendChild(row);
+      });
+    }
+
+    wrap.querySelector('#ig-emj-add').onclick = () => {
+      const eVal = wrap.querySelector('#ig-emj-val').value.trim();
+      const kVal = wrap.querySelector('#ig-emj-key').value.trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
+      if (!eVal || !kVal) return alert('Provide both an emoji and a keyword (no spaces).');
+
+      // Check if keyword already exists
+      const existing = dict.findIndex(i => i.k === kVal);
+      if (existing > -1) dict[existing].e = eVal;
+      else dict.unshift({ e: eVal, k: kVal });
+
+      saveDict();
+      wrap.querySelector('#ig-emj-val').value = '';
+      wrap.querySelector('#ig-emj-key').value = '';
+      wrap.querySelector('#ig-emj-val').focus();
+    };
+
+    wrap.querySelector('#ig-emj-key').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') wrap.querySelector('#ig-emj-add').click();
+    });
+
+    renderList();
+
+    function mountCard(attemptsLeft = 10) {
+      if (typeof core.registerMenu === 'function') {
+        core.registerMenu('left', '🙂 Emojis', wrap, '⠿', 'emoji-settings-module');
+      } else if (attemptsLeft > 0) {
+        setTimeout(() => mountCard(attemptsLeft - 1), 200);
+      }
+    }
+    mountCard();
+
+    // Send initial payload out just in case QC loads after
+    setTimeout(() => core.emit('emoji:updated', dict), 500);
+
+    core.emit('block:ready', { id: 'emojiSettingsModule' });
+  }
+});
+
+/* ============================================================
+   BLOCK: Cursor Focus (v2)
+   ============================================================ */
+/* ============================================================
+   BLOCK: Cursor Focus (v8.1 - Dictator Mode / UI Fixed)
+   ============================================================ */
+LegoCore.registerBlock({
+  id: 'focusSentinelModule',
+  init(core) {
+    const DICTATOR_PREF_KEY = 'ig_dictator_mode_v1';
+    let dictatorMode = localStorage.getItem(DICTATOR_PREF_KEY) !== 'false'; // Default ON
+
+    function getQuickChat() {
+      const qc = document.getElementById('ig-quick-chat-input');
+      if (!qc) return null;
+      if (qc.closest('.is-iconified')) return null; // Sleep if modal is minimized
+      return qc;
+    }
+
+    // 1. INJECT THE OVERRIDE TOGGLE INTO THE CORRECT UI ROW
+    function injectToggle() {
+      if (document.getElementById('ig-dictator-toggle')) return;
+
+      // Target the exact row containing the 'Effects' checkbox
+      const effectsChk = document.getElementById('ig-qc-effects-chk');
+      if (!effectsChk) return;
+
+      const controlsRow = effectsChk.closest('div');
+      if (controlsRow) {
+        const label = document.createElement('label');
+        label.style.cssText = 'color: #f43f5e; font-size:9px; font-weight:bold; cursor:pointer; display:flex; align-items:center; gap:3px; user-select:none; margin-left: 8px;';
+        label.innerHTML = `<input type="checkbox" id="ig-dictator-toggle" ${dictatorMode ? 'checked' : ''} style="accent-color: #f43f5e; margin:0; width:11px; height:11px;"> 🧲 Dictator Mode`;
+
+        label.querySelector('input').onchange = (e) => {
+          dictatorMode = e.target.checked;
+          localStorage.setItem(DICTATOR_PREF_KEY, String(dictatorMode));
+        };
+
+        // Append it neatly at the end of the bottom toggle row
+        controlsRow.appendChild(label);
+      }
+    }
+
+    // Check periodically to inject the button (in case Quick Chat loads after Sentinel)
+    setInterval(injectToggle, 1000);
+
+    // 2. THE BLACK HOLE KEYDOWN INTERCEPTOR
+    window.addEventListener('keydown', (e) => {
+      if (!dictatorMode) return;
+
+      const qc = getQuickChat();
+      if (!qc) return;
+
+      // Allow shortcuts (Copy, Paste, Undo, etc.)
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+      // Allow structural keys except backspace and enter
+      if (e.key.length !== 1 && e.key !== 'Backspace' && e.key !== 'Enter') return;
+
+      const active = document.activeElement;
+
+      // Are they inside the Lego Toolkit?
+      const isLegoUI = active && (
+          active.id === 'ig-quick-chat-input' ||
+          active.closest('.ig-draggable-menu') ||
+          active.closest('.ig-floating-modal') ||
+          active.closest('.ig-qcx-modal-overlay') ||
+          active.closest('#ig-profile-floating-window') ||
+          active.closest('#ig-tln-filter-win') ||
+          active.closest('#ig-audio-modal-box')
+      );
+
+      // If they are explicitly typing in one of OUR other boxes (Search, settings, naming a clip), let them.
+      if (isLegoUI && active !== qc && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {
+          return;
+      }
+
+      // If they are already correctly focused on the Quick Chat, let natural typing happen
+      if (active === qc) return;
+
+      // --- DICTATOR MODE ACTIVATED: STEAL THE KEYSTROKE ---
+      e.preventDefault();
+      e.stopPropagation();
+
+      qc.focus();
+
+      // Programmatically write the key into the Quick Chat
+      if (e.key.length === 1) {
+          qc.setRangeText(e.key, qc.selectionStart, qc.selectionEnd, 'end');
+          qc.dispatchEvent(new Event('input', { bubbles: true }));
+      } else if (e.key === 'Backspace') {
+          if (qc.selectionStart > 0) {
+              const start = qc.selectionStart === qc.selectionEnd ? qc.selectionStart - 1 : qc.selectionStart;
+              qc.setRangeText('', start, qc.selectionEnd, 'end');
+              qc.dispatchEvent(new Event('input', { bubbles: true }));
+          }
+      } else if (e.key === 'Enter') {
+          if (e.shiftKey) {
+              qc.setRangeText('\n', qc.selectionStart, qc.selectionEnd, 'end');
+              qc.dispatchEvent(new Event('input', { bubbles: true }));
+          } else {
+              // Trigger Send
+              const sendBtn = document.getElementById('ig-quick-chat-send');
+              if (sendBtn) sendBtn.click();
+          }
+      }
+    }, true); // true = Capture phase (Runs BEFORE Instagram)
+
+    // 3. THE BLACK HOLE PASTE INTERCEPTOR
+    window.addEventListener('paste', (e) => {
+      if (!dictatorMode) return;
+      const qc = getQuickChat();
+      if (!qc) return;
+
+      const active = document.activeElement;
+      const isLegoUI = active && (
+          active.id === 'ig-quick-chat-input' ||
+          active.closest('.ig-draggable-menu') ||
+          active.closest('.ig-floating-modal') ||
+          active.closest('.ig-qcx-modal-overlay') ||
+          active.closest('#ig-profile-floating-window')
+      );
+
+      if (isLegoUI && active !== qc && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) return;
+      if (active === qc) return;
+
+      // --- DICTATOR MODE ACTIVATED: STEAL THE PASTE ---
+      e.preventDefault();
+      e.stopPropagation();
+
+      const pastedText = (e.clipboardData || window.clipboardData).getData('text');
+      if (pastedText) {
+          qc.focus();
+          qc.setRangeText(pastedText, qc.selectionStart, qc.selectionEnd, 'end');
+          qc.dispatchEvent(new Event('input', { bubbles: true }));
+      }
+    }, true);
+
+    core.emit('block:ready', { id: 'focusSentinelModule' });
   }
 });
 
