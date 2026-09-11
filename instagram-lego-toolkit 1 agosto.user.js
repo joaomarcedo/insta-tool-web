@@ -4174,10 +4174,10 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Commands (v15)
+   BLOCK: Commands (v16)
    ============================================================ */
 /* ============================================================
-   BLOCK: Commands (v15 - Click Shield Fix)
+   BLOCK: Commands (v16 - /user Manual Override)
    ============================================================ */
 LegoCore.registerBlock({
   id: 'quickCommandExtension',
@@ -4424,7 +4424,7 @@ LegoCore.registerBlock({
     function enhanceCard(card, oldInput, oldSendBtn, header) {
       const input = oldInput.cloneNode(true);
       oldInput.parentNode.replaceChild(input, oldInput);
-      input.placeholder = 'Type message, or / to search, or : for emojis...';
+      input.placeholder = 'Type msg, / to search, : for emoji, or /user...';
       input.style.paddingRight = '76px';
 
       const sendBtn = oldSendBtn.cloneNode(true);
@@ -4604,6 +4604,9 @@ LegoCore.registerBlock({
         const lower = remainder.toLowerCase();
         let mode = 'all', q = remainder;
 
+        // Suppress dropdown if they are trying to manually override user
+        if (lower.startsWith('user ') || lower === 'user') { closeDropdown(); return; }
+
         if (lower.startsWith('text ')) { mode = 'text'; q = remainder.slice(5); }
         else if (lower === 'text') { mode = 'text'; q = ''; }
         else if (lower.startsWith('audio ')) { mode = 'audio'; q = remainder.slice(6); }
@@ -4670,6 +4673,7 @@ LegoCore.registerBlock({
         previewBar.style.display = 'none';
         if (previewPlayer) { previewPlayer.pause(); previewPlayer = null; }
         previewPlayBtn.innerText = '▶️'; previewPlayBtn.style.display = '';
+        previewDiscardBtn.style.display = '';
       }
 
       previewPlayBtn.onclick = () => {
@@ -4790,10 +4794,32 @@ LegoCore.registerBlock({
           if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); e.stopPropagation(); pickSelected(); return; }
           if (e.key === 'Escape') { e.preventDefault(); closeDropdown(); return; }
         }
+
         if (e.key === 'Enter' && !e.shiftKey) {
           e.preventDefault(); e.stopPropagation();
-          const saveMatch = input.value.match(/^\/save\s+audio\s+([^.]+)\.(.*)$/i);
+          const val = input.value.trim();
+
+          const saveMatch = val.match(/^\/save\s+audio\s+([^.]+)\.(.*)$/i);
           if (saveMatch) { saveAudioToLibrary(saveMatch[1].trim(), saveMatch[2].trim()); return; }
+
+          // --- /USER MANUAL OVERRIDE INTERCEPTOR ---
+          const userMatch = val.match(/^\/user\s+(.+)$/i);
+          if (userMatch) {
+            const overrideUser = userMatch[1].trim().replace(/^@/, '');
+            input.value = '';
+            closeDropdown();
+            core.emit('mc:manual-override', overrideUser); // Broadcast to Detector
+            previewBar.style.display = 'flex';
+            previewLabel.innerText = '✅ Username set to @' + overrideUser;
+            previewPlayBtn.style.display = 'none';
+            previewDiscardBtn.style.display = 'none';
+            setTimeout(() => {
+                previewBar.style.display = 'none';
+                previewDiscardBtn.style.display = '';
+            }, 2000);
+            return;
+          }
+
           sendCurrent(); return;
         }
         if (e.key === 'Escape') { if (pendingAudioBlob || pendingFlowNs || pendingSet) clearPending(); }
@@ -4838,15 +4864,7 @@ LegoCore.registerBlock({
         }
       };
 
-      // ----------------------------------------------------
-      // THE CLICK SHIELD (Stops drag mechanics from eating clicks)
-      // ----------------------------------------------------
-      document.addEventListener('mousedown', (e) => {
-          if (e.target.closest('.ig-qcx-gear-btn')) {
-              e.stopPropagation();
-          }
-      }, true);
-
+      // Event Delegation Fix for the Gear Button
       document.addEventListener('click', async (e) => {
         if (!e.target.closest('.ig-qcx-gear-btn')) return;
         e.stopPropagation();
@@ -5811,10 +5829,10 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: ManyChat Username Detector (v7)
+   BLOCK: ManyChat Username Detector (v8)
    ============================================================ */
 /* ============================================================
-   BLOCK: ManyChat Username Detector (v5.0 - Multi-Engine & Debug)
+   BLOCK: ManyChat Username Detector (v5.1 - Fast Method Sync)
    ============================================================ */
 LegoCore.registerBlock({
   id: 'igUsernameManyChatBridge',
@@ -5832,6 +5850,10 @@ LegoCore.registerBlock({
     let lastMatchedId = null;
     let lookupInFlight = false;
     let lastHighlightedEl = null;
+
+    // --- MANUAL LOCK FLAG ---
+    let manualOverrideLock = false;
+    let currentUrl = location.href;
 
     function gmRequest(url, options) {
       return new Promise((resolve, reject) => {
@@ -5944,7 +5966,8 @@ LegoCore.registerBlock({
     engineSelect.onchange = (e) => {
         activeEngine = e.target.value;
         localStorage.setItem(ENGINE_PREF_STORAGE, activeEngine);
-        runDetection(); // Force run immediately
+        manualOverrideLock = false;
+        runDetection();
     };
 
     function showMessage(text, type) { msgBox.textContent = text; msgBox.className = 'ig-ub-msg' + (type ? ' ' + type : ''); }
@@ -5981,13 +6004,31 @@ LegoCore.registerBlock({
       navigator.clipboard.writeText(String(lastMatchedId)).then(() => showMessage('Copied ID.', 'success')).catch(()=>{});
     };
 
+    // --- MANUAL OVERRIDES ---
+
+    // 1. Triggered via the "Use This" button on the UI
     wrap.querySelector('#ig-ub-use-manual-btn').onclick = () => {
       const val = manualInput.value.trim().replace(/^@/, '');
       if (!val) return;
-      setDetected({ user: val, el: null }); localStorage.setItem(MANUAL_USERNAME_STORAGE, val);
-      showMessage('Using manual username: @' + val, null);
-      clearManyChatTarget(); performLookup(val);
+      manualOverrideLock = true;
+      setDetected({ user: val, el: null, raw: 'Manual Override' });
+      localStorage.setItem(MANUAL_USERNAME_STORAGE, val);
+      clearManyChatTarget();
+      performLookup(val);
+      showMessage('Using manual override: @' + val, 'success');
+      highlightElement(null);
     };
+
+    // 2. Triggered via the /user invisible bridge from Quick Chat
+    core.on('mc:manual-override', (username) => {
+        manualOverrideLock = true;
+        setDetected({ user: username, el: null, raw: 'Manual Override via Quick Chat' });
+        localStorage.setItem(MANUAL_USERNAME_STORAGE, username);
+        clearManyChatTarget();
+        performLookup(username);
+        showMessage('Using manual override: @' + username, 'success');
+        highlightElement(null);
+    });
 
     wrap.querySelector('#ig-ub-save-field-btn').onclick = () => {
       fieldName = fieldNameInput.value.trim(); localStorage.setItem(FIELD_NAME_STORAGE, fieldName);
@@ -6051,7 +6092,6 @@ LegoCore.registerBlock({
       clearManyChatTarget(); performLookup(username);
     };
 
-    // --- VISUAL HIGHLIGHTER LOGIC ---
     function highlightElement(el) {
       if (lastHighlightedEl && lastHighlightedEl !== el) {
         lastHighlightedEl.style.outline = lastHighlightedEl.dataset.oldOutline || '';
@@ -6074,17 +6114,14 @@ LegoCore.registerBlock({
       }
     }
 
-    // --- THE MULTI-ENGINE SCANNER ---
     function getChatHeaderData() {
         const EXCLUDED = new Set(['instagram', 'general', 'requests', 'message', 'messages', 'home', 'search', 'notifications', 'create', 'profile', 'more', 'reels', 'dashboard', 'view', 'next', 'prev', 'contact', 'active', 'online', 'seen', 'typing', 'today', 'yesterday', 'now', 'sent', 'details', 'explore', 'direct', 'inbox', 'reply', 'new', 'admin', 'moderator', 'you']);
 
-        // Strict typography check for IG usernames
         const isStrictUsername = (text) => text.length >= 2 && text.length <= 30 && /^[a-z0-9_.]+$/.test(text) && /[a-z]/.test(text) && !EXCLUDED.has(text) && !/^\d+[smhdwy]?$/.test(text);
 
         const candidates = [];
-        const debugReads = []; // Store raw reads for UI debug output
+        const debugReads = [];
 
-        // Grab text nodes deeply
         const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
         let node;
         while ((node = walker.nextNode())) {
@@ -6092,14 +6129,11 @@ LegoCore.registerBlock({
             if (!el) continue;
 
             const rect = el.getBoundingClientRect();
-
-            // GLOBAL FILTER: Must be in top 200px. Must be past left sidebar (> 300px).
             if (rect.width === 0 || rect.height === 0 || rect.top < 0 || rect.top > 200 || rect.left < 300) continue;
 
             const rawText = (node.nodeValue || '').trim();
             if (!rawText) continue;
 
-            // Strip invisible chars & dots
             const text = rawText.replace(/[\u200B-\u200D\uFEFF]/g, '').split('·')[0].trim();
             if (!text) continue;
 
@@ -6110,36 +6144,28 @@ LegoCore.registerBlock({
             }
         }
 
-        const engine = activeEngine; // "1", "2", "3", "4", "5"
+        const engine = activeEngine;
         let chosen = null;
 
-        // --- ENGINE 1: Center Header (Finds the element closest to the middle of the chat pane) ---
         if (engine === '1') {
             if (candidates.length > 0) {
-                // Approximate center of the right half of the screen
                 const targetCenterX = window.innerWidth / 2 + 150;
                 candidates.sort((a, b) => Math.abs(a.left - targetCenterX) - Math.abs(b.left - targetCenterX));
                 chosen = candidates[0];
             }
         }
-
-        // --- ENGINE 2: Highest Node (Closest to top of screen) ---
         else if (engine === '2') {
             if (candidates.length > 0) {
                 candidates.sort((a, b) => a.top - b.top);
                 chosen = candidates[0];
             }
         }
-
-        // --- ENGINE 3: Right-most Node (Furthest to the right) ---
         else if (engine === '3') {
             if (candidates.length > 0) {
                 candidates.sort((a, b) => b.left - a.left);
                 chosen = candidates[0];
             }
         }
-
-        // --- ENGINE 4: Link Scanner (Looks only at <a href> tags) ---
         else if (engine === '4') {
             const linkCandidates = [];
             document.querySelectorAll('a[href]').forEach(a => {
@@ -6153,13 +6179,10 @@ LegoCore.registerBlock({
                 }
             });
             if (linkCandidates.length > 0) {
-                // Sort links by highest up
                 linkCandidates.sort((a, b) => a.top - b.top);
                 chosen = linkCandidates[0];
             }
         }
-
-        // --- ENGINE 5: 2nd Line Extractor ---
         else if (engine === '5') {
             const blockCandidates = [];
             const blocks = document.querySelectorAll('h1, h2, h3, h4, span, div[dir="auto"], div[role="button"]');
@@ -6183,7 +6206,6 @@ LegoCore.registerBlock({
         }
 
         if (!chosen) {
-            // Provide a clean debug string so the user knows what text nodes it actually saw
             const cleanDebug = [...new Set(debugReads)].filter(t => t.length > 1).slice(0, 5).join(' | ');
             return { user: null, el: null, raw: cleanDebug || "No text matching criteria found" };
         }
@@ -6192,6 +6214,9 @@ LegoCore.registerBlock({
     }
 
     function runDetection() {
+      // OVERRIDE LOCK: Skip automatic scanning if a manual lookup is active
+      if (manualOverrideLock) return;
+
       const match = getChatHeaderData();
       const username = match ? match.user : null;
       const el = match ? match.el : null;
@@ -6208,17 +6233,31 @@ LegoCore.registerBlock({
         clearManyChatTarget();
         highlightElement(null);
       } else if (username && username === lastDetected) {
-        // Keep highlight alive
         highlightElement(el);
       } else if (!username && !lastDetected) {
-        // Update debug string continuously
         setDetected(match);
         highlightElement(null);
       }
     }
 
+    // BREAK LOCK ON CHAT CHANGE
+    setInterval(() => {
+        if (location.href !== currentUrl) {
+            currentUrl = location.href;
+            manualOverrideLock = false; // Release the lock
+            lastDetected = ''; // Force a fresh visual scan
+            runDetection();
+        }
+    }, 500);
+
     setInterval(runDetection, 1500);
-    wrap.querySelector('#ig-ub-refresh-btn').onclick = () => runDetection();
+
+    // BREAK LOCK ON REFRESH
+    wrap.querySelector('#ig-ub-refresh-btn').onclick = () => {
+        manualOverrideLock = false;
+        runDetection();
+    };
+
     setTimeout(runDetection, 1000);
 
     core.emit('block:ready', { id: 'igUsernameManyChatBridge' });
