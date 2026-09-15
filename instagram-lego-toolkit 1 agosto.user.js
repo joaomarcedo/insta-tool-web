@@ -2,11 +2,12 @@
 // @name         Instagram Lego Toolkit
 // @namespace    https://node-builder.local/
 // @version      1.0.0
-// @description  Compiled by Node Builder -- 26 block(s): Quick Message Recorder, Sidebar Plugin Manager, Recorder Studio, Audio Library, Dual Sidebar UI Shell, menuCollapseModule, Menu Panel Switcher Module, Menu Card Pop-out Module, Header Toolbar Organizer Module, Workspace Profile & Visibility Manager, Instagram Resizer Feature, Sidebar-to-Resizer Sync, Quick Chat Box, Text Library Module (Saved Snippets), image manager, Highlighter, Commands, Reorder Module, text sync Google Sheets, ManyChat Integration, ManyChat Username Detector, Text Library Height Fix (v1), Reset menus, Image Library, Emoji Module, Cursor Focus
+// @description  Compiled by Node Builder -- 26 block(s): Quick Message Recorder, Sidebar Plugin Manager, Recorder Studio, Audio Library, Dual Sidebar UI Shell, menuCollapseModule, Menu Panel Switcher Module, Menu Card Pop-out Module, Header Toolbar Organizer Module, Workspace Profile & Visibility Manager, Instagram Resizer Feature, Sidebar-to-Resizer Sync, Quick Chat Box, Text Library Module (Saved Snippets), image manager, Highlighter, Commands, Reorder Module, text sync Google Sheets, ManyChat Integration, ManyChat Username Detector, Text Library Height Fix (v1), Reset menus, Image Library, Emoji Module, Audio Bunny Sync
 // @author       You
 // @match        https://www.instagram.com/*
 // @grant        GM_xmlhttpRequest
 // @connect      docs.google.com
+// @connect      bunnycdn.com
 // @require      https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js
 // @run-at       document-idle
 // ==/UserScript==
@@ -17,14 +18,10 @@
 /* ============================================================
    CORE ENGINE
    ============================================================ */
-/* ============================================================
-   CORE ENGINE
-   ============================================================ */
 /* ================================================================
    CORE ENGINE: Instagram Soundboard & Chat Infrastructure
    Handles IndexedDB storage, audio recording, silence trimming,
    hotkey configurations, and chat injection bridges.
-   Now includes Universal Focus Overwatch Hammer.
 ================================================================ */
 const LegoCore = (function () {
     let db;
@@ -80,6 +77,18 @@ const LegoCore = (function () {
         };
     };
 
+    // NEW: Helper to find only the VISIBLE chat box, ignoring ghosts
+    function getActiveChatZone() {
+        const zones = document.querySelectorAll('div[contenteditable="true"], form textarea');
+        for (let zone of zones) {
+            const rect = zone.getBoundingClientRect();
+            if (rect.width > 0 && rect.height > 0) {
+                return zone;
+            }
+        }
+        return null;
+    }
+
     // 3. Chat Injection Bridges
     function injectClipToChat(blob, name) {
         const audioFile = new Blob([blob], { type: 'audio/mp4' });
@@ -87,7 +96,7 @@ const LegoCore = (function () {
         const dataTransfer = new DataTransfer();
         dataTransfer.items.add(fileObj);
 
-        const chatZone = document.querySelector('div[contenteditable="true"]') || document.querySelector('form');
+        const chatZone = getActiveChatZone(); // UPDATED
 
         if (chatZone) {
             ['dragenter', 'dragover', 'drop'].forEach(eventType => {
@@ -118,7 +127,7 @@ const LegoCore = (function () {
         const dataTransfer = new DataTransfer();
         dataTransfer.items.add(fileObj);
 
-        const chatZone = document.querySelector('div[contenteditable="true"]') || document.querySelector('form');
+        const chatZone = getActiveChatZone(); // UPDATED
         if (chatZone) {
             ['dragenter', 'dragover', 'drop'].forEach(eventType => {
                 chatZone.dispatchEvent(new DragEvent(eventType, {
@@ -131,7 +140,7 @@ const LegoCore = (function () {
     }
 
     function injectTextToChat(text) {
-        const chatZone = document.querySelector('div[contenteditable="true"]');
+        const chatZone = getActiveChatZone(); // UPDATED
         if (chatZone) {
             chatZone.focus();
             document.execCommand('insertText', false, text);
@@ -182,15 +191,41 @@ const LegoCore = (function () {
             headerElement.style.cursor = "grab";
             document.removeEventListener('mousemove', onMouseMove);
             document.removeEventListener('mouseup', onMouseUp);
-            if (storageKey) {
-                const rect = panelElement.getBoundingClientRect();
-                localStorage.setItem(storageKey, JSON.stringify({ bottom: 'auto', left: `${rect.left}px`, top: `${rect.top}px` }));
-            }
+            const rect = panelElement.getBoundingClientRect();
+            localStorage.setItem(storageKey, JSON.stringify({ bottom: 'auto', left: `${rect.left}px`, top: `${rect.top}px` }));
         }
     }
 
     function makeIsolatedDraggable(panel, header, storageKey) {
-        makeDraggable(panel, header, storageKey);
+        let dragging = false, startX, startY, initL, initT;
+        header.onmousedown = e => {
+            if (e.button !== 0) return;
+            dragging = true;
+            header.style.cursor = "grabbing";
+            startX = e.clientX; startY = e.clientY;
+            const rect = panel.getBoundingClientRect();
+            initL = rect.left; initT = rect.top;
+            panel.style.bottom = "auto"; panel.style.right = "auto";
+            panel.style.left = `${initL}px`; panel.style.top = `${initT}px`;
+
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup', onUp);
+            e.preventDefault();
+        };
+        function onMove(e) {
+            if (!dragging) return;
+            panel.style.left = `${initL + (e.clientX - startX)}px`;
+            panel.style.top = `${initT + (e.clientY - startY)}px`;
+        }
+        function onUp() {
+            if (!dragging) return;
+            dragging = false;
+            header.style.cursor = "grab";
+            document.removeEventListener('mousemove', onMouseMove);
+            document.removeEventListener('mouseup', onUp);
+            const rect = panel.getBoundingClientRect();
+            localStorage.setItem(storageKey, JSON.stringify({ bottom: 'auto', left: `${rect.left}px`, top: `${rect.top}px` }));
+        }
     }
 
     // --- NEW: Universal Focus Overwatch Hammer ---
@@ -241,6 +276,7 @@ const LegoCore = (function () {
         injectClipToChat,
         injectImageToChat,
         injectTextToChat,
+        getActiveChatZone, // <--- ADDED
         makeDraggable,
         makeIsolatedDraggable,
         enableFocusOverwatch,
@@ -2246,7 +2282,7 @@ LegoCore.registerBlock({
       // Attach listener to minimize button
       const collapseBtn = header.querySelector('.ig-collapse-btn');
       if (collapseBtn) {
-        collapseBtn.innerText = '−';
+        collapseBtn.innerText = '−'; 
         collapseBtn.addEventListener('click', (e) => {
           e.stopPropagation();
           modal.classList.add('is-iconified');
@@ -2303,10 +2339,10 @@ LegoCore.registerBlock({
       modal.addEventListener('mousedown', (e) => {
         // Only accept left-click and ignore nested buttons (like minimize, dock, etc)
         if (e.button !== 0 || e.target.closest('button')) return;
-
+        
         const isHeaderClick = e.target.closest('.ig-menu-header');
         const isIconified = modal.classList.contains('is-iconified');
-
+        
         // Only start drag if we click the header, OR if the whole window is currently a tiny icon
         if (!isHeaderClick && !isIconified) return;
 
@@ -2326,12 +2362,12 @@ LegoCore.registerBlock({
         if (!isDragging) return;
         const dx = e.clientX - startX;
         const dy = e.clientY - startY;
-
+        
         // If mouse moves more than 3px, we register this as a drag, not a click
         if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
           moved = true;
         }
-
+        
         modal.style.left = (initLeft + dx) + 'px';
         modal.style.top = (initTop + dy) + 'px';
       }
@@ -2343,7 +2379,7 @@ LegoCore.registerBlock({
         document.removeEventListener('mouseup', onMouseUp);
 
         const isIconified = modal.classList.contains('is-iconified');
-
+        
         // If it was a tiny icon and we didn't drag it around, it was a click to Expand
         if (isIconified && !moved) {
           modal.classList.remove('is-iconified');
@@ -2493,24 +2529,68 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Header Toolbar Organizer Module (v3)
+   BLOCK: Header Toolbar Organizer Module (v1)
    ============================================================ */
 /* ============================================================
-   BLOCK: Header Toolbar Organizer Module (v3 - Gear Grouping)
+   BLOCK: Header Toolbar Organizer Module (v2 - No Move Handle)
    ============================================================ */
+/* ================================================================
+   BLOCK: Header Toolbar Organizer (Standalone Feature Plugin)
+   - Removes the redundant move/drag handle icon
+   - Groups remaining action buttons (Pop-out, Switch, Collapse)
+     into a clean, unified toolbar pill
+   - Retains full drag-reorder functionality on the header area
+================================================================ */
 LegoCore.registerBlock({
   id: 'headerToolbarOrganizerModule',
   init(core) {
+    // Inject CSS to restyle buttons and hide old drag icons
     const style = document.createElement('style');
     style.id = 'ig-header-toolbar-styles';
     style.innerHTML = `
-      .ig-drag-handle { display: none !important; }
-      .ig-card-toolbar { display: flex; align-items: center; gap: 2px; background: rgba(255, 255, 255, 0.05); border: 1px solid var(--igls-border, rgba(255, 255, 255, 0.08)); border-radius: 6px; padding: 2px; margin-left: auto; }
-      .ig-card-toolbar button, .ig-card-toolbar .ig-popout-btn, .ig-card-toolbar .ig-switch-panel-btn, .ig-card-toolbar .ig-collapse-btn {
-        background: transparent !important; border: none !important; color: var(--igls-text-dim, #96949c) !important; cursor: pointer !important; font-size: 11px !important; line-height: 1 !important; padding: 4px 6px !important; margin: 0 !important; border-radius: 4px !important; display: inline-flex !important; align-items: center !important; justify-content: center !important; transition: color 0.15s, background 0.15s !important;
+      /* Hide standalone move/drag handle icons across all menus */
+      .ig-drag-handle {
+        display: none !important;
       }
-      .ig-card-toolbar button:hover, .ig-card-toolbar .ig-popout-btn:hover, .ig-card-toolbar .ig-switch-panel-btn:hover, .ig-card-toolbar .ig-collapse-btn:hover {
-        color: var(--igls-accent, #c9a876) !important; background: rgba(255, 255, 255, 0.1) !important;
+
+      /* Unified Header Toolbar Container */
+      .ig-card-toolbar {
+        display: flex;
+        align-items: center;
+        gap: 2px;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid var(--igls-border, rgba(255, 255, 255, 0.08));
+        border-radius: 6px;
+        padding: 2px;
+        margin-left: auto;
+      }
+
+      /* Base Style for All Action Buttons inside Toolbar */
+      .ig-card-toolbar button,
+      .ig-card-toolbar .ig-popout-btn,
+      .ig-card-toolbar .ig-switch-panel-btn,
+      .ig-card-toolbar .ig-collapse-btn {
+        background: transparent !important;
+        border: none !important;
+        color: var(--igls-text-dim, #96949c) !important;
+        cursor: pointer !important;
+        font-size: 11px !important;
+        line-height: 1 !important;
+        padding: 4px 6px !important;
+        margin: 0 !important;
+        border-radius: 4px !important;
+        display: inline-flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        transition: color 0.15s, background 0.15s !important;
+      }
+
+      .ig-card-toolbar button:hover,
+      .ig-card-toolbar .ig-popout-btn:hover,
+      .ig-card-toolbar .ig-switch-panel-btn:hover,
+      .ig-card-toolbar .ig-collapse-btn:hover {
+        color: var(--igls-accent, #c9a876) !important;
+        background: rgba(255, 255, 255, 0.1) !important;
       }
     `;
     document.head.appendChild(style);
@@ -2519,9 +2599,13 @@ LegoCore.registerBlock({
       const header = card.querySelector('.ig-menu-header');
       if (!header) return;
 
+      // 1. Remove/hide existing move handles
       const dragHandle = header.querySelector('.ig-drag-handle');
-      if (dragHandle) dragHandle.remove();
+      if (dragHandle) {
+        dragHandle.remove();
+      }
 
+      // 2. Check or create toolbar container
       let toolbar = header.querySelector('.ig-card-toolbar');
       if (!toolbar) {
         toolbar = document.createElement('div');
@@ -2529,35 +2613,33 @@ LegoCore.registerBlock({
         header.appendChild(toolbar);
       }
 
-      // Group ALL action buttons into the pill, including the gears
-      const actions = [
-        header.querySelector('.ig-popout-btn'),
-        header.querySelector('.ig-switch-panel-btn'),
-        header.querySelector('.ig-collapse-btn'),
-        header.querySelector('.ig-mc-gear-btn'),
-        header.querySelector('.ig-qcx-gear-btn')
-      ];
+      // 3. Collect action buttons
+      const popBtn = header.querySelector('.ig-popout-btn');
+      const switchBtn = header.querySelector('.ig-switch-panel-btn');
+      const collapseBtn = header.querySelector('.ig-collapse-btn');
 
-      actions.forEach(btn => {
-          if (btn && btn.parentElement !== toolbar) {
-              toolbar.appendChild(btn);
-          }
-      });
+      // 4. Move controls into the toolbar pill
+      if (popBtn && popBtn.parentElement !== toolbar) toolbar.appendChild(popBtn);
+      if (switchBtn && switchBtn.parentElement !== toolbar) toolbar.appendChild(switchBtn);
+      if (collapseBtn && collapseBtn.parentElement !== toolbar) toolbar.appendChild(collapseBtn);
     }
 
     function attachToContainer(containerId) {
       const container = document.getElementById(containerId);
       if (!container) return;
+
       container.querySelectorAll('.ig-draggable-menu').forEach(organizeCardHeader);
+
       const observer = new MutationObserver(() => {
         container.querySelectorAll('.ig-draggable-menu').forEach(organizeCardHeader);
       });
       observer.observe(container, { childList: true, subtree: true });
     }
 
-    function initWatcher(attempts = 10) {
+    function initWatcher(attempts) {
       const left = document.getElementById('ig-left-menu-container');
       const right = document.getElementById('ig-right-menu-container');
+
       if (left && right) {
         attachToContainer('ig-left-menu-container');
         attachToContainer('ig-right-menu-container');
@@ -2566,7 +2648,8 @@ LegoCore.registerBlock({
       }
     }
 
-    initWatcher();
+    initWatcher(10);
+    console.log('[HeaderToolbarOrganizerModule] Move button removed & controls organized.');
     core.emit('block:ready', { id: 'headerToolbarOrganizerModule' });
   }
 });
@@ -2586,15 +2669,15 @@ LegoCore.registerBlock({
     let profileData = {
       activeProfile: 'Default',
       profiles: {
-        'Default': {},
+        'Default': {}, 
         'Quick Message Only': { 'audio-quick': true, 'audio-rec': false, 'audio-lib': false, 'command-center-launcher': false },
         'Studio Workstation': { 'audio-quick': false, 'audio-rec': true, 'audio-lib': true, 'command-center-launcher': true },
         'Library Focus': { 'audio-quick': false, 'audio-rec': false, 'audio-lib': true, 'command-center-launcher': true }
       },
-      hiddenCards: {}
+      hiddenCards: {} 
     };
 
-    let windowPos = { top: 60, left: 90 };
+    let windowPos = { top: 60, left: 90 }; 
 
     try {
       const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
@@ -2769,7 +2852,7 @@ LegoCore.registerBlock({
         if (confirm(`Are you sure you want to delete profile "${current}"?`)) {
           delete profileData.profiles[current];
           profileData.activeProfile = 'Default';
-          profileData.hiddenCards = {};
+          profileData.hiddenCards = {}; 
           applyVisibility(); saveProfiles(); win.remove(); openProfileWindow();
         }
       };
@@ -2855,9 +2938,9 @@ LegoCore.registerBlock({
   id: 'igPageResizerFeature',
   init(core) {
     const STATE_KEY = 'ig_page_resizer_state_v2';
-
+    
     let resizerState = JSON.parse(localStorage.getItem(STATE_KEY)) || {
-      enabled: false, editing: false, leftWidth: 156, rightWidth: 248, leftOffset: null, rightOffset: null
+      enabled: false, editing: false, leftWidth: 156, rightWidth: 248, leftOffset: null, rightOffset: null 
     };
 
     function saveState() {
@@ -2905,7 +2988,7 @@ LegoCore.registerBlock({
         transition: background 0.15s, border-color 0.15s; flex: 1;
       }
       .ig-resizer-code-btn:hover { background: rgba(255,255,255,0.1); border-color: var(--igls-accent, #c9a876); }
-
+      
       /* Precision Controls UI */
       .ig-prec-container {
         font-size: 10px; color: var(--igls-text-dim, #96949c);
@@ -2969,7 +3052,7 @@ LegoCore.registerBlock({
 
     function updateCardUI() {
       const toggleResizingBtn = document.getElementById('ig-toggle-resizing-btn');
-      if (!toggleResizingBtn) return;
+      if (!toggleResizingBtn) return; 
 
       const toggleEditingBtn = document.getElementById('ig-toggle-editing-btn');
       const statusText = document.getElementById('ig-resizer-status-text');
@@ -2982,7 +3065,7 @@ LegoCore.registerBlock({
       toggleEditingBtn.style.color = resizerState.editing ? '#fff' : 'var(--igls-text, #ece9e4)';
       statusText.innerText = `Status: ${resizerState.enabled ? (resizerState.editing ? 'RESIZING ACTIVE (Editing)' : 'RESIZING ACTIVE (Locked)') : 'RESIZING OFF'}`;
       statusText.className = `ig-resizer-status ${resizerState.enabled ? 'is-on' : 'is-off'}`;
-
+      
       valLeft.innerText = resizerState.leftWidth;
       valRight.innerText = resizerState.rightWidth;
     }
@@ -2990,7 +3073,7 @@ LegoCore.registerBlock({
     core.on('profile-window:opened', ({ container }) => {
       const section = document.createElement('div');
       section.className = 'ig-profile-section';
-
+      
       section.innerHTML = `
         <span class="ig-profile-section-title">Webpage Resizer</span>
         <div class="ig-resizer-status ${resizerState.enabled ? 'is-on' : 'is-off'}" id="ig-resizer-status-text">
@@ -3000,17 +3083,17 @@ LegoCore.registerBlock({
           <button class="ig-profile-action-btn" id="ig-toggle-resizing-btn" style="flex:1; padding:8px;"></button>
           <button class="ig-profile-action-btn" id="ig-toggle-editing-btn" style="flex:1; padding:8px;"></button>
         </div>
-
+        
         <!-- Precision Taps & Hold Area -->
         <div class="ig-prec-container">
           <div style="display:flex; align-items:center; gap:4px;">
-            <span style="width:24px;">Left:</span>
+            <span style="width:24px;">Left:</span> 
             <span id="ig-val-left" style="color:#fff; font-weight:bold; width:24px;">${resizerState.leftWidth}</span>
             <button class="ig-prec-btn" data-target="left" data-dir="-1">-</button>
             <button class="ig-prec-btn" data-target="left" data-dir="1">+</button>
           </div>
           <div style="display:flex; align-items:center; gap:4px;">
-            <span style="width:28px;">Right:</span>
+            <span style="width:28px;">Right:</span> 
             <span id="ig-val-right" style="color:#fff; font-weight:bold; width:24px;">${resizerState.rightWidth}</span>
             <button class="ig-prec-btn" data-target="right" data-dir="-1">-</button>
             <button class="ig-prec-btn" data-target="right" data-dir="1">+</button>
@@ -3065,14 +3148,14 @@ LegoCore.registerBlock({
             return;
           }
           e.preventDefault();
-
+          
           adjustWidth(target, dir); // Immediate tap
-
+          
           // Wait 300ms, then rapid continuous adjustment
           holdTimeout = setTimeout(() => {
             holdInterval = setInterval(() => {
               adjustWidth(target, dir);
-            }, 25);
+            }, 25); 
           }, 300);
         };
 
@@ -3134,7 +3217,7 @@ LegoCore.registerBlock({
       if (!activeDragHandle || !resizerState.enabled || !resizerState.editing) return;
       if (activeDragHandle === 'left') resizerState.leftWidth = Math.min(500, Math.max(50, e.clientX));
       else if (activeDragHandle === 'right') resizerState.rightWidth = Math.min(500, Math.max(50, window.innerWidth - e.clientX));
-
+      
       applyPageDimensions();
       updateCardUI();
     });
@@ -3158,7 +3241,7 @@ LegoCore.registerBlock({
     });
 
     if (resizerState.leftOffset === null) {
-      setTimeout(recalculateOffsets, 500);
+      setTimeout(recalculateOffsets, 500); 
     }
     applyPageDimensions();
 
@@ -3199,7 +3282,7 @@ LegoCore.registerBlock({
    BLOCK: Quick Chat Box (v5)
    ============================================================ */
 /* ============================================================
-   BLOCK: Quick Chat Box (v5 - Sentinel Managed)
+   BLOCK: Quick Chat Box (v4 - Default Auto-Focus + Target Fix)
    ============================================================ */
 LegoCore.registerBlock({
   id: 'quickChatBoxPlugin',
@@ -3207,21 +3290,24 @@ LegoCore.registerBlock({
     const PREF_KEY = 'ig_quick_chat_prefs_v1';
     const EFFECTS_KEY = 'ig_quick_effects_enabled_v1';
     let prefs = JSON.parse(localStorage.getItem(PREF_KEY)) || { keepFocus: true };
-    let effectsEnabled = localStorage.getItem(EFFECTS_KEY) !== 'false';
+    let effectsEnabled = localStorage.getItem(EFFECTS_KEY) !== 'false'; // default true
 
+    // 1. Build the UI
     const chatUI = document.createElement('div');
     chatUI.style.cssText = 'display: flex; flex-direction: column; gap: 8px;';
+
     chatUI.innerHTML = `
       <textarea id="ig-quick-chat-input" placeholder="Type message... (Enter to send, Shift+Enter for new line)"
         style="width: 100%; min-height: 65px; max-height: 250px; background: #0f172a; color: #fff; border: 1px solid #334155; border-radius: 6px; padding: 8px; font-size: 12px; resize: vertical; outline: none; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; box-sizing: border-box; line-height: 1.4; transition: border 0.2s;"></textarea>
+
       <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:6px;">
          <label style="color:var(--igls-text-dim, #96949c); font-size:10px; cursor:pointer; display:flex; align-items:center; gap:4px; user-select:none;">
            <input type="checkbox" id="ig-qc-keep-focus" ${prefs.keepFocus ? 'checked' : ''}> Keep Focus (Rapid Fire)
          </label>
-         <label style="color:var(--igls-text-dim, #96949c); font-size:9px; cursor:pointer; display:flex; align-items:center; gap:3px; user-select:none;">
+         <label style="color:var(--igls-text-dim, #96949c); font-size:9px; cursor:pointer; display:flex; align-items:center; gap:3px; user-select:none;" title="Disables silence-trim processing on quick voice clips for faster sending">
            <input type="checkbox" id="ig-qc-effects-chk" style="width:11px; height:11px;" ${effectsEnabled ? 'checked' : ''}> Effects
          </label>
-         <button id="ig-quick-chat-send" class="ig-base-btn" style="background: #10b981; color: white; border: none; border-radius: 6px; padding: 5px 12px; font-weight: bold; cursor: pointer; width:auto;">📤 Send</button>
+         <button id="ig-quick-chat-send" class="ig-base-btn" style="background: #10b981; color: white; border: none; border-radius: 6px; padding: 5px 12px; font-weight: bold; cursor: pointer; transition: filter 0.2s; width:auto;">📤 Send</button>
       </div>
     `;
 
@@ -3230,6 +3316,7 @@ LegoCore.registerBlock({
     const focusChk = chatUI.querySelector('#ig-qc-keep-focus');
     const effectsChk = chatUI.querySelector('#ig-qc-effects-chk');
 
+    // 2. Save preferences when toggles change
     focusChk.onchange = (e) => {
         prefs.keepFocus = e.target.checked;
         localStorage.setItem(PREF_KEY, JSON.stringify(prefs));
@@ -3239,57 +3326,164 @@ LegoCore.registerBlock({
         localStorage.setItem(EFFECTS_KEY, String(effectsEnabled));
     };
 
+    // 3. Focus styling for UX
     inputField.addEventListener('focus', () => inputField.style.borderColor = '#6366f1');
     inputField.addEventListener('blur', () => inputField.style.borderColor = '#334155');
+    sendBtn.addEventListener('mouseover', () => sendBtn.style.filter = 'brightness(1.1)');
+    sendBtn.addEventListener('mouseout', () => sendBtn.style.filter = 'none');
 
+    // 4. Define the sending & aggressive refocusing logic
     function sendMessage() {
       const liveInput = document.getElementById('ig-quick-chat-input');
       if (!liveInput) return;
+
       const text = liveInput.value.trim();
       if (!text) return;
-      const chatZone = document.querySelector('div[contenteditable="true"]');
-      if (!chatZone) { alert("Open an active Instagram chat window first."); return; }
 
+      // UPDATED: Now grabs from the core helper to avoid background ghost elements
+      const chatZone = core.getActiveChatZone();
+      if (!chatZone) {
+        alert("Open an active Instagram chat window first.");
+        return;
+      }
+
+      // Visual feedback & clear input immediately so user can keep typing
       liveInput.value = '';
       const originalText = sendBtn.innerText;
       sendBtn.innerText = '✅ Sent!';
       sendBtn.style.background = '#059669';
-      setTimeout(() => { sendBtn.innerText = originalText; sendBtn.style.background = '#10b981'; }, 1000);
+      setTimeout(() => {
+        sendBtn.innerText = originalText;
+        sendBtn.style.background = '#10b981';
+      }, 1000);
 
+      // Give Instagram focus just long enough to paste the text
       chatZone.focus();
       document.execCommand('insertText', false, text);
 
+      // Wait 100ms for Instagram to register the text before hitting enter
       setTimeout(() => {
-        const enterEvent = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true });
+        const enterEvent = new KeyboardEvent('keydown', {
+          key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true
+        });
         chatZone.dispatchEvent(enterEvent);
-        core.enableFocusOverwatch(2000); // Hand over to the Sentinel!
+
+        // Hand over to the Sentinel!
+        core.enableFocusOverwatch(2000); 
+
       }, 100);
     }
 
+    // 5. Attach Event Listeners
     sendBtn.onclick = sendMessage;
+
     inputField.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault(); // Prevents adding a new line
+        sendMessage();
+      }
     });
 
-    function mountCard(attemptsLeft = 10) {
+    // 6. GLOBAL FOCUS INTERCEPTOR (Make this the default typing box)
+    function forceQuickChatFocus() {
+      // Don't steal focus if we aren't even looking at a chat right now
+      if (!window.location.href.includes('/direct/')) return;
+
+      const liveInput = document.getElementById('ig-quick-chat-input');
+      if (liveInput) liveInput.focus();
+    }
+
+    // A: Typing out of nowhere
+    document.addEventListener('keydown', (e) => {
+      // Ignore modifier keys alone
+      if (e.key === 'Control' || e.key === 'Alt' || e.key === 'Shift' || e.key === 'Meta') return;
+      // Allow keyboard shortcuts (Ctrl+C, Cmd+V, etc.) to pass normally
+      if (e.ctrlKey || e.metaKey || e.altKey) return;
+
+      const active = document.activeElement;
+
+      // If we are already focused on a legitimate text field, leave it alone
+      const isInput = active && (
+        active.tagName === 'INPUT' ||
+        active.tagName === 'TEXTAREA' ||
+        active.isContentEditable ||
+        active.closest('[contenteditable="true"]')
+      );
+
+      if (!isInput) {
+        forceQuickChatFocus();
+      }
+    });
+
+    // B: Idle click routing (Clicking the background)
+    document.addEventListener('mouseup', (e) => {
+      if (e.button !== 0) return; // Only trigger on left clicks
+
+      // If the user highlighted text to copy it, don't steal focus
+      if (window.getSelection().toString().length > 0) return;
+
+      // Small delay allows native browser focus events to settle first
+      setTimeout(() => {
+        const active = document.activeElement;
+        const isInput = active && (
+          active.tagName === 'INPUT' ||
+          active.tagName === 'TEXTAREA' ||
+          active.isContentEditable ||
+          active.closest('[contenteditable="true"]')
+        );
+
+        // If they click on something meant to be interactive (buttons, menus, SVG icons)
+        // we shouldn't rip focus away from Instagram's native UI layer.
+        const isInteractive = e.target.closest('button, a, select, [role="button"], [role="link"], [role="menuitem"], [role="dialog"], [role="tab"], svg');
+
+        // If it was a dead click on a background element, route it to our Quick Chat
+        if (!isInput && !isInteractive) {
+          forceQuickChatFocus();
+        }
+      }, 50);
+    });
+
+    // C: Auto-focus when switching chats
+    let lastUrl = location.href;
+    setInterval(() => {
+      if (location.href !== lastUrl) {
+        lastUrl = location.href;
+        if (location.href.includes('/direct/')) {
+          // Give Instagram 800ms to build the new chat UI before taking focus
+          setTimeout(forceQuickChatFocus, 800);
+        }
+      }
+    }, 500);
+
+    // D: Initial focus when the plugin loads
+    setTimeout(forceQuickChatFocus, 1000);
+
+
+    // 7. Mount to the Sidebar Plugin Registry
+    function mountCard(attemptsLeft) {
+      attemptsLeft = attemptsLeft === undefined ? 10 : attemptsLeft;
       if (typeof core.registerMenu === 'function') {
         core.registerMenu('right', '💬 Quick Chat', chatUI, '⠿', 'quick-chat-box');
       } else if (attemptsLeft > 0) {
         setTimeout(() => mountCard(attemptsLeft - 1), 200);
+      } else {
+        console.warn('[QuickChatBoxPlugin] Could not find core.registerMenu.');
       }
     }
+
     mountCard();
+    console.log('[QuickChatBoxPlugin] Sidebar chat box loaded with Global Focus Interceptor.');
     core.emit('block:ready', { id: 'quickChatBoxPlugin' });
   }
 });
 
 /* ============================================================
-   BLOCK: Text Library Module (Saved Snippets) (v4)
+   BLOCK: Text Library Module (Saved Snippets) (v5)
    ============================================================ */
 /* ============================================================
    BLOCK: Text Library Module (Saved Snippets) (v3)
    - Unified Native Notion UI
-   - Paste-Only (Zero Send Logic)
+   - Paste-Only (Zero Send Logic + Target Fix)
    - Filters, Adjustable Columns, Tags, Folders
    - Custom Command field (works with the Quick Command Bar plugin)
    ============================================================ */
@@ -3393,9 +3587,9 @@ LegoCore.registerBlock({
       return `rgba(${r}, ${g}, ${b}, ${alpha})`;
     }
 
-    // PURE PASTE FUNCTION - Absolute Zero Send Logic
+    // PURE PASTE FUNCTION - Absolute Zero Send Logic + Target Fix
     function injectText(text) {
-      const chatZone = document.querySelector('div[contenteditable="true"]');
+      const chatZone = core.getActiveChatZone(); // UPDATED
       if (!chatZone) { alert("Open an active Instagram chat window first."); return; }
 
       chatZone.focus();
@@ -3796,18 +3990,18 @@ LegoCore.registerBlock({
    ============================================================ */
 /* ============================================================
    BLOCK: Text Library Image Manager (Right-Side Icon & Viewer)
-   - Completely separate extension.
+   - Completely separate extension. 
    - Handles file uploading, compression, and hover viewing.
    ============================================================ */
 LegoCore.registerBlock({
   id: 'textLibraryImageManager',
   init(core) {
     const PRO_KEY = 'ig_text_library_pro_v1';
-
+    
     const style = document.createElement('style');
     style.innerHTML = `
-      .ig-tln-thumb-btn {
-        background: transparent; border: none; font-size: 11px; cursor: pointer;
+      .ig-tln-thumb-btn { 
+        background: transparent; border: none; font-size: 11px; cursor: pointer; 
         padding: 4px; border-radius: 4px; transition: 0.1s; margin-right: 2px;
       }
       .ig-tln-thumb-btn:hover { background: rgba(255,255,255,0.1); }
@@ -3850,24 +4044,24 @@ LegoCore.registerBlock({
       contentArea.querySelectorAll('.ig-tln-snippet').forEach(row => {
         const id = row.dataset.id;
         const item = libraryData.items.find(i => i.id === id);
-
+        
         if (item && item.thumbnail && !row.querySelector('.ig-tln-thumb-btn')) {
           const actionsDiv = row.querySelector('.ig-tln-actions');
           const btn = document.createElement('button');
           btn.className = 'ig-tln-thumb-btn ig-tln-thumb-icon';
           btn.title = 'Hold to view thumbnail';
           btn.innerText = '🖼️';
-
+          
           btn.onmousedown = (e) => {
             e.stopPropagation();
             thumbViewerImg.src = item.thumbnail;
-            thumbViewer.style.left = (e.clientX - 265) + 'px';
+            thumbViewer.style.left = (e.clientX - 265) + 'px'; 
             thumbViewer.style.top = (e.clientY + 10) + 'px';
             thumbViewer.style.display = 'block';
           };
           const hide = () => thumbViewer.style.display = 'none';
           btn.onmouseup = hide; btn.onmouseleave = hide; btn.onclick = e => e.stopPropagation();
-
+          
           actionsDiv.insertBefore(btn, actionsDiv.firstChild);
         }
       });
@@ -3880,11 +4074,11 @@ LegoCore.registerBlock({
             const overlay = node;
             const modal = overlay.querySelector('#ig-tlp-modal-box');
             const tagSection = Array.from(modal.querySelectorAll('div')).find(d => d.innerText.includes('Assign Tags:'));
-
+            
             if (!tagSection || modal.querySelector('#ig-tlc-thumb-upload')) return;
 
             const currentThumb = overlay.dataset.thumbnail || '';
-
+            
             const thumbUI = document.createElement('div');
             thumbUI.innerHTML = `
               <div style="font-size:11px; font-weight:bold; color:#94a3b8; margin-top:4px;">Thumbnail Image (Optional):</div>
@@ -3894,7 +4088,7 @@ LegoCore.registerBlock({
               </div>
               <img id="ig-tlc-thumb-preview" src="${currentThumb}" style="max-height:40px; border-radius:4px; display:${currentThumb ? 'block' : 'none'}; object-fit:contain; margin-top:4px;">
             `;
-
+            
             modal.insertBefore(thumbUI, tagSection);
 
             const upload = thumbUI.querySelector('#ig-tlc-thumb-upload');
@@ -3905,7 +4099,7 @@ LegoCore.registerBlock({
               const file = e.target.files[0];
               if (file) {
                 compressImage(file, 400, (base64) => {
-                  overlay.dataset.thumbnail = base64;
+                  overlay.dataset.thumbnail = base64; 
                   preview.src = base64;
                   preview.style.display = 'block';
                   clear.style.display = 'block';
@@ -3914,7 +4108,7 @@ LegoCore.registerBlock({
             };
 
             clear.onclick = () => {
-              overlay.dataset.thumbnail = 'CLEAR';
+              overlay.dataset.thumbnail = 'CLEAR'; 
               preview.style.display = 'none';
               clear.style.display = 'none';
               upload.value = '';
@@ -4174,10 +4368,10 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Commands (v16)
+   BLOCK: Commands (v13)
    ============================================================ */
 /* ============================================================
-   BLOCK: Commands (v16 - /user Manual Override)
+   BLOCK: Commands (v18 - Target Fixes + Prevent Double Send + Tab Isolation)
    ============================================================ */
 LegoCore.registerBlock({
   id: 'quickCommandExtension',
@@ -4303,7 +4497,7 @@ LegoCore.registerBlock({
         if (targetInput && targetInput.value.trim()) {
           subscriberId = targetInput.value.trim();
         } else {
-          subscriberId = localStorage.getItem(MC_TARGET_KEY) || '';
+          subscriberId = sessionStorage.getItem(MC_TARGET_KEY) || '';
         }
 
         if (!apiKey) return reject(new Error('No ManyChat API Key found. Configure ManyChat first.'));
@@ -4706,7 +4900,8 @@ LegoCore.registerBlock({
       }
 
       function sendImageSet(setObj, btnEl) {
-        const chatZone = document.querySelector('div[contenteditable="true"]') || document.querySelector('form');
+        // UPDATED: Now grabs from the core helper to avoid background ghost elements
+        const chatZone = core.getActiveChatZone(); 
         if (!chatZone) { alert("Open an active Instagram chat window first."); return; }
         const original = btnEl.innerText; btnEl.innerText = '⏳';
         const dt = new DataTransfer();
@@ -4724,31 +4919,26 @@ LegoCore.registerBlock({
         }, 200);
       }
 
+      // ----------------------------------------------------
+      // THE NEW GUARANTEED SEND ENGINE FOR TEXT
+      // ----------------------------------------------------
       function sendText(text) {
-        const chatZone = document.querySelector('div[contenteditable="true"]');
+        // UPDATED: Now grabs from the core helper to avoid background ghost elements
+        const chatZone = core.getActiveChatZone(); 
         if (!chatZone) { alert("Open an active Instagram chat window first."); return; }
 
         chatZone.focus();
         document.execCommand('insertText', false, text);
 
+        // 1. Force React to recognize the text change
         chatZone.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
 
         setTimeout(() => {
+          // 2. Dispatch a full, realistic Enter sequence (This is all we need!)
           const keyOpts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true };
           chatZone.dispatchEvent(new KeyboardEvent('keydown', keyOpts));
           chatZone.dispatchEvent(new KeyboardEvent('keypress', keyOpts));
           chatZone.dispatchEvent(new KeyboardEvent('keyup', keyOpts));
-
-          const footer = chatZone.closest('footer') || chatZone.parentElement.parentElement.parentElement;
-          if (footer) {
-             const buttons = Array.from(footer.querySelectorAll('button, div[role="button"]'));
-             for (let btn of buttons) {
-                 const textContent = (btn.textContent || '').toLowerCase();
-                 if (textContent.includes('send') || textContent.includes('enviar') || (btn.querySelector('svg') && !btn.querySelector('svg').getAttribute('aria-label')?.toLowerCase().includes('emoji'))) {
-                     btn.click();
-                 }
-             }
-          }
 
           core.enableFocusOverwatch(4000);
         }, 150);
@@ -5077,15 +5267,15 @@ LegoCore.registerBlock({
 
       const observer = new MutationObserver(() => {
         // FIX: Pause observer to prevent infinite loop during DOM appendChild operations
-        observer.disconnect();
-
+        observer.disconnect(); 
+        
         container.querySelectorAll('.ig-draggable-menu').forEach(card => processCard(card, side, container));
         applyStoredOrder(container, side);
-
+        
         // Resume observer after DOM is settled
-        observer.observe(container, { childList: true });
+        observer.observe(container, { childList: true }); 
       });
-
+      
       observer.observe(container, { childList: true });
     }
 
@@ -5212,7 +5402,7 @@ LegoCore.registerBlock({
       overlay.innerHTML = `
         <div class="ig-tlp-modal" style="width:400px; max-width:90vw;">
           <h3>☁️ Google Sheets Sync</h3>
-
+          
           <div style="background:rgba(255,255,255,0.05); padding:10px; border-radius:6px; margin-top:4px;">
             <div style="font-size:11px; color:#94a3b8; margin-bottom:8px;">1. Export your current library to a CSV file to upload into Google Sheets.</div>
             <button id="ig-sync-export-btn" style="background:#0284c7; color:#fff; border:none; padding:8px 12px; border-radius:4px; font-weight:bold; cursor:pointer; width:100%;">📤 Export to CSV</button>
@@ -5233,25 +5423,25 @@ LegoCore.registerBlock({
       // --- EXPORT LOGIC (unchanged -- this part never touched the network) ---
       overlay.querySelector('#ig-sync-export-btn').onclick = () => {
         const data = JSON.parse(localStorage.getItem(PRO_KEY)) || { items: [], tags: [] };
-
+        
         const folders = {};
         data.items.filter(i => i.type === 'folder').forEach(f => folders[f.id] = f.name);
-
+        
         const tags = {};
         data.tags.forEach(t => tags[t.id] = t.name);
 
         let csvContent = 'Name,Group,Tags,Command,Description\n';
-
+        
         data.items.filter(i => i.type === 'snippet').forEach(snip => {
           const fName = folders[snip.parentId] || 'General';
           const tNames = (snip.tags || []).map(tid => tags[tid]).filter(Boolean).join('|');
-
+          
           const title = escapeCSV(snip.title);
           const folder = escapeCSV(fName);
           const tagStr = escapeCSV(tNames);
           const cmd = escapeCSV(snip.customCommand || '');
           const desc = escapeCSV(snip.text || '');
-
+          
           csvContent += `${title},${folder},${tagStr},${cmd},${desc}\n`;
         });
 
@@ -5277,7 +5467,7 @@ LegoCore.registerBlock({
         // Extract Document ID & Sheet GID
         const match = urlInput.match(/\/d\/([a-zA-Z0-9-_]+)/);
         if (!match) return alert("Invalid Google Sheets URL. Make sure you copy the full browser link.");
-
+        
         const docId = match[1];
         const gidMatch = urlInput.match(/gid=([0-9]+)/);
         const gidParam = gidMatch ? `&gid=${gidMatch[1]}` : '';
@@ -5403,10 +5593,10 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: ManyChat Integration (v6)
+   BLOCK: ManyChat Integration (v5)
    ============================================================ */
 /* ============================================================
-   BLOCK: ManyChat Integration (v11 - Click Shield Fix)
+   BLOCK: ManyChat Integration (v12 - Live Active Send + Session Storage)
    ============================================================ */
 LegoCore.registerBlock({
   id: 'manychatModule',
@@ -5422,7 +5612,7 @@ LegoCore.registerBlock({
     let apiKey = localStorage.getItem(API_KEY_STORAGE) || '';
     let flows = [];
     try { flows = JSON.parse(localStorage.getItem(FLOWS_STORAGE)) || []; } catch (e) { flows = []; }
-    let targetSubscriberId = localStorage.getItem(TARGET_ID_STORAGE) || '';
+    let targetSubscriberId = sessionStorage.getItem(TARGET_ID_STORAGE) || '';
 
     let folders = [];
     try { folders = JSON.parse(localStorage.getItem(FOLDERS_STORAGE)) || ['General']; } catch (e) { folders = ['General']; }
@@ -5435,7 +5625,7 @@ LegoCore.registerBlock({
     let targetCollapsed = localStorage.getItem(TARGET_COLLAPSE_KEY) !== 'false';
 
     function saveFlows() { localStorage.setItem(FLOWS_STORAGE, JSON.stringify(flows)); }
-    function saveTargetId(val) { targetSubscriberId = val; localStorage.setItem(TARGET_ID_STORAGE, val); }
+    function saveTargetId(val) { targetSubscriberId = val; sessionStorage.setItem(TARGET_ID_STORAGE, val); }
     function saveFolders() { localStorage.setItem(FOLDERS_STORAGE, JSON.stringify(folders)); }
     function saveCollapsedFolders() { localStorage.setItem(COLLAPSED_FOLDERS_KEY, JSON.stringify(Array.from(collapsedFolders))); }
 
@@ -5740,10 +5930,14 @@ LegoCore.registerBlock({
     }
 
     async function sendFlow(flow) {
-      const subscriberId = targetInput.value.trim();
+      // Force the script to find the LIVE input box in the active DOM, ignoring old ghosts
+      const liveInput = document.getElementById('ig-mc-target-input');
+      const subscriberId = liveInput ? liveInput.value.trim() : '';
+
       if (!subscriberId) { showMessage('Set a Target Subscriber ID first.', 'error'); return; }
       const numericId = parseInt(subscriberId, 10);
       if (isNaN(numericId)) { showMessage('Invalid Subscriber ID. Must be a number.', 'error'); return; }
+      
       const payload = { subscriber_id: numericId, flow_ns: flow.flow_ns };
       showMessage('Sending "' + flow.name + '"...', null);
       try {
@@ -5829,10 +6023,10 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: ManyChat Username Detector (v8)
+   BLOCK: ManyChat Username Detector (v4)
    ============================================================ */
 /* ============================================================
-   BLOCK: ManyChat Username Detector (v5.1 - Fast Method Sync)
+   BLOCK: ManyChat Username Detector (v5.2 - Synchronized Memory)
    ============================================================ */
 LegoCore.registerBlock({
   id: 'igUsernameManyChatBridge',
@@ -5993,10 +6187,28 @@ LegoCore.registerBlock({
       else { idDisplayEl.textContent = 'No match yet'; idDisplayEl.classList.add('empty'); }
     }
 
+    function fillManyChatTarget(subscriberId) {
+      // Isolate memory strictly to THIS specific tab
+      sessionStorage.setItem('mc_target_subscriber_v1', String(subscriberId)); 
+      
+      // Update ALL ghosted and active inputs to ensure complete synchronization
+      const allInputs = document.querySelectorAll('#ig-mc-target-input');
+      if (!allInputs.length) return false;
+      
+      allInputs.forEach(input => {
+          input.value = String(subscriberId);
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+      });
+      return true;
+    }
+
     function clearManyChatTarget() {
-      const targetInput = document.getElementById('ig-mc-target-input');
-      if (targetInput) { targetInput.value = ''; targetInput.dispatchEvent(new Event('input', { bubbles: true })); }
-      localStorage.removeItem('mc_target_subscriber_v1');
+      sessionStorage.removeItem('mc_target_subscriber_v1');
+      const allInputs = document.querySelectorAll('#ig-mc-target-input');
+      allInputs.forEach(input => {
+          input.value = '';
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+      });
     }
 
     wrap.querySelector('#ig-ub-copy-btn').onclick = () => {
@@ -6021,13 +6233,13 @@ LegoCore.registerBlock({
 
     // 2. Triggered via the /user invisible bridge from Quick Chat
     core.on('mc:manual-override', (username) => {
-        manualOverrideLock = true;
-        setDetected({ user: username, el: null, raw: 'Manual Override via Quick Chat' });
-        localStorage.setItem(MANUAL_USERNAME_STORAGE, username);
-        clearManyChatTarget();
-        performLookup(username);
-        showMessage('Using manual override: @' + username, 'success');
-        highlightElement(null);
+      manualOverrideLock = true;
+      setDetected({ user: username, el: null, raw: 'Manual Override via Quick Chat' });
+      localStorage.setItem(MANUAL_USERNAME_STORAGE, username);
+      clearManyChatTarget();
+      performLookup(username);
+      showMessage('Using manual override: @' + username, 'success');
+      highlightElement(null);
     });
 
     wrap.querySelector('#ig-ub-save-field-btn').onclick = () => {
@@ -6053,15 +6265,27 @@ LegoCore.registerBlock({
       const data = await gmRequest(API_BASE + '/fb/subscriber/findByCustomField?' + query, { method: 'GET' });
       const result = data && data.data;
       if (!result) return null;
-      if (Array.isArray(result)) return result.length ? result[0].id : null;
-      return result.id || null;
-    }
 
-    function fillManyChatTarget(subscriberId) {
-      const targetInput = document.getElementById('ig-mc-target-input');
-      if (!targetInput) { localStorage.setItem('mc_target_subscriber_v1', String(subscriberId)); return false; }
-      targetInput.value = String(subscriberId); targetInput.dispatchEvent(new Event('input', { bubbles: true }));
-      return true;
+      if (Array.isArray(result)) {
+        if (!result.length) return null;
+
+        // 1. Filter for EXACT matches to prevent substring errors
+        let exactMatches = result.filter(sub => {
+          if (!sub.custom_fields) return false;
+          const field = sub.custom_fields.find(f => String(f.id) === String(fieldId));
+          return field && field.value && field.value.toLowerCase() === username.toLowerCase();
+        });
+
+        // Fallback to raw results if strict filtering yields empty (safeguard)
+        if (!exactMatches.length) exactMatches = result;
+
+        // 2. Sort by ID descending so index 0 is always the NEWEST, active profile
+        exactMatches.sort((a, b) => b.id - a.id);
+
+        return exactMatches[0].id;
+      }
+
+      return result.id || null;
     }
 
     async function performLookup(username) {
@@ -6356,7 +6580,7 @@ LegoCore.registerBlock({
     const resetBtn = document.createElement('button');
     resetBtn.innerText = '⛑️ Reset Menus';
     resetBtn.title = 'Click to reset all floating window positions if they get stuck off-screen';
-
+    
     resetBtn.style.cssText = `
       position: fixed;
       bottom: 12px;
@@ -6389,20 +6613,20 @@ LegoCore.registerBlock({
       if (confirm("Reset all floating menu positions? This will reload the page.")) {
         // 1. Clear Popped-out cards
         localStorage.removeItem('ig_menu_inpage_popouts_v1');
-
+        
         // 2. Clear Workspace Profile window
         localStorage.removeItem('ig_workspace_profile_window_pos_v1');
-
+        
         // 3. Clear Text Library Filter window
         localStorage.removeItem('ig_tl_notion_filter_pos');
-
+        
         // Reload to apply the fresh state
         window.location.reload();
       }
     };
 
     document.body.appendChild(resetBtn);
-
+    
     core.emit('block:ready', { id: 'floatingMenuRescueModule' });
   }
 });
@@ -6477,7 +6701,7 @@ LegoCore.registerBlock({
 
       .ig-isl-input { width: 100%; background: #1e293b; border: 1px solid #475569; color: #fff; padding: 8px; border-radius: 4px; font-size: 12px; box-sizing: border-box; outline: none; }
       .ig-isl-input:focus { border-color: #6366f1; }
-
+      
       .ig-isl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(70px, 1fr)); gap: 8px; margin-top: 8px; }
       .ig-isl-thumb-wrap { position: relative; aspect-ratio: 1; background: #1e293b; border: 1px solid #334155; border-radius: 4px; overflow: hidden; }
       .ig-isl-thumb-wrap img { width: 100%; height: 100%; object-fit: cover; }
@@ -6523,8 +6747,8 @@ LegoCore.registerBlock({
     function openSetEditor(existingSet) {
       const isEdit = !!existingSet;
       // Copy array so we can safely edit drafts without affecting the DB until Save
-      let draftImages = isEdit ? [...existingSet.images] : [];
-
+      let draftImages = isEdit ? [...existingSet.images] : []; 
+      
       const overlay = document.createElement('div');
       overlay.className = 'ig-isl-modal-overlay';
       overlay.innerHTML = `
@@ -6629,7 +6853,7 @@ LegoCore.registerBlock({
         }
         const tx = db.transaction(['sets'], 'readwrite');
         const store = tx.objectStore('sets');
-
+        
         if (isEdit) {
           existingSet.title = title;
           existingSet.images = draftImages;
@@ -6655,8 +6879,8 @@ LegoCore.registerBlock({
     function openPreviewModal(setObj) {
       const overlay = document.createElement('div');
       overlay.className = 'ig-isl-modal-overlay';
-
-      const thumbsHtml = setObj.images.map(img =>
+      
+      const thumbsHtml = setObj.images.map(img => 
         `<div class="ig-isl-thumb-wrap"><img src="${img.thumb}" alt="thumb"></div>`
       ).join('');
 
@@ -6672,48 +6896,48 @@ LegoCore.registerBlock({
         </div>
       `;
       document.body.appendChild(overlay);
-
+      
       const close = () => overlay.remove();
       overlay.querySelector('#ig-isl-close-prev').onclick = close;
       overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
     }
 
     // 7. Drag & Drop Reordering Logic
-    function handleDragStart(e, id) {
-      draggedItem = id;
-      e.dataTransfer.effectAllowed = 'move';
-      setTimeout(() => e.target.style.opacity = '0.3', 0);
+    function handleDragStart(e, id) { 
+      draggedItem = id; 
+      e.dataTransfer.effectAllowed = 'move'; 
+      setTimeout(() => e.target.style.opacity = '0.3', 0); 
     }
     function handleDragOver(e, id) {
       e.preventDefault(); e.stopPropagation();
       const targetEl = e.currentTarget;
       document.querySelectorAll('.ig-isl-drop-top, .ig-isl-drop-bottom').forEach(el => el.classList.remove('ig-isl-drop-top', 'ig-isl-drop-bottom'));
       if (!draggedItem || draggedItem === id) return;
-      const rect = targetEl.getBoundingClientRect();
-      const y = e.clientY - rect.top;
+      const rect = targetEl.getBoundingClientRect(); 
+      const y = e.clientY - rect.top; 
       if (y < rect.height / 2) targetEl.classList.add('ig-isl-drop-top');
       else targetEl.classList.add('ig-isl-drop-bottom');
     }
     function handleDrop(e, targetId) {
       e.preventDefault(); e.stopPropagation();
       if (!draggedItem || draggedItem === targetId) return;
-
-      const targetEl = e.currentTarget;
-      const rect = targetEl.getBoundingClientRect();
-      const y = e.clientY - rect.top;
-
+      
+      const targetEl = e.currentTarget; 
+      const rect = targetEl.getBoundingClientRect(); 
+      const y = e.clientY - rect.top; 
+      
       const tx = db.transaction(['sets'], 'readwrite');
       const store = tx.objectStore('sets');
       store.getAll().onsuccess = ev => {
         const sets = ev.target.result.sort((a,b) => (a.order || 0) - (b.order || 0));
         const dragIdx = sets.findIndex(s => s.id === draggedItem);
         const targetIdx = sets.findIndex(s => s.id === targetId);
-
+        
         if (dragIdx > -1 && targetIdx > -1) {
           const [moved] = sets.splice(dragIdx, 1);
           if (y < rect.height / 2) sets.splice(targetIdx, 0, moved); // Drop top
           else sets.splice(targetIdx + 1, 0, moved); // Drop bottom
-
+          
           sets.forEach((s, i) => { s.order = i; store.put(s); });
         }
       };
@@ -6752,7 +6976,7 @@ LegoCore.registerBlock({
       const tx = db.transaction(['sets'], 'readonly');
       tx.objectStore('sets').getAll().onsuccess = e => {
         const sets = (e.target.result || []).sort((a,b) => (a.order || 0) - (b.order || 0));
-
+        
         if (!sets.length) {
           tree.innerHTML = '<div style="padding:12px; color:#94a3b8; font-size:10px; text-align:center;">No Image Sets yet. Click New to bundle images together.</div>';
           return;
@@ -6816,7 +7040,7 @@ LegoCore.registerBlock({
   id: 'emojiSettingsModule',
   init(core) {
     const STORAGE_KEY = 'ig_emoji_dict_v1';
-
+    
     const defaultEmojis = [
       { e: '😀', k: 'happy' }, { e: '😂', k: 'laugh' }, { e: '🤣', k: 'rofl' },
       { e: '😍', k: 'hearteyes' }, { e: '🥰', k: 'love' }, { e: '😊', k: 'smile' },
@@ -6895,12 +7119,12 @@ LegoCore.registerBlock({
       const eVal = wrap.querySelector('#ig-emj-val').value.trim();
       const kVal = wrap.querySelector('#ig-emj-key').value.trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
       if (!eVal || !kVal) return alert('Provide both an emoji and a keyword (no spaces).');
-
+      
       // Check if keyword already exists
       const existing = dict.findIndex(i => i.k === kVal);
       if (existing > -1) dict[existing].e = eVal;
       else dict.unshift({ e: eVal, k: kVal });
-
+      
       saveDict();
       wrap.querySelector('#ig-emj-val').value = '';
       wrap.querySelector('#ig-emj-key').value = '';
@@ -6921,7 +7145,7 @@ LegoCore.registerBlock({
       }
     }
     mountCard();
-
+    
     // Send initial payload out just in case QC loads after
     setTimeout(() => core.emit('emoji:updated', dict), 500);
 
@@ -6930,143 +7154,1154 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Cursor Focus (v2)
+   BLOCK: Bunny.net Sync (v2)
    ============================================================ */
 /* ============================================================
-   BLOCK: Cursor Focus (v8.1 - Dictator Mode / UI Fixed)
+   BLOCK: Audio Bunny.net Sync (v2 - Smart Sync)
    ============================================================ */
 LegoCore.registerBlock({
-  id: 'focusSentinelModule',
+  id: 'audioBunnySyncModule',
   init(core) {
-    const DICTATOR_PREF_KEY = 'ig_dictator_mode_v1';
-    let dictatorMode = localStorage.getItem(DICTATOR_PREF_KEY) !== 'false'; // Default ON
+    const BUNNY_PREFS_KEY = 'ig_bunny_sync_prefs_v1';
+    let prefs = JSON.parse(localStorage.getItem(BUNNY_PREFS_KEY)) || { zoneName: '', apiKey: '', region: 'default' };
 
-    function getQuickChat() {
-      const qc = document.getElementById('ig-quick-chat-input');
-      if (!qc) return null;
-      if (qc.closest('.is-iconified')) return null; // Sleep if modal is minimized
-      return qc;
+    function savePrefs() { localStorage.setItem(BUNNY_PREFS_KEY, JSON.stringify(prefs)); }
+
+    function blobToArrayBuffer(blob) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result);
+            reader.onerror = () => reject(new Error('Failed to read blob'));
+            reader.readAsArrayBuffer(blob);
+        });
     }
 
-    // 1. INJECT THE OVERRIDE TOGGLE INTO THE CORRECT UI ROW
-    function injectToggle() {
-      if (document.getElementById('ig-dictator-toggle')) return;
+    function bunnyRequest(method, path, data = null, responseType = '') {
+      return new Promise((resolve, reject) => {
+        if (!prefs.zoneName || !prefs.apiKey) return reject(new Error('Missing credentials.'));
+        const endpoint = prefs.region === 'default' ? 'storage.bunnycdn.com' : `${prefs.region}.storage.bunnycdn.com`;
+        
+        const cleanPath = path ? path.replace(/^\/+/, '') : '';
+        const url = `https://${endpoint}/${prefs.zoneName}/ig_audio_backup/${cleanPath}`;
 
-      // Target the exact row containing the 'Effects' checkbox
-      const effectsChk = document.getElementById('ig-qc-effects-chk');
-      if (!effectsChk) return;
-
-      const controlsRow = effectsChk.closest('div');
-      if (controlsRow) {
-        const label = document.createElement('label');
-        label.style.cssText = 'color: #f43f5e; font-size:9px; font-weight:bold; cursor:pointer; display:flex; align-items:center; gap:3px; user-select:none; margin-left: 8px;';
-        label.innerHTML = `<input type="checkbox" id="ig-dictator-toggle" ${dictatorMode ? 'checked' : ''} style="accent-color: #f43f5e; margin:0; width:11px; height:11px;"> 🧲 Dictator Mode`;
-
-        label.querySelector('input').onchange = (e) => {
-          dictatorMode = e.target.checked;
-          localStorage.setItem(DICTATOR_PREF_KEY, String(dictatorMode));
+        const reqOpts = {
+          method: method,
+          url: url,
+          headers: {
+            'AccessKey': prefs.apiKey,
+            'accept': 'application/json'
+          },
+          onload: function(res) {
+            if (res.status >= 200 && res.status < 300) {
+                if (responseType === 'blob') resolve(res.response);
+                else if (responseType === 'arraybuffer') resolve(res.response);
+                else {
+                    try { resolve(res.responseText ? JSON.parse(res.responseText) : null); }
+                    catch(e) { resolve(res.responseText); }
+                }
+            } else {
+                reject(new Error(`API Error ${res.status}: ${res.statusText}`));
+            }
+          },
+          onerror: function() { reject(new Error('Network error.')); }
         };
 
-        // Append it neatly at the end of the bottom toggle row
-        controlsRow.appendChild(label);
+        if (data) {
+            reqOpts.data = data;
+            if (data instanceof ArrayBuffer || data instanceof Blob) {
+                reqOpts.headers['Content-Type'] = 'application/octet-stream';
+            } else {
+                reqOpts.headers['Content-Type'] = 'application/json';
+            }
+        }
+        
+        if (responseType) reqOpts.responseType = responseType;
+
+        if (typeof GM_xmlhttpRequest !== 'undefined') {
+            GM_xmlhttpRequest(reqOpts);
+        } else {
+            reject(new Error('GM_xmlhttpRequest not available.'));
+        }
+      });
+    }
+
+    async function getCloudInventory() {
+        let inventory = [];
+        try {
+            const rootItems = await bunnyRequest('GET', '');
+            if (!Array.isArray(rootItems)) return inventory;
+            
+            for (let item of rootItems) {
+                if (item.IsDirectory) {
+                    const folderItems = await bunnyRequest('GET', encodeURIComponent(item.ObjectName) + '/');
+                    if (Array.isArray(folderItems)) {
+                        folderItems.forEach(file => {
+                            if (!file.IsDirectory && file.ObjectName.endsWith('.m4a')) {
+                                inventory.push({
+                                    folder: item.ObjectName,
+                                    name: file.ObjectName.replace(/\.m4a$/, ''),
+                                    path: `${encodeURIComponent(item.ObjectName)}/${encodeURIComponent(file.ObjectName)}`
+                                });
+                            }
+                        });
+                    }
+                } else if (item.ObjectName.endsWith('.m4a')) {
+                    inventory.push({
+                        folder: 'General',
+                        name: item.ObjectName.replace(/\.m4a$/, ''),
+                        path: encodeURIComponent(item.ObjectName)
+                    });
+                }
+            }
+        } catch (e) {
+            if (e.message.includes('404')) return []; // Directory doesn't exist yet
+            throw e;
+        }
+        return inventory;
+    }
+
+    function getLocalClips() {
+        return new Promise((resolve) => {
+            const db = core.getDb();
+            const tx = db.transaction(['clips'], 'readonly');
+            tx.objectStore('clips').getAll().onsuccess = e => resolve(e.target.result || []);
+        });
+    }
+
+    function saveClipToLocalDB(clipData) {
+        return new Promise((resolve) => {
+            const db = core.getDb();
+            const tx = db.transaction(['folders', 'clips'], 'readwrite');
+            tx.objectStore('folders').put({ name: clipData.folder });
+            const store = tx.objectStore('clips');
+            const countReq = store.count();
+            countReq.onsuccess = () => {
+                clipData.order = countReq.result;
+                store.add(clipData);
+            };
+            tx.oncomplete = resolve;
+        });
+    }
+
+    function openBunnyModal() {
+      if (document.getElementById('ig-bunny-sync-modal')) return;
+
+      const overlay = document.createElement('div');
+      overlay.className = 'ig-tlp-modal-overlay'; 
+      overlay.id = 'ig-bunny-sync-modal';
+
+      overlay.innerHTML = `
+        <div class="ig-tlp-modal" style="width:380px;">
+          <h3>🐰 Bunny.net Audio Smart Sync</h3>
+          
+          <div style="font-size:11px; color:#94a3b8; margin-top:8px;">Storage Zone Name</div>
+          <input type="text" id="ig-bunny-zone" class="ig-tlp-input" placeholder="e.g. my-audio-zone" value="${prefs.zoneName}">
+          
+          <div style="font-size:11px; color:#94a3b8; margin-top:8px;">Storage Zone Password (API Key)</div>
+          <input type="password" id="ig-bunny-key" class="ig-tlp-input" placeholder="Paste password..." value="${prefs.apiKey}">
+
+          <div style="font-size:11px; color:#94a3b8; margin-top:8px;">Main Storage Region</div>
+          <select id="ig-bunny-region" class="ig-tlp-input" style="padding:6px;">
+            <option value="default" ${prefs.region === 'default' ? 'selected' : ''}>Falkenstein (Default)</option>
+            <option value="ny" ${prefs.region === 'ny' ? 'selected' : ''}>New York (ny)</option>
+            <option value="la" ${prefs.region === 'la' ? 'selected' : ''}>Los Angeles (la)</option>
+            <option value="sg" ${prefs.region === 'sg' ? 'selected' : ''}>Singapore (sg)</option>
+            <option value="syd" ${prefs.region === 'syd' ? 'selected' : ''}>Sydney (syd)</option>
+            <option value="uk" ${prefs.region === 'uk' ? 'selected' : ''}>United Kingdom (uk)</option>
+          </select>
+
+          <div style="display:flex; flex-direction:column; gap:8px; margin-top:16px;">
+            <button id="ig-bunny-btn-backup" style="background:#10b981; color:#fff; border:none; padding:8px 12px; border-radius:4px; font-weight:bold; cursor:pointer;">☁️ Smart Backup (Push New & Sync Deletes)</button>
+            <button id="ig-bunny-btn-download" style="background:#0284c7; color:#fff; border:none; padding:8px 12px; border-radius:4px; font-weight:bold; cursor:pointer;">📥 Smart Download (Pull Missing to Local)</button>
+            <button id="ig-bunny-btn-force" style="background:#dc2626; color:#fff; border:none; padding:8px 12px; border-radius:4px; font-weight:bold; cursor:pointer;">♻️ Force Mirror Overwrite (Wipe Cloud & Push All)</button>
+          </div>
+
+          <div id="ig-bunny-status" style="font-size:10px; text-align:center; margin-top:12px; color:#c9a876; min-height:14px; font-weight:bold;"></div>
+
+          <div style="display:flex; justify-content:space-between; margin-top:12px;">
+            <button id="ig-bunny-close-btn" style="background:transparent; color:#94a3b8; border:none; cursor:pointer; font-weight:bold; width:100%;">Close</button>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(overlay);
+
+      const zoneInput = overlay.querySelector('#ig-bunny-zone');
+      const keyInput = overlay.querySelector('#ig-bunny-key');
+      const regionSelect = overlay.querySelector('#ig-bunny-region');
+      const statusEl = overlay.querySelector('#ig-bunny-status');
+      const btns = [
+        overlay.querySelector('#ig-bunny-btn-backup'),
+        overlay.querySelector('#ig-bunny-btn-download'),
+        overlay.querySelector('#ig-bunny-btn-force')
+      ];
+
+      function updateCreds() {
+        prefs.zoneName = zoneInput.value.trim();
+        prefs.apiKey = keyInput.value.trim();
+        prefs.region = regionSelect.value;
+        savePrefs();
+        return prefs.zoneName && prefs.apiKey;
+      }
+
+      function lockUI(msg) {
+        btns.forEach(b => b.disabled = true);
+        statusEl.style.color = '#c9a876';
+        statusEl.innerText = msg;
+      }
+
+      function unlockUI(msg, isError = false) {
+        btns.forEach(b => b.disabled = false);
+        statusEl.style.color = isError ? '#f43f5e' : '#10b981';
+        statusEl.innerText = msg;
+        core.emit('folders:refresh');
+        core.emit('library:refresh');
+      }
+
+      zoneInput.onchange = updateCreds;
+      keyInput.onchange = updateCreds;
+      regionSelect.onchange = updateCreds;
+      overlay.querySelector('#ig-bunny-close-btn').onclick = () => overlay.remove();
+
+      // 1. SMART BACKUP
+      overlay.querySelector('#ig-bunny-btn-backup').onclick = async () => {
+        if (!updateCreds()) return unlockUI('❌ Please enter Zone Name and Password.', true);
+        lockUI('☁️ Fetching cloud inventory...');
+
+        try {
+            const localClips = await getLocalClips();
+            const cloudInventory = await getCloudInventory();
+
+            const localKeys = new Set(localClips.map(c => `${c.folder}||${c.name}`));
+            const cloudKeys = new Set(cloudInventory.map(c => `${c.folder}||${c.name}`));
+
+            const toUpload = localClips.filter(c => !cloudKeys.has(`${c.folder}||${c.name}`));
+            const toDelete = cloudInventory.filter(c => !localKeys.has(`${c.folder}||${c.name}`));
+
+            if (!toUpload.length && !toDelete.length) {
+                return unlockUI('✅ Everything is already up to date!');
+            }
+
+            for (let i = 0; i < toDelete.length; i++) {
+                lockUI(`🗑️ Deleting removed clip ${i + 1} of ${toDelete.length}...`);
+                await bunnyRequest('DELETE', toDelete[i].path);
+            }
+
+            for (let i = 0; i < toUpload.length; i++) {
+                lockUI(`☁️ Uploading new clip ${i + 1} of ${toUpload.length}...`);
+                const clip = toUpload[i];
+                const arrayBuffer = await blobToArrayBuffer(clip.blob);
+                const safeFolder = clip.folder.replace(/[^a-zA-Z0-9-_ \u00C0-\u017F]/g, '_');
+                const safeName = clip.name.replace(/[^a-zA-Z0-9-_ \u00C0-\u017F]/g, '_');
+                const path = `${encodeURIComponent(safeFolder)}/${encodeURIComponent(safeName)}.m4a`;
+                await bunnyRequest('PUT', path, arrayBuffer);
+                await new Promise(r => setTimeout(r, 100)); // Rate limit buffer
+            }
+
+            unlockUI(`✅ Smart Backup Complete! Uploaded ${toUpload.length}, Deleted ${toDelete.length}.`);
+        } catch (e) {
+            console.error(e);
+            unlockUI(`❌ Error: ${e.message}`, true);
+        }
+      };
+
+      // 2. SMART DOWNLOAD
+      overlay.querySelector('#ig-bunny-btn-download').onclick = async () => {
+        if (!updateCreds()) return unlockUI('❌ Please enter Zone Name and Password.', true);
+        lockUI('📥 Fetching cloud inventory...');
+
+        try {
+            const localClips = await getLocalClips();
+            const cloudInventory = await getCloudInventory();
+
+            const localKeys = new Set(localClips.map(c => `${c.folder}||${c.name}`));
+            const toDownload = cloudInventory.filter(c => !localKeys.has(`${c.folder}||${c.name}`));
+
+            if (!toDownload.length) {
+                return unlockUI('✅ Local library is fully synced. No missing files.');
+            }
+
+            for (let i = 0; i < toDownload.length; i++) {
+                lockUI(`📥 Downloading clip ${i + 1} of ${toDownload.length}: ${toDownload[i].name}...`);
+                const c = toDownload[i];
+                const blob = await bunnyRequest('GET', c.path, null, 'blob');
+                
+                await saveClipToLocalDB({
+                    name: c.name,
+                    folder: c.folder,
+                    blob: blob,
+                    color: '#0095f6', // Default blue for pulled clips
+                    customCommand: ''
+                });
+                await new Promise(r => setTimeout(r, 100)); // Rate limit buffer
+            }
+
+            unlockUI(`✅ Smart Download Complete! Pulled ${toDownload.length} clips.`);
+        } catch (e) {
+            console.error(e);
+            unlockUI(`❌ Error: ${e.message}`, true);
+        }
+      };
+
+      // 3. FORCE MIRROR
+      overlay.querySelector('#ig-bunny-btn-force').onclick = async () => {
+        if (!updateCreds()) return unlockUI('❌ Please enter Zone Name and Password.', true);
+        if (!confirm("⚠️ Are you absolutely sure? This will permanently DELETE all audio files currently on Bunny.net and replace them with a fresh copy of your local library.")) return;
+
+        lockUI('♻️ Starting Force Mirror Override...');
+
+        try {
+            const cloudInventory = await getCloudInventory();
+            for (let i = 0; i < cloudInventory.length; i++) {
+                lockUI(`♻️ Wiping cloud storage (${i + 1} of ${cloudInventory.length})...`);
+                await bunnyRequest('DELETE', cloudInventory[i].path);
+            }
+
+            const localClips = await getLocalClips();
+            if (!localClips.length) {
+                return unlockUI('✅ Cloud wiped. Local library is empty, so no files pushed.');
+            }
+
+            for (let i = 0; i < localClips.length; i++) {
+                lockUI(`☁️ Pushing local library (${i + 1} of ${localClips.length})...`);
+                const clip = localClips[i];
+                const arrayBuffer = await blobToArrayBuffer(clip.blob);
+                const safeFolder = clip.folder.replace(/[^a-zA-Z0-9-_ \u00C0-\u017F]/g, '_');
+                const safeName = clip.name.replace(/[^a-zA-Z0-9-_ \u00C0-\u017F]/g, '_');
+                const path = `${encodeURIComponent(safeFolder)}/${encodeURIComponent(safeName)}.m4a`;
+                await bunnyRequest('PUT', path, arrayBuffer);
+                await new Promise(r => setTimeout(r, 100));
+            }
+
+            unlockUI(`✅ Force Mirror Complete! Pushed ${localClips.length} clips.`);
+        } catch (e) {
+            console.error(e);
+            unlockUI(`❌ Error: ${e.message}`, true);
+        }
+      };
+    }
+
+    function attachBunnyButton() {
+      const headerBtns = document.querySelector('[data-key="audio-lib"] .ig-audio-lib-header') || document.querySelector('.ig-audio-lib-header');
+      if (headerBtns && !document.getElementById('ig-bunny-sync-btn')) {
+        const btn = document.createElement('button');
+        btn.id = 'ig-bunny-sync-btn';
+        btn.className = 'ig-audio-lib-new-btn';
+        btn.innerText = '🐰 Sync';
+        btn.style.marginLeft = '8px';
+        btn.style.color = '#10b981';
+        btn.onclick = openBunnyModal;
+        
+        headerBtns.insertBefore(btn, headerBtns.children[1]);
       }
     }
 
-    // Check periodically to inject the button (in case Quick Chat loads after Sentinel)
-    setInterval(injectToggle, 1000);
+    core.on('library:refresh', attachBunnyButton);
 
-    // 2. THE BLACK HOLE KEYDOWN INTERCEPTOR
-    window.addEventListener('keydown', (e) => {
-      if (!dictatorMode) return;
+    function initWatcher(attempts = 15) {
+      attachBunnyButton();
+      if (!document.getElementById('ig-bunny-sync-btn') && attempts > 0) {
+        setTimeout(() => initWatcher(attempts - 1), 200);
+      }
+    }
+    initWatcher();
 
-      const qc = getQuickChat();
-      if (!qc) return;
+    console.log('[AudioBunnySyncModule] Cloud Smart Sync engine loaded.');
+    core.emit('block:ready', { id: 'audioBunnySyncModule' });
+  }
+});
 
-      // Allow shortcuts (Copy, Paste, Undo, etc.)
-      if (e.ctrlKey || e.metaKey || e.altKey) return;
-      // Allow structural keys except backspace and enter
-      if (e.key.length !== 1 && e.key !== 'Backspace' && e.key !== 'Enter') return;
+/* ============================================================
+   BLOCK: Mobile UI (v1)
+   ============================================================ */
+/* ============================================================
+   BLOCK: Mobile Bottom Sheet UI Shell (v1)
+   ------------------------------------------------------------
+   A drop-in mobile replacement for the Dual Sidebar UI Shell,
+   built for Firefox on Android (tested target: Galaxy S22, ~360dp).
 
-      const active = document.activeElement;
+   HOW IT WORKS
+   Rather than building its own menu containers (which would create
+   duplicate #ig-left-menu-container / #ig-right-menu-container IDs
+   and break core.registerMenu), this block ADOPTS the containers the
+   Dual Sidebar already created and physically moves those DOM nodes
+   into a bottom sheet.
 
-      // Are they inside the Lego Toolkit?
-      const isLegoUI = active && (
-          active.id === 'ig-quick-chat-input' ||
-          active.closest('.ig-draggable-menu') ||
-          active.closest('.ig-floating-modal') ||
-          active.closest('.ig-qcx-modal-overlay') ||
-          active.closest('#ig-profile-floating-window') ||
-          active.closest('#ig-tln-filter-win') ||
-          active.closest('#ig-audio-modal-box')
-      );
+   Because the nodes themselves are reused:
+     - core.registerMenu('left'|'right', ...) keeps working unchanged
+     - menuCollapseModule, menuPanelSwitcherModule,
+       menuCardReorderModule, headerToolbarOrganizerModule and
+       profileManagerModule keep working -- their MutationObservers
+       are bound to the element, not to its position in the page
+     - EVERY existing and future feature block mounts on mobile with
+       zero code changes, as long as it mounts via core.registerMenu
 
-      // If they are explicitly typing in one of OUR other boxes (Search, settings, naming a clip), let them.
-      if (isLegoUI && active !== qc && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {
+   WHAT IT ADDS
+     - core.isMobile           -> boolean, read this in future blocks
+     - core.mobileSheet        -> { open, collapse, expand, setTab, isMobile }
+
+   PLACEMENT
+   Register this block AFTER 'igDualSidebarUI' (i.e. paste it near the
+   end of the compiled script). On desktop it detects that it isn't
+   needed and returns immediately, leaving the sidebars alone.
+
+   TESTING ON DESKTOP
+   localStorage.setItem('ig_force_mobile_v1','1')  -> force mobile shell
+   localStorage.setItem('ig_force_mobile_v1','0')  -> force desktop shell
+   localStorage.removeItem('ig_force_mobile_v1')   -> auto-detect
+   ============================================================ */
+LegoCore.registerBlock({
+  id: 'igMobileBottomSheetUI',
+  init(core) {
+
+    /* ========================================================
+       0. MOBILE DETECTION
+       ======================================================== */
+    const FORCE_KEY = 'ig_force_mobile_v1';
+    const PREF_KEY  = 'ig_mobile_sheet_v1';
+
+    const forced    = localStorage.getItem(FORCE_KEY);
+    const uaMobile  = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+    const narrow    = window.matchMedia('(max-width: 820px)').matches;
+    const isMobile  = forced === '1' ? true
+                    : forced === '0' ? false
+                    : (uaMobile || narrow);
+
+    // Exposed so any future block can branch on it.
+    core.isMobile = isMobile;
+
+    if (!isMobile) {
+      console.log('[MobileSheet] Desktop detected -- mobile shell inactive.');
+      core.emit('block:ready', { id: 'igMobileBottomSheetUI', active: false });
+      return;
+    }
+
+    /* ========================================================
+       1. PREFERENCES
+       ======================================================== */
+    let prefs = {
+      state: 'half',          // 'collapsed' | 'half' | 'full'
+      lastExpanded: 'half',   // remembered so the grabber tap restores it
+      tab: 'left',            // 'left' | 'right'
+      scale: 100,             // UI zoom inside the sheet
+      keyboardGuard: true     // suppress Quick Chat's focus-stealing
+    };
+    try { Object.assign(prefs, JSON.parse(localStorage.getItem(PREF_KEY)) || {}); } catch (e) {}
+    function savePrefs() {
+      try { localStorage.setItem(PREF_KEY, JSON.stringify(prefs)); } catch (e) {}
+    }
+
+    const GRAB_H  = 54;   // collapsed height (the grabber bar itself)
+    const HALF_F  = 0.52; // fraction of viewport height
+    const FULL_F  = 0.92;
+
+    /* ========================================================
+       2. STYLES
+       Split in two: the sheet chrome, and a compatibility layer
+       that fixes desktop-tuned CSS inside the existing blocks.
+       ======================================================== */
+    const sheetStyle = document.createElement('style');
+    sheetStyle.id = 'igms-sheet-styles';
+    sheetStyle.innerHTML = `
+      :root {
+        --igms-bg: #131318;
+        --igms-surface: #17171d;
+        --igms-surface-2: #1c1c23;
+        --igms-border: rgba(255,255,255,0.08);
+        --igms-text: #ece9e4;
+        --igms-text-dim: #96949c;
+        --igms-accent: #c9a876;
+        --igms-safe: env(safe-area-inset-bottom, 0px);
+      }
+
+      #igms-root { display: none; }
+      body.igms-on #igms-root { display: block; }
+
+      #igms-scrim {
+        position: fixed; inset: 0;
+        background: rgba(0,0,0,0.45);
+        z-index: 2147482998;
+        opacity: 0; pointer-events: none;
+        transition: opacity 0.2s ease;
+      }
+      #igms-sheet[data-state="full"] ~ #igms-scrim,
+      body.igms-full #igms-scrim { opacity: 1; pointer-events: auto; }
+
+      #igms-sheet {
+        position: fixed; left: 0; right: 0; bottom: 0;
+        z-index: 2147482999;
+        height: ${GRAB_H}px;
+        background: var(--igms-bg);
+        color: var(--igms-text);
+        border-top: 1px solid var(--igms-border);
+        border-radius: 16px 16px 0 0;
+        box-shadow: 0 -10px 40px rgba(0,0,0,0.6);
+        display: flex; flex-direction: column;
+        overflow: hidden;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        transition: height 0.26s cubic-bezier(0.22,0.61,0.36,1),
+                    bottom 0.18s ease;
+        padding-bottom: var(--igms-safe);
+        box-sizing: border-box;
+      }
+
+      /* ---- Grabber / toolbar ---- */
+      #igms-grabber {
+        flex-shrink: 0;
+        height: ${GRAB_H}px;
+        display: flex; flex-direction: column;
+        justify-content: center; gap: 4px;
+        padding: 0 8px;
+        touch-action: none;             /* stop Android hijacking the drag */
+        user-select: none;
+        -webkit-user-select: none;
+        cursor: grab;
+      }
+      #igms-grabber:active { cursor: grabbing; }
+
+      #igms-handle-bar {
+        width: 38px; height: 4px; border-radius: 4px;
+        background: rgba(255,255,255,0.22);
+        margin: 0 auto 2px;
+        flex-shrink: 0;
+      }
+
+      #igms-toprow {
+        display: flex; align-items: center; gap: 6px;
+        width: 100%;
+      }
+
+      .igms-tabs { display: flex; gap: 4px; flex: 1; min-width: 0; }
+      .igms-tab {
+        flex: 1; min-width: 0;
+        background: var(--igms-surface-2);
+        color: var(--igms-text-dim);
+        border: 1px solid var(--igms-border);
+        border-radius: 8px;
+        padding: 7px 4px;
+        font-size: 11px; font-weight: 600;
+        cursor: pointer;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+        touch-action: manipulation;
+      }
+      .igms-tab.active {
+        background: var(--igms-accent);
+        color: #171208;
+        border-color: var(--igms-accent);
+      }
+
+      .igms-tools { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
+      .igms-tool-btn {
+        background: transparent;
+        border: 1px solid var(--igms-border);
+        color: var(--igms-text-dim);
+        border-radius: 8px;
+        min-width: 34px; height: 32px;
+        font-size: 13px;
+        display: flex; align-items: center; justify-content: center;
+        cursor: pointer;
+        touch-action: manipulation;
+        padding: 0 6px;
+      }
+      .igms-tool-btn:active { background: rgba(255,255,255,0.1); color: var(--igms-accent); }
+      .igms-tool-btn.on { color: var(--igms-accent); border-color: var(--igms-accent); }
+
+      #igms-scale {
+        background: var(--igms-surface-2);
+        color: var(--igms-text-dim);
+        border: 1px solid var(--igms-border);
+        border-radius: 8px;
+        height: 32px; font-size: 10px; padding: 0 2px;
+      }
+
+      /* ---- Body / panes ---- */
+      #igms-body {
+        flex: 1; min-height: 0;
+        overflow: hidden;
+        display: flex;
+        border-top: 1px solid var(--igms-border);
+      }
+      .igms-pane {
+        flex: 1; min-width: 0; min-height: 0;
+        overflow-y: auto;
+        overflow-x: hidden;
+        overscroll-behavior: contain;      /* no scroll-chaining into IG */
+        -webkit-overflow-scrolling: touch;
+        display: none;
+        padding: 8px;
+        box-sizing: border-box;
+      }
+      #igms-sheet[data-tab="left"]  .igms-pane[data-pane="left"],
+      #igms-sheet[data-tab="right"] .igms-pane[data-pane="right"] { display: block; }
+
+      #igms-sheet[data-state="collapsed"] #igms-body { display: none; }
+
+      /* The adopted containers were flex columns inside the sidebars. */
+      .igms-pane #ig-left-menu-container,
+      .igms-pane #ig-right-menu-container {
+        display: flex; flex-direction: column; gap: 10px;
+        padding: 0; height: auto; overflow: visible;
+      }
+
+      .igms-empty {
+        padding: 24px 12px; text-align: center;
+        font-size: 11px; color: var(--igms-text-dim);
+      }
+    `;
+    document.documentElement.appendChild(sheetStyle);
+
+    /* --------------------------------------------------------
+       Compatibility layer.
+       Appended to documentElement (i.e. AFTER every block's own
+       <style> in <head>) so equal-specificity rules win on source
+       order, and !important beats the inline styles set by the
+       pop-out / floating-window modules.
+       -------------------------------------------------------- */
+    const fixStyle = document.createElement('style');
+    fixStyle.id = 'igms-compat-styles';
+    fixStyle.innerHTML = `
+      /* 1. Hide the desktop shell entirely. */
+      body.igms-on #ig-modular-left-panel,
+      body.igms-on #ig-modular-right-panel,
+      body.igms-on #ig-left-toggle-tab,
+      body.igms-on #ig-right-toggle-tab,
+      body.igms-on #ig-left-resizer,
+      body.igms-on #ig-right-resizer,
+      body.igms-on .ig-interactive-handle { display: none !important; }
+
+      /* 2. Neutralise the desktop page-resizer's layout takeover.
+            If resizing was left enabled on desktop it would otherwise
+            squeeze Instagram into a sliver on the phone. */
+      body.igms-on { width: auto !important; height: auto !important; overflow: visible !important; position: static !important; }
+      body.igms-on #react-root,
+      body.igms-on div[data-testid="mw-direct-inbox"],
+      body.igms-on main {
+        position: static !important;
+        left: 0 !important;
+        width: 100% !important;
+        height: auto !important;
+        overflow: visible !important;
+      }
+
+      /* 3. Pop-out floating windows don't belong on a 360dp screen. */
+      body.igms-on .ig-popout-btn { display: none !important; }
+      body.igms-on .ig-floating-modal {
+        left: 3vw !important;
+        width: 94vw !important;
+        max-width: 94vw !important;
+        top: 8vh !important;
+        max-height: 70vh !important;
+      }
+
+      /* 4. Clamp every fixed-width desktop modal to the viewport. */
+      body.igms-on .ig-tlp-modal,
+      body.igms-on .ig-qcx-modal,
+      body.igms-on .ig-mc-modal,
+      body.igms-on .ig-isl-modal,
+      body.igms-on .ig-audio-modal,
+      body.igms-on .ig-profile-floating-window {
+        width: 94vw !important;
+        max-width: 94vw !important;
+        max-height: 82vh !important;
+        overflow-y: auto !important;
+        box-sizing: border-box !important;
+      }
+      body.igms-on .ig-profile-floating-window {
+        left: 3vw !important;
+        top: 8vh !important;
+      }
+
+      /* 5. Finger-sized hit areas without changing icon sizes. */
+      body.igms-on .ig-card-toolbar button,
+      body.igms-on .ig-audio-btn,
+      body.igms-on .ig-tln-btn,
+      body.igms-on .ig-isl-btn,
+      body.igms-on .ig-mc-flow-del,
+      body.igms-on .ig-mc-flow-edit,
+      body.igms-on .ig-hl-btn,
+      body.igms-on .ig-emj-del {
+        min-width: 34px !important;
+        min-height: 34px !important;
+        padding: 6px !important;
+        touch-action: manipulation;
+      }
+      body.igms-on .ig-audio-send-btn,
+      body.igms-on .ig-isl-send-btn,
+      body.igms-on .ig-mc-send-btn {
+        min-height: 34px !important;
+        padding: 6px 12px !important;
+      }
+
+      /* 6. Column resizers are mouse-only -- hide them, they'd only
+            block touch scrolling. Widths keep their saved values. */
+      body.igms-on .ig-audio-col-resizer,
+      body.igms-on .ig-tln-col-resizer { display: none !important; }
+
+      /* 7. Drag grips: tell Android not to treat the gesture as
+            text-selection / scroll before our handlers see it. */
+      body.igms-on .ig-audio-grip,
+      body.igms-on .ig-tln-drag-grip,
+      body.igms-on .ig-isl-grip,
+      body.igms-on .ig-menu-header { touch-action: none; }
+
+      /* 8. Cards: kill the desktop vertical resize nub, cap list heights
+            so a long library can't push the rest off-screen. */
+      body.igms-on .ig-menu-content {
+        resize: none !important;
+        max-height: none !important;
+        padding: 0 10px 10px !important;
+      }
+      body.igms-on .ig-draggable-menu[data-key="text-library-module"] .ig-menu-content {
+        height: auto !important;
+        min-height: 0 !important;
+      }
+      body.igms-on .ig-tln-tree,
+      body.igms-on .ig-audio-lib-tree,
+      body.igms-on .ig-isl-tree,
+      body.igms-on .ig-mc-flow-list {
+        max-height: 46vh !important;
+        flex: none !important;
+      }
+
+      /* 9. Quick Chat textarea: 16px stops Firefox Android from
+            zooming the page on focus. */
+      body.igms-on #ig-quick-chat-input { font-size: 16px !important; }
+      body.igms-on .ig-mc-input,
+      body.igms-on .ig-ub-input,
+      body.igms-on .ig-tlp-input,
+      body.igms-on .ig-isl-input,
+      body.igms-on .ig-hl-input { font-size: 16px !important; }
+
+      /* 10. The rescue button would sit under the sheet grabber. */
+      body.igms-on > button[title^="Click to reset"] {
+        bottom: calc(${GRAB_H}px + 14px + env(safe-area-inset-bottom, 0px)) !important;
+        left: 10px !important;
+        opacity: 0.35 !important;
+      }
+
+      /* 11. Command dropdown: keep it inside the viewport. */
+      body.igms-on .ig-qcx-dropdown {
+        left: 3vw !important;
+        width: 94vw !important;
+        max-width: 94vw !important;
+      }
+
+      /* 12. Touch thumbnail viewer (see shim below). */
+      #igms-thumb-viewer {
+        position: fixed; z-index: 2147483647;
+        max-width: 80vw; max-height: 60vh;
+        border-radius: 10px; padding: 6px;
+        background: #0f172a; border: 1px solid #334155;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.8);
+        display: none; pointer-events: none;
+      }
+      #igms-thumb-viewer img {
+        max-width: 100%; max-height: 100%;
+        object-fit: contain; border-radius: 6px; display: block;
+      }
+    `;
+    document.documentElement.appendChild(fixStyle);
+
+    /* ========================================================
+       3. BUILD THE SHEET
+       ======================================================== */
+    let root, sheet, scrim, grabber, body, paneLeft, paneRight;
+
+    function build() {
+      if (document.getElementById('igms-root')) return;
+
+      root = document.createElement('div');
+      root.id = 'igms-root';
+
+      sheet = document.createElement('div');
+      sheet.id = 'igms-sheet';
+      sheet.dataset.state = prefs.state;
+      sheet.dataset.tab = prefs.tab;
+
+      sheet.innerHTML = `
+        <div id="igms-grabber">
+          <div id="igms-handle-bar"></div>
+          <div id="igms-toprow">
+            <div class="igms-tabs">
+              <button class="igms-tab" data-tab="left">📚 Library</button>
+              <button class="igms-tab" data-tab="right">🤖 Chat</button>
+            </div>
+            <div class="igms-tools">
+              <button class="igms-tool-btn" id="igms-kbd" title="Keyboard auto-focus">⌨️</button>
+              <button class="igms-tool-btn" id="igms-profiles" title="Workspace profiles">⚙️</button>
+              <select id="igms-scale" title="UI size">
+                <option value="85">85%</option>
+                <option value="90">90%</option>
+                <option value="100">100%</option>
+                <option value="110">110%</option>
+              </select>
+              <button class="igms-tool-btn" id="igms-toggle" title="Expand / collapse">▴</button>
+            </div>
+          </div>
+        </div>
+        <div id="igms-body">
+          <div class="igms-pane" data-pane="left"></div>
+          <div class="igms-pane" data-pane="right"></div>
+        </div>
+      `;
+
+      scrim = document.createElement('div');
+      scrim.id = 'igms-scrim';
+
+      root.appendChild(sheet);
+      root.appendChild(scrim);
+      document.body.appendChild(root);
+
+      grabber   = sheet.querySelector('#igms-grabber');
+      body      = sheet.querySelector('#igms-body');
+      paneLeft  = sheet.querySelector('.igms-pane[data-pane="left"]');
+      paneRight = sheet.querySelector('.igms-pane[data-pane="right"]');
+
+      wireTabs();
+      wireTools();
+      wireDrag();
+      wireViewport();
+
+      applyScale();
+      setState(prefs.state, true);
+      syncContainers();
+      startWatchers();
+    }
+
+    /* ========================================================
+       4. CONTAINER ADOPTION
+       Moves (never clones) the Dual Sidebar's containers in.
+       Runs on a heartbeat so a late-building sidebar, or a card
+       moved by the Panel Switcher, is always re-homed correctly.
+       ======================================================== */
+    function syncContainers() {
+      [['left', paneLeft], ['right', paneRight]].forEach(([side, pane]) => {
+        if (!pane) return;
+        let c = document.getElementById('ig-' + side + '-menu-container');
+
+        // Fall back to creating one if the Dual Sidebar block isn't present.
+        if (!c) {
+          c = document.createElement('div');
+          c.id = 'ig-' + side + '-menu-container';
+          c.className = 'ig-panel-body';
+          pane.appendChild(c);
           return;
+        }
+        if (c.parentElement !== pane) pane.appendChild(c);
+
+        // Empty-state hint
+        const hasCards = !!c.querySelector('.ig-draggable-menu');
+        let hint = pane.querySelector('.igms-empty');
+        if (!hasCards && !hint) {
+          hint = document.createElement('div');
+          hint.className = 'igms-empty';
+          hint.textContent = side === 'left'
+            ? 'No library cards here yet.'
+            : 'No chat / automation cards here yet.';
+          pane.appendChild(hint);
+        } else if (hasCards && hint) {
+          hint.remove();
+        }
+      });
+    }
+
+    /* ========================================================
+       5. SNAP STATES + POINTER DRAG
+       ======================================================== */
+    function viewportH() {
+      const vv = window.visualViewport;
+      return Math.round(vv ? vv.height : window.innerHeight);
+    }
+    function heightFor(state) {
+      if (state === 'collapsed') return GRAB_H;
+      if (state === 'full') return Math.round(viewportH() * FULL_F);
+      return Math.round(viewportH() * HALF_F);
+    }
+    function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+    function setState(state, silent) {
+      prefs.state = state;
+      if (state !== 'collapsed') prefs.lastExpanded = state;
+      sheet.dataset.state = state;
+      sheet.style.height = heightFor(state) + 'px';
+      document.body.classList.toggle('igms-full', state === 'full');
+      const t = sheet.querySelector('#igms-toggle');
+      if (t) t.textContent = state === 'collapsed' ? '▴' : '▾';
+      if (!silent) savePrefs();
+    }
+
+    function nearestState(h) {
+      const opts = [
+        ['collapsed', heightFor('collapsed')],
+        ['half',      heightFor('half')],
+        ['full',      heightFor('full')]
+      ];
+      opts.sort((a, b) => Math.abs(a[1] - h) - Math.abs(b[1] - h));
+      return opts[0][0];
+    }
+
+    function wireDrag() {
+      let drag = null;
+
+      grabber.addEventListener('pointerdown', (e) => {
+        if (e.target.closest('button, select, input')) return;
+        drag = {
+          startY: e.clientY,
+          startH: sheet.getBoundingClientRect().height,
+          moved: false
+        };
+        try { grabber.setPointerCapture(e.pointerId); } catch (err) {}
+        sheet.style.transition = 'none';
+      });
+
+      grabber.addEventListener('pointermove', (e) => {
+        if (!drag) return;
+        const dy = drag.startY - e.clientY;          // up = positive = taller
+        if (Math.abs(dy) > 5) drag.moved = true;
+        const maxH = Math.round(viewportH() * FULL_F);
+        sheet.style.height = clamp(drag.startH + dy, GRAB_H, maxH) + 'px';
+      });
+
+      function endDrag(e) {
+        if (!drag) return;
+        sheet.style.transition = '';
+        if (!drag.moved) {
+          // Treat as a tap: toggle open/closed.
+          setState(prefs.state === 'collapsed' ? (prefs.lastExpanded || 'half') : 'collapsed');
+        } else {
+          setState(nearestState(sheet.getBoundingClientRect().height));
+        }
+        drag = null;
+        try { grabber.releasePointerCapture(e.pointerId); } catch (err) {}
+      }
+      grabber.addEventListener('pointerup', endDrag);
+      grabber.addEventListener('pointercancel', endDrag);
+
+      scrim.addEventListener('click', () => setState('half'));
+    }
+
+    /* ========================================================
+       6. VIEWPORT / KEYBOARD HANDLING
+       Firefox Android collapses its address bar on scroll and
+       shrinks the visual viewport when the keyboard opens, so we
+       size against visualViewport rather than vh, and lift the
+       sheet above the keyboard inset.
+       ======================================================== */
+    function wireViewport() {
+      const vv = window.visualViewport;
+
+      function update() {
+        const inset = vv
+          ? Math.max(0, Math.round(window.innerHeight - vv.height - vv.offsetTop))
+          : 0;
+        sheet.style.bottom = inset + 'px';
+        if (prefs.state !== 'collapsed') {
+          sheet.style.height = heightFor(prefs.state) + 'px';
+        }
       }
 
-      // If they are already correctly focused on the Quick Chat, let natural typing happen
-      if (active === qc) return;
-
-      // --- DICTATOR MODE ACTIVATED: STEAL THE KEYSTROKE ---
-      e.preventDefault();
-      e.stopPropagation();
-
-      qc.focus();
-
-      // Programmatically write the key into the Quick Chat
-      if (e.key.length === 1) {
-          qc.setRangeText(e.key, qc.selectionStart, qc.selectionEnd, 'end');
-          qc.dispatchEvent(new Event('input', { bubbles: true }));
-      } else if (e.key === 'Backspace') {
-          if (qc.selectionStart > 0) {
-              const start = qc.selectionStart === qc.selectionEnd ? qc.selectionStart - 1 : qc.selectionStart;
-              qc.setRangeText('', start, qc.selectionEnd, 'end');
-              qc.dispatchEvent(new Event('input', { bubbles: true }));
-          }
-      } else if (e.key === 'Enter') {
-          if (e.shiftKey) {
-              qc.setRangeText('\n', qc.selectionStart, qc.selectionEnd, 'end');
-              qc.dispatchEvent(new Event('input', { bubbles: true }));
-          } else {
-              // Trigger Send
-              const sendBtn = document.getElementById('ig-quick-chat-send');
-              if (sendBtn) sendBtn.click();
-          }
+      if (vv) {
+        vv.addEventListener('resize', update);
+        vv.addEventListener('scroll', update);
       }
-    }, true); // true = Capture phase (Runs BEFORE Instagram)
+      window.addEventListener('orientationchange', () => setTimeout(update, 250));
+      window.addEventListener('resize', update);
+      update();
+    }
 
-    // 3. THE BLACK HOLE PASTE INTERCEPTOR
-    window.addEventListener('paste', (e) => {
-      if (!dictatorMode) return;
-      const qc = getQuickChat();
-      if (!qc) return;
+    /* ========================================================
+       7. TABS + TOOLBAR
+       ======================================================== */
+    function setTab(tab) {
+      prefs.tab = tab;
+      sheet.dataset.tab = tab;
+      sheet.querySelectorAll('.igms-tab').forEach(b => {
+        b.classList.toggle('active', b.dataset.tab === tab);
+      });
+      savePrefs();
+    }
 
-      const active = document.activeElement;
-      const isLegoUI = active && (
-          active.id === 'ig-quick-chat-input' ||
-          active.closest('.ig-draggable-menu') ||
-          active.closest('.ig-floating-modal') ||
-          active.closest('.ig-qcx-modal-overlay') ||
-          active.closest('#ig-profile-floating-window')
-      );
+    function wireTabs() {
+      sheet.querySelectorAll('.igms-tab').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+          e.stopPropagation();
+          setTab(btn.dataset.tab);
+          if (prefs.state === 'collapsed') setState(prefs.lastExpanded || 'half');
+        });
+      });
+      setTab(prefs.tab);
+    }
 
-      if (isLegoUI && active !== qc && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) return;
-      if (active === qc) return;
+    function applyScale() {
+      const b = sheet.querySelector('#igms-body');
+      if (b) b.style.zoom = (prefs.scale / 100);
+      const sel = sheet.querySelector('#igms-scale');
+      if (sel) sel.value = String(prefs.scale);
+    }
 
-      // --- DICTATOR MODE ACTIVATED: STEAL THE PASTE ---
-      e.preventDefault();
-      e.stopPropagation();
+    function wireTools() {
+      sheet.querySelector('#igms-toggle').addEventListener('click', (e) => {
+        e.stopPropagation();
+        setState(prefs.state === 'collapsed' ? (prefs.lastExpanded || 'half')
+               : prefs.state === 'half'      ? 'full'
+               : 'collapsed');
+      });
 
-      const pastedText = (e.clipboardData || window.clipboardData).getData('text');
-      if (pastedText) {
-          qc.focus();
-          qc.setRangeText(pastedText, qc.selectionStart, qc.selectionEnd, 'end');
-          qc.dispatchEvent(new Event('input', { bubbles: true }));
+      sheet.querySelector('#igms-scale').addEventListener('change', (e) => {
+        prefs.scale = parseInt(e.target.value, 10) || 100;
+        applyScale();
+        savePrefs();
+      });
+
+      // Proxy the Profile Manager's button, which lives in the now-hidden
+      // desktop panel header. The element still exists, so click() works.
+      sheet.querySelector('#igms-profiles').addEventListener('click', (e) => {
+        e.stopPropagation();
+        const btn = document.querySelector('#ig-modular-left-panel .ig-profile-btn')
+                 || document.querySelector('#ig-modular-right-panel .ig-profile-btn')
+                 || document.querySelector('.ig-profile-btn');
+        if (btn) btn.click();
+        else alert('Workspace Profiles module is not loaded.');
+      });
+
+      const kbdBtn = sheet.querySelector('#igms-kbd');
+      function paintKbd() {
+        kbdBtn.classList.toggle('on', !prefs.keyboardGuard);
+        kbdBtn.title = prefs.keyboardGuard
+          ? 'Keyboard auto-focus: OFF (tap to enable)'
+          : 'Keyboard auto-focus: ON (tap to disable)';
       }
-    }, true);
+      kbdBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        prefs.keyboardGuard = !prefs.keyboardGuard;
+        savePrefs();
+        paintKbd();
+      });
+      paintKbd();
+    }
 
-    core.emit('block:ready', { id: 'focusSentinelModule' });
+    /* ========================================================
+       8. MOBILE SHIMS FOR EXISTING BLOCKS
+       ======================================================== */
+
+    /* 8a. Quick Chat focus guard.
+       quickChatBoxPlugin installs a global interceptor that grabs
+       keyboard focus on any stray tap or keypress. On a phone that
+       means the soft keyboard flies open constantly.
+
+       We can't remove its listeners from outside the closure, so we
+       shadow the input's .focus() method: programmatic focus is only
+       honoured if the user was genuinely typing there in the last few
+       seconds. That keeps rapid-fire re-focus after sending (which is
+       what enableFocusOverwatch is for) while blocking cold-start
+       focus theft. Real taps focus natively and bypass this entirely. */
+    let lastRealFocus = 0;
+    function installFocusGuard() {
+      const input = document.getElementById('ig-quick-chat-input');
+      if (!input || input.dataset.igmsGuarded === '1') return;
+      input.dataset.igmsGuarded = '1';
+
+      input.addEventListener('focus', () => { lastRealFocus = Date.now(); });
+
+      const nativeFocus = HTMLElement.prototype.focus;
+      input.focus = function () {
+        if (!prefs.keyboardGuard) return nativeFocus.call(input);
+        if (document.activeElement === input) return nativeFocus.call(input);
+        if (Date.now() - lastRealFocus < 6000) return nativeFocus.call(input);
+        // Otherwise: silently ignore the programmatic focus grab.
+      };
+    }
+
+    /* 8b. Thumbnail preview.
+       textLibraryImageManager binds preview to onmousedown/onmouseup
+       only, so it is completely inert on a touchscreen. We add a
+       touch path that reads the same data straight from localStorage. */
+    let thumbViewer = null;
+    function installThumbTouch() {
+      if (thumbViewer) return;
+      thumbViewer = document.createElement('div');
+      thumbViewer.id = 'igms-thumb-viewer';
+      thumbViewer.innerHTML = '<img alt="">';
+      document.body.appendChild(thumbViewer);
+
+      const img = thumbViewer.querySelector('img');
+      const hide = () => { thumbViewer.style.display = 'none'; };
+
+      document.addEventListener('touchstart', (e) => {
+        const btn = e.target.closest && e.target.closest('.ig-tln-thumb-btn');
+        if (!btn) return;
+        const row = btn.closest('.ig-tln-snippet');
+        if (!row) return;
+        let lib;
+        try { lib = JSON.parse(localStorage.getItem('ig_text_library_pro_v1')); } catch (err) { return; }
+        const item = lib && lib.items && lib.items.find(i => i.id === row.dataset.id);
+        if (!item || !item.thumbnail) return;
+
+        e.preventDefault();
+        e.stopPropagation();
+        img.src = item.thumbnail;
+        const t = e.touches[0];
+        thumbViewer.style.left = Math.max(8, Math.min(t.clientX - 120, window.innerWidth - 240)) + 'px';
+        thumbViewer.style.top  = Math.max(8, t.clientY - 260) + 'px';
+        thumbViewer.style.display = 'block';
+      }, { passive: false });
+
+      document.addEventListener('touchend', hide);
+      document.addEventListener('touchcancel', hide);
+    }
+
+    /* ========================================================
+       9. WATCHERS
+       ======================================================== */
+    function startWatchers() {
+      // Show the sheet only inside DMs, mirroring the desktop shell.
+      setInterval(() => {
+        const inDirect = window.location.href.includes('/direct/');
+        document.body.classList.toggle('igms-on', inDirect);
+        if (!inDirect) document.body.classList.remove('igms-full');
+      }, 500);
+
+      // Heartbeat: re-home containers, re-arm shims on rebuilt nodes.
+      setInterval(() => {
+        syncContainers();
+        installFocusGuard();
+      }, 1000);
+
+      installThumbTouch();
+      installFocusGuard();
+    }
+
+    /* ========================================================
+       10. PUBLIC API
+       ======================================================== */
+    core.mobileSheet = {
+      isMobile: true,
+      open:     (tab) => { if (tab) setTab(tab); setState(prefs.lastExpanded || 'half'); },
+      expand:   () => setState('full'),
+      collapse: () => setState('collapsed'),
+      setTab,
+      getState: () => prefs.state
+    };
+
+    // Keep the Dual Sidebar's prefs API shape alive for anything reading it.
+    if (typeof core.getSidebarPrefs !== 'function') {
+      core.getSidebarPrefs = () => ({
+        leftWidth: 0, rightWidth: 0,
+        leftHidden: prefs.tab !== 'left',
+        rightHidden: prefs.tab !== 'right',
+        uiScale: prefs.scale
+      });
+    }
+
+    /* NOTE: deliberately NOT emitting 'sidebar:layout-changed'.
+       igSidebarSyncFeature forwards that event to igPageResizerFeature,
+       which rewrites Instagram's layout for a two-sidebar desktop.
+       On mobile that is exactly what we don't want. */
+
+    if (document.body) build();
+    else document.addEventListener('DOMContentLoaded', build);
+
+    console.log('[MobileSheet] Bottom sheet shell active (Firefox Android profile).');
+    core.emit('block:ready', { id: 'igMobileBottomSheetUI', active: true });
   }
 });
 
