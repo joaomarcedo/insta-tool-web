@@ -1589,10 +1589,10 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Dual Sidebar UI Shell (v4)
+   BLOCK: Dual Sidebar UI Shell (v2)
    ============================================================ */
 /* ============================================================
-   BLOCK: Dual Sidebar UI Shell (Panels Only)
+   BLOCK: Dual Sidebar UI Shell (v5 - with Module Search)
    ============================================================ */
 LegoCore.registerBlock({
   id: 'igDualSidebarUI',
@@ -1680,6 +1680,17 @@ LegoCore.registerBlock({
 
         .ig-panel-title { font-size: 10.5px; font-weight: 600; color: var(--igls-text-dim); text-transform: uppercase; }
 
+        .ig-panel-search { padding: 10px 12px 0 12px; flex-shrink: 0; }
+        .ig-panel-search input {
+          width: 100%; box-sizing: border-box; background: var(--igls-surface-2);
+          color: var(--igls-text); border: 1px solid var(--igls-border);
+          border-radius: 6px; padding: 6px 8px; font-size: 11px; outline: none;
+          transition: border-color 0.2s;
+        }
+        .ig-panel-search input:focus { border-color: var(--igls-accent); }
+
+        .ig-draggable-menu.ig-search-hidden { display: none !important; }
+
         .ig-panel-body {
           padding: 12px; flex: 1; overflow-y: auto; overflow-x: hidden; display: flex; flex-direction: column; gap: 10px;
         }
@@ -1730,6 +1741,9 @@ LegoCore.registerBlock({
           <span class="ig-panel-title">Left</span>
           <button class="ig-hide-btn" id="ig-hide-left-btn">Hide</button>
         </div>
+        <div class="ig-panel-search">
+          <input type="text" id="ig-left-search" placeholder="🔍 Search modules...">
+        </div>
         <div class="ig-panel-body" id="ig-left-menu-container"></div>
       `;
       document.body.appendChild(leftPanel);
@@ -1748,6 +1762,9 @@ LegoCore.registerBlock({
             <option value="110">110%</option>
             <option value="120">120%</option>
           </select>
+        </div>
+        <div class="ig-panel-search">
+          <input type="text" id="ig-right-search" placeholder="🔍 Search modules...">
         </div>
         <div class="ig-panel-body" id="ig-right-menu-container"></div>
       `;
@@ -1791,6 +1808,30 @@ LegoCore.registerBlock({
       window.addEventListener('mouseup', () => {
         if (isResizingLeft || isResizingRight) { isResizingLeft = isResizingRight = false; savePrefs(); notifyChange(); }
       });
+
+      // Module Search Filtering Logic
+      function attachSearchFilter(inputId, containerId) {
+        const input = document.getElementById(inputId);
+        const container = document.getElementById(containerId);
+        if (!input || !container) return;
+
+        input.addEventListener('input', (e) => {
+          const term = e.target.value.toLowerCase();
+          const cards = container.querySelectorAll('.ig-draggable-menu');
+          cards.forEach(card => {
+            const titleEl = card.querySelector('.ig-menu-header span:first-child');
+            const title = titleEl ? titleEl.innerText.toLowerCase() : '';
+            if (title.includes(term)) {
+              card.classList.remove('ig-search-hidden');
+            } else {
+              card.classList.add('ig-search-hidden');
+            }
+          });
+        });
+      }
+
+      attachSearchFilter('ig-left-search', 'ig-left-menu-container');
+      attachSearchFilter('ig-right-search', 'ig-right-menu-container');
 
       startWatcher();
     }
@@ -2282,7 +2323,7 @@ LegoCore.registerBlock({
       // Attach listener to minimize button
       const collapseBtn = header.querySelector('.ig-collapse-btn');
       if (collapseBtn) {
-        collapseBtn.innerText = '−'; 
+        collapseBtn.innerText = '−';
         collapseBtn.addEventListener('click', (e) => {
           e.stopPropagation();
           modal.classList.add('is-iconified');
@@ -2339,10 +2380,10 @@ LegoCore.registerBlock({
       modal.addEventListener('mousedown', (e) => {
         // Only accept left-click and ignore nested buttons (like minimize, dock, etc)
         if (e.button !== 0 || e.target.closest('button')) return;
-        
+
         const isHeaderClick = e.target.closest('.ig-menu-header');
         const isIconified = modal.classList.contains('is-iconified');
-        
+
         // Only start drag if we click the header, OR if the whole window is currently a tiny icon
         if (!isHeaderClick && !isIconified) return;
 
@@ -2362,12 +2403,12 @@ LegoCore.registerBlock({
         if (!isDragging) return;
         const dx = e.clientX - startX;
         const dy = e.clientY - startY;
-        
+
         // If mouse moves more than 3px, we register this as a drag, not a click
         if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
           moved = true;
         }
-        
+
         modal.style.left = (initLeft + dx) + 'px';
         modal.style.top = (initTop + dy) + 'px';
       }
@@ -2379,7 +2420,7 @@ LegoCore.registerBlock({
         document.removeEventListener('mouseup', onMouseUp);
 
         const isIconified = modal.classList.contains('is-iconified');
-        
+
         // If it was a tiny icon and we didn't drag it around, it was a click to Expand
         if (isIconified && !moved) {
           modal.classList.remove('is-iconified');
@@ -2669,15 +2710,15 @@ LegoCore.registerBlock({
     let profileData = {
       activeProfile: 'Default',
       profiles: {
-        'Default': {}, 
+        'Default': {},
         'Quick Message Only': { 'audio-quick': true, 'audio-rec': false, 'audio-lib': false, 'command-center-launcher': false },
         'Studio Workstation': { 'audio-quick': false, 'audio-rec': true, 'audio-lib': true, 'command-center-launcher': true },
         'Library Focus': { 'audio-quick': false, 'audio-rec': false, 'audio-lib': true, 'command-center-launcher': true }
       },
-      hiddenCards: {} 
+      hiddenCards: {}
     };
 
-    let windowPos = { top: 60, left: 90 }; 
+    let windowPos = { top: 60, left: 90 };
 
     try {
       const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
@@ -2852,7 +2893,7 @@ LegoCore.registerBlock({
         if (confirm(`Are you sure you want to delete profile "${current}"?`)) {
           delete profileData.profiles[current];
           profileData.activeProfile = 'Default';
-          profileData.hiddenCards = {}; 
+          profileData.hiddenCards = {};
           applyVisibility(); saveProfiles(); win.remove(); openProfileWindow();
         }
       };
@@ -2938,9 +2979,9 @@ LegoCore.registerBlock({
   id: 'igPageResizerFeature',
   init(core) {
     const STATE_KEY = 'ig_page_resizer_state_v2';
-    
+
     let resizerState = JSON.parse(localStorage.getItem(STATE_KEY)) || {
-      enabled: false, editing: false, leftWidth: 156, rightWidth: 248, leftOffset: null, rightOffset: null 
+      enabled: false, editing: false, leftWidth: 156, rightWidth: 248, leftOffset: null, rightOffset: null
     };
 
     function saveState() {
@@ -2988,7 +3029,7 @@ LegoCore.registerBlock({
         transition: background 0.15s, border-color 0.15s; flex: 1;
       }
       .ig-resizer-code-btn:hover { background: rgba(255,255,255,0.1); border-color: var(--igls-accent, #c9a876); }
-      
+
       /* Precision Controls UI */
       .ig-prec-container {
         font-size: 10px; color: var(--igls-text-dim, #96949c);
@@ -3052,7 +3093,7 @@ LegoCore.registerBlock({
 
     function updateCardUI() {
       const toggleResizingBtn = document.getElementById('ig-toggle-resizing-btn');
-      if (!toggleResizingBtn) return; 
+      if (!toggleResizingBtn) return;
 
       const toggleEditingBtn = document.getElementById('ig-toggle-editing-btn');
       const statusText = document.getElementById('ig-resizer-status-text');
@@ -3065,7 +3106,7 @@ LegoCore.registerBlock({
       toggleEditingBtn.style.color = resizerState.editing ? '#fff' : 'var(--igls-text, #ece9e4)';
       statusText.innerText = `Status: ${resizerState.enabled ? (resizerState.editing ? 'RESIZING ACTIVE (Editing)' : 'RESIZING ACTIVE (Locked)') : 'RESIZING OFF'}`;
       statusText.className = `ig-resizer-status ${resizerState.enabled ? 'is-on' : 'is-off'}`;
-      
+
       valLeft.innerText = resizerState.leftWidth;
       valRight.innerText = resizerState.rightWidth;
     }
@@ -3073,7 +3114,7 @@ LegoCore.registerBlock({
     core.on('profile-window:opened', ({ container }) => {
       const section = document.createElement('div');
       section.className = 'ig-profile-section';
-      
+
       section.innerHTML = `
         <span class="ig-profile-section-title">Webpage Resizer</span>
         <div class="ig-resizer-status ${resizerState.enabled ? 'is-on' : 'is-off'}" id="ig-resizer-status-text">
@@ -3083,17 +3124,17 @@ LegoCore.registerBlock({
           <button class="ig-profile-action-btn" id="ig-toggle-resizing-btn" style="flex:1; padding:8px;"></button>
           <button class="ig-profile-action-btn" id="ig-toggle-editing-btn" style="flex:1; padding:8px;"></button>
         </div>
-        
+
         <!-- Precision Taps & Hold Area -->
         <div class="ig-prec-container">
           <div style="display:flex; align-items:center; gap:4px;">
-            <span style="width:24px;">Left:</span> 
+            <span style="width:24px;">Left:</span>
             <span id="ig-val-left" style="color:#fff; font-weight:bold; width:24px;">${resizerState.leftWidth}</span>
             <button class="ig-prec-btn" data-target="left" data-dir="-1">-</button>
             <button class="ig-prec-btn" data-target="left" data-dir="1">+</button>
           </div>
           <div style="display:flex; align-items:center; gap:4px;">
-            <span style="width:28px;">Right:</span> 
+            <span style="width:28px;">Right:</span>
             <span id="ig-val-right" style="color:#fff; font-weight:bold; width:24px;">${resizerState.rightWidth}</span>
             <button class="ig-prec-btn" data-target="right" data-dir="-1">-</button>
             <button class="ig-prec-btn" data-target="right" data-dir="1">+</button>
@@ -3148,14 +3189,14 @@ LegoCore.registerBlock({
             return;
           }
           e.preventDefault();
-          
+
           adjustWidth(target, dir); // Immediate tap
-          
+
           // Wait 300ms, then rapid continuous adjustment
           holdTimeout = setTimeout(() => {
             holdInterval = setInterval(() => {
               adjustWidth(target, dir);
-            }, 25); 
+            }, 25);
           }, 300);
         };
 
@@ -3217,7 +3258,7 @@ LegoCore.registerBlock({
       if (!activeDragHandle || !resizerState.enabled || !resizerState.editing) return;
       if (activeDragHandle === 'left') resizerState.leftWidth = Math.min(500, Math.max(50, e.clientX));
       else if (activeDragHandle === 'right') resizerState.rightWidth = Math.min(500, Math.max(50, window.innerWidth - e.clientX));
-      
+
       applyPageDimensions();
       updateCardUI();
     });
@@ -3241,7 +3282,7 @@ LegoCore.registerBlock({
     });
 
     if (resizerState.leftOffset === null) {
-      setTimeout(recalculateOffsets, 500); 
+      setTimeout(recalculateOffsets, 500);
     }
     applyPageDimensions();
 
@@ -3369,7 +3410,7 @@ LegoCore.registerBlock({
         chatZone.dispatchEvent(enterEvent);
 
         // Hand over to the Sentinel!
-        core.enableFocusOverwatch(2000); 
+        core.enableFocusOverwatch(2000);
 
       }, 100);
     }
@@ -3990,18 +4031,18 @@ LegoCore.registerBlock({
    ============================================================ */
 /* ============================================================
    BLOCK: Text Library Image Manager (Right-Side Icon & Viewer)
-   - Completely separate extension. 
+   - Completely separate extension.
    - Handles file uploading, compression, and hover viewing.
    ============================================================ */
 LegoCore.registerBlock({
   id: 'textLibraryImageManager',
   init(core) {
     const PRO_KEY = 'ig_text_library_pro_v1';
-    
+
     const style = document.createElement('style');
     style.innerHTML = `
-      .ig-tln-thumb-btn { 
-        background: transparent; border: none; font-size: 11px; cursor: pointer; 
+      .ig-tln-thumb-btn {
+        background: transparent; border: none; font-size: 11px; cursor: pointer;
         padding: 4px; border-radius: 4px; transition: 0.1s; margin-right: 2px;
       }
       .ig-tln-thumb-btn:hover { background: rgba(255,255,255,0.1); }
@@ -4044,24 +4085,24 @@ LegoCore.registerBlock({
       contentArea.querySelectorAll('.ig-tln-snippet').forEach(row => {
         const id = row.dataset.id;
         const item = libraryData.items.find(i => i.id === id);
-        
+
         if (item && item.thumbnail && !row.querySelector('.ig-tln-thumb-btn')) {
           const actionsDiv = row.querySelector('.ig-tln-actions');
           const btn = document.createElement('button');
           btn.className = 'ig-tln-thumb-btn ig-tln-thumb-icon';
           btn.title = 'Hold to view thumbnail';
           btn.innerText = '🖼️';
-          
+
           btn.onmousedown = (e) => {
             e.stopPropagation();
             thumbViewerImg.src = item.thumbnail;
-            thumbViewer.style.left = (e.clientX - 265) + 'px'; 
+            thumbViewer.style.left = (e.clientX - 265) + 'px';
             thumbViewer.style.top = (e.clientY + 10) + 'px';
             thumbViewer.style.display = 'block';
           };
           const hide = () => thumbViewer.style.display = 'none';
           btn.onmouseup = hide; btn.onmouseleave = hide; btn.onclick = e => e.stopPropagation();
-          
+
           actionsDiv.insertBefore(btn, actionsDiv.firstChild);
         }
       });
@@ -4074,11 +4115,11 @@ LegoCore.registerBlock({
             const overlay = node;
             const modal = overlay.querySelector('#ig-tlp-modal-box');
             const tagSection = Array.from(modal.querySelectorAll('div')).find(d => d.innerText.includes('Assign Tags:'));
-            
+
             if (!tagSection || modal.querySelector('#ig-tlc-thumb-upload')) return;
 
             const currentThumb = overlay.dataset.thumbnail || '';
-            
+
             const thumbUI = document.createElement('div');
             thumbUI.innerHTML = `
               <div style="font-size:11px; font-weight:bold; color:#94a3b8; margin-top:4px;">Thumbnail Image (Optional):</div>
@@ -4088,7 +4129,7 @@ LegoCore.registerBlock({
               </div>
               <img id="ig-tlc-thumb-preview" src="${currentThumb}" style="max-height:40px; border-radius:4px; display:${currentThumb ? 'block' : 'none'}; object-fit:contain; margin-top:4px;">
             `;
-            
+
             modal.insertBefore(thumbUI, tagSection);
 
             const upload = thumbUI.querySelector('#ig-tlc-thumb-upload');
@@ -4099,7 +4140,7 @@ LegoCore.registerBlock({
               const file = e.target.files[0];
               if (file) {
                 compressImage(file, 400, (base64) => {
-                  overlay.dataset.thumbnail = base64; 
+                  overlay.dataset.thumbnail = base64;
                   preview.src = base64;
                   preview.style.display = 'block';
                   clear.style.display = 'block';
@@ -4108,7 +4149,7 @@ LegoCore.registerBlock({
             };
 
             clear.onclick = () => {
-              overlay.dataset.thumbnail = 'CLEAR'; 
+              overlay.dataset.thumbnail = 'CLEAR';
               preview.style.display = 'none';
               clear.style.display = 'none';
               upload.value = '';
@@ -4901,7 +4942,7 @@ LegoCore.registerBlock({
 
       function sendImageSet(setObj, btnEl) {
         // UPDATED: Now grabs from the core helper to avoid background ghost elements
-        const chatZone = core.getActiveChatZone(); 
+        const chatZone = core.getActiveChatZone();
         if (!chatZone) { alert("Open an active Instagram chat window first."); return; }
         const original = btnEl.innerText; btnEl.innerText = '⏳';
         const dt = new DataTransfer();
@@ -4924,7 +4965,7 @@ LegoCore.registerBlock({
       // ----------------------------------------------------
       function sendText(text) {
         // UPDATED: Now grabs from the core helper to avoid background ghost elements
-        const chatZone = core.getActiveChatZone(); 
+        const chatZone = core.getActiveChatZone();
         if (!chatZone) { alert("Open an active Instagram chat window first."); return; }
 
         chatZone.focus();
@@ -5267,15 +5308,15 @@ LegoCore.registerBlock({
 
       const observer = new MutationObserver(() => {
         // FIX: Pause observer to prevent infinite loop during DOM appendChild operations
-        observer.disconnect(); 
-        
+        observer.disconnect();
+
         container.querySelectorAll('.ig-draggable-menu').forEach(card => processCard(card, side, container));
         applyStoredOrder(container, side);
-        
+
         // Resume observer after DOM is settled
-        observer.observe(container, { childList: true }); 
+        observer.observe(container, { childList: true });
       });
-      
+
       observer.observe(container, { childList: true });
     }
 
@@ -5293,302 +5334,6 @@ LegoCore.registerBlock({
 
     console.log('[MenuCardReorderModule] Drag-to-reorder enabled and stabilized.');
     core.emit('block:ready', { id: 'menuCardReorderModule' });
-  }
-});
-
-/* ============================================================
-   BLOCK: text sync Google Sheets (v1)
-   ============================================================ */
-/* ============================================================
-   BLOCK: text sync (v3 - Fixed CSP/CORS block via GM_xmlhttpRequest)
-   ============================================================ */
-LegoCore.registerBlock({
-  id: 'textLibrarySheetsSync',
-  init(core) {
-    const PRO_KEY = 'ig_text_library_pro_v1';
-    const LAST_URL_KEY = 'ig_tl_sync_last_url';
-
-    // Helper: Escape CSV fields
-    function escapeCSV(str) {
-      if (str === null || str === undefined) return '""';
-      let escaped = str.toString().replace(/"/g, '""');
-      return `"${escaped}"`;
-    }
-
-    // Helper: Parse raw CSV text into rows and columns
-    function parseCSV(str) {
-      const result = [];
-      let row = [];
-      let inQuotes = false;
-      let val = '';
-      for (let i = 0; i < str.length; i++) {
-        let char = str[i];
-        let nextChar = str[i + 1];
-        if (inQuotes) {
-          if (char === '"' && nextChar === '"') {
-            val += '"';
-            i++;
-          } else if (char === '"') {
-            inQuotes = false;
-          } else {
-            val += char;
-          }
-        } else {
-          if (char === '"') {
-            inQuotes = true;
-          } else if (char === ',') {
-            row.push(val);
-            val = '';
-          } else if (char === '\n' || char === '\r') {
-            if (char === '\r' && nextChar === '\n') i++;
-            row.push(val);
-            result.push(row);
-            row = [];
-            val = '';
-          } else {
-            val += char;
-          }
-        }
-      }
-      if (val !== '' || row.length > 0) {
-        row.push(val);
-        result.push(row);
-      }
-      return result;
-    }
-
-    // Helper: GM_xmlhttpRequest wrapped in a Promise, mirroring the
-    // pattern already used by the ManyChat blocks. Needed because a
-    // plain fetch() from this page's own JS context gets blocked by
-    // Instagram's CSP (connect-src) and would fail CORS anyway, since
-    // Google's CSV export endpoint doesn't allow instagram.com as an
-    // origin. GM_xmlhttpRequest runs outside the page's CSP/CORS jail.
-    function gmFetchText(url) {
-      return new Promise((resolve, reject) => {
-        if (typeof GM_xmlhttpRequest === 'undefined') {
-          reject(new Error('GM_xmlhttpRequest not available. Add @grant GM_xmlhttpRequest to your userscript header.'));
-          return;
-        }
-        GM_xmlhttpRequest({
-          method: 'GET',
-          url: url,
-          onload: function (response) {
-            if (response.status >= 200 && response.status < 300) {
-              resolve(response.responseText);
-            } else {
-              reject(new Error('Request failed with status ' + response.status));
-            }
-          },
-          onerror: function () {
-            reject(new Error('Network error while fetching the sheet.'));
-          },
-          ontimeout: function () {
-            reject(new Error('Request timed out.'));
-          }
-        });
-      });
-    }
-
-    // Modal UI Generator
-    function openSyncModal() {
-      if (document.getElementById('ig-tlc-sync-modal')) return;
-
-      const savedUrl = localStorage.getItem(LAST_URL_KEY) || '';
-
-      const overlay = document.createElement('div');
-      overlay.className = 'ig-tlp-modal-overlay';
-      overlay.id = 'ig-tlc-sync-modal';
-
-      overlay.innerHTML = `
-        <div class="ig-tlp-modal" style="width:400px; max-width:90vw;">
-          <h3>☁️ Google Sheets Sync</h3>
-          
-          <div style="background:rgba(255,255,255,0.05); padding:10px; border-radius:6px; margin-top:4px;">
-            <div style="font-size:11px; color:#94a3b8; margin-bottom:8px;">1. Export your current library to a CSV file to upload into Google Sheets.</div>
-            <button id="ig-sync-export-btn" style="background:#0284c7; color:#fff; border:none; padding:8px 12px; border-radius:4px; font-weight:bold; cursor:pointer; width:100%;">📤 Export to CSV</button>
-          </div>
-
-          <div style="background:rgba(244,63,94,0.05); border:1px solid rgba(244,63,94,0.2); padding:10px; border-radius:6px; margin-top:8px;">
-            <div style="font-size:11px; color:#94a3b8; margin-bottom:8px;">2. Restore from a public Google Sheets URL.<br><span style="color:#f43f5e; font-weight:bold;">⚠️ This overwrites your entire Text Library!</span></div>
-            <input type="text" id="ig-sync-import-url" class="ig-tlp-input" placeholder="https://docs.google.com/spreadsheets/d/.../edit" value="${savedUrl}" style="margin-bottom:8px;">
-            <button id="ig-sync-import-btn" style="background:#dc2626; color:#fff; border:none; padding:8px 12px; border-radius:4px; font-weight:bold; cursor:pointer; width:100%;">📥 Overwrite & Import</button>
-          </div>
-
-          <button id="ig-sync-close-btn" style="background:transparent; color:#94a3b8; border:none; cursor:pointer; font-weight:bold; margin-top:8px; width:100%;">Close</button>
-        </div>
-      `;
-
-      document.body.appendChild(overlay);
-
-      // --- EXPORT LOGIC (unchanged -- this part never touched the network) ---
-      overlay.querySelector('#ig-sync-export-btn').onclick = () => {
-        const data = JSON.parse(localStorage.getItem(PRO_KEY)) || { items: [], tags: [] };
-        
-        const folders = {};
-        data.items.filter(i => i.type === 'folder').forEach(f => folders[f.id] = f.name);
-        
-        const tags = {};
-        data.tags.forEach(t => tags[t.id] = t.name);
-
-        let csvContent = 'Name,Group,Tags,Command,Description\n';
-        
-        data.items.filter(i => i.type === 'snippet').forEach(snip => {
-          const fName = folders[snip.parentId] || 'General';
-          const tNames = (snip.tags || []).map(tid => tags[tid]).filter(Boolean).join('|');
-          
-          const title = escapeCSV(snip.title);
-          const folder = escapeCSV(fName);
-          const tagStr = escapeCSV(tNames);
-          const cmd = escapeCSV(snip.customCommand || '');
-          const desc = escapeCSV(snip.text || '');
-          
-          csvContent += `${title},${folder},${tagStr},${cmd},${desc}\n`;
-        });
-
-        const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = `Text_Library_Backup_${Date.now()}.csv`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-      };
-
-      // --- IMPORT LOGIC (fixed: uses GM_xmlhttpRequest instead of fetch) ---
-      overlay.querySelector('#ig-sync-import-btn').onclick = async () => {
-        const urlInput = overlay.querySelector('#ig-sync-import-url').value.trim();
-        if (!urlInput) return alert("Please enter a Google Sheets URL.");
-
-        // Save URL memory for future sessions
-        localStorage.setItem(LAST_URL_KEY, urlInput);
-
-        // Extract Document ID & Sheet GID
-        const match = urlInput.match(/\/d\/([a-zA-Z0-9-_]+)/);
-        if (!match) return alert("Invalid Google Sheets URL. Make sure you copy the full browser link.");
-        
-        const docId = match[1];
-        const gidMatch = urlInput.match(/gid=([0-9]+)/);
-        const gidParam = gidMatch ? `&gid=${gidMatch[1]}` : '';
-        const fetchUrl = `https://docs.google.com/spreadsheets/d/${docId}/export?format=csv${gidParam}`;
-
-        if (!confirm("⚠️ WARNING: This will permanently DELETE and OVERWRITE your current Text Library with the data from the Google Sheet. Are you absolutely sure?")) {
-            return;
-        }
-
-        const btn = overlay.querySelector('#ig-sync-import-btn');
-        btn.innerText = "⏳ Fetching...";
-        btn.disabled = true;
-
-        try {
-          const csvText = await gmFetchText(fetchUrl);
-
-          if (csvText.includes('<html') && (csvText.includes('sign in') || csvText.includes('ServiceLogin'))) {
-              throw new Error("Sheet is private. Change sharing settings to 'Anyone with the link can view'.");
-          }
-
-          const rows = parseCSV(csvText);
-          if (rows.length < 2) throw new Error("Sheet appears empty or invalid.");
-
-          const newLib = { items: [], tags: [] };
-          const folderMap = {};
-          const tagMap = {};
-
-          const defaultPalette = ['#0095f6', '#2e7d32', '#f77f00', '#9d0208', '#7209b7', '#10b981', '#f43f5e'];
-          let tagColorIndex = 0;
-
-          for (let i = 1; i < rows.length; i++) {
-              const row = rows[i];
-              if (!row || row.length < 1 || !row[0].trim()) continue;
-
-              const title = row[0].trim();
-              const folderName = (row[1] || '').trim() || 'General';
-              const tagsRaw = (row[2] || '').trim();
-              const command = (row[3] || '').trim();
-              const description = (row[4] || row[0] || '').trim();
-
-              // 1. Process Folder
-              if (!folderMap[folderName]) {
-                  const fid = 'fld_' + Date.now() + '_' + i;
-                  folderMap[folderName] = fid;
-                  newLib.items.push({
-                      id: fid, type: 'folder', parentId: 'root', name: folderName, collapsed: false, order: i
-                  });
-              }
-
-              // 2. Process Tags
-              const tagIds = [];
-              if (tagsRaw) {
-                  const splitTags = tagsRaw.split('|').map(t => t.trim()).filter(Boolean);
-                  splitTags.forEach(tName => {
-                      if (!tagMap[tName]) {
-                          const tid = 'tag_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5);
-                          tagMap[tName] = tid;
-                          newLib.tags.push({
-                              id: tid, name: tName, color: defaultPalette[tagColorIndex % defaultPalette.length]
-                          });
-                          tagColorIndex++;
-                      }
-                      tagIds.push(tagMap[tName]);
-                  });
-              }
-
-              // 3. Process Snippet
-              newLib.items.push({
-                  id: 'snip_' + Date.now() + '_' + i,
-                  type: 'snippet',
-                  parentId: folderMap[folderName],
-                  title: title,
-                  text: description,
-                  tags: tagIds,
-                  customCommand: command,
-                  order: i
-              });
-          }
-
-          localStorage.setItem(PRO_KEY, JSON.stringify(newLib));
-          alert("✅ Import successful! Reloading page to apply changes.");
-          window.location.reload();
-
-        } catch (err) {
-          console.error(err);
-          alert("Import failed: " + err.message + "\n\nEnsure Google Sheet sharing is set to 'Anyone with the link can view'.");
-          btn.innerText = "📥 Overwrite & Import";
-          btn.disabled = false;
-        }
-      };
-
-      overlay.querySelector('#ig-sync-close-btn').onclick = () => overlay.remove();
-    }
-
-    // Direct DOM injection helper
-    function attachSyncButton() {
-      const headerBtns = document.querySelector('[data-key="text-library-module"] .ig-tln-header-btns') || document.querySelector('.ig-tln-header-btns');
-      if (headerBtns && !headerBtns.querySelector('#ig-tlc-sync-btn')) {
-        const syncBtn = document.createElement('button');
-        syncBtn.id = 'ig-tlc-sync-btn';
-        syncBtn.className = 'ig-tln-hbtn';
-        syncBtn.innerText = '☁️ Sync';
-        syncBtn.onclick = openSyncModal;
-        headerBtns.appendChild(syncBtn);
-      }
-    }
-
-    // 1. Listen for re-render events
-    core.on('tl:tree-rendered', () => attachSyncButton());
-
-    // 2. Poll/watch DOM directly to handle initialization order race conditions
-    function initWatcher(attempts = 15) {
-      attachSyncButton();
-      if (!document.querySelector('#ig-tlc-sync-btn') && attempts > 0) {
-        setTimeout(() => initWatcher(attempts - 1), 200);
-      }
-    }
-    initWatcher();
-
-    console.log('[TextLibrarySheetsSync] Google Sheets Sync extension loaded (v3: GM_xmlhttpRequest fix).');
-    core.emit('block:ready', { id: 'textLibrarySheetsSync' });
   }
 });
 
@@ -5937,7 +5682,7 @@ LegoCore.registerBlock({
       if (!subscriberId) { showMessage('Set a Target Subscriber ID first.', 'error'); return; }
       const numericId = parseInt(subscriberId, 10);
       if (isNaN(numericId)) { showMessage('Invalid Subscriber ID. Must be a number.', 'error'); return; }
-      
+
       const payload = { subscriber_id: numericId, flow_ns: flow.flow_ns };
       showMessage('Sending "' + flow.name + '"...', null);
       try {
@@ -6189,12 +5934,12 @@ LegoCore.registerBlock({
 
     function fillManyChatTarget(subscriberId) {
       // Isolate memory strictly to THIS specific tab
-      sessionStorage.setItem('mc_target_subscriber_v1', String(subscriberId)); 
-      
+      sessionStorage.setItem('mc_target_subscriber_v1', String(subscriberId));
+
       // Update ALL ghosted and active inputs to ensure complete synchronization
       const allInputs = document.querySelectorAll('#ig-mc-target-input');
       if (!allInputs.length) return false;
-      
+
       allInputs.forEach(input => {
           input.value = String(subscriberId);
           input.dispatchEvent(new Event('input', { bubbles: true }));
@@ -6580,7 +6325,7 @@ LegoCore.registerBlock({
     const resetBtn = document.createElement('button');
     resetBtn.innerText = '⛑️ Reset Menus';
     resetBtn.title = 'Click to reset all floating window positions if they get stuck off-screen';
-    
+
     resetBtn.style.cssText = `
       position: fixed;
       bottom: 12px;
@@ -6613,422 +6358,28 @@ LegoCore.registerBlock({
       if (confirm("Reset all floating menu positions? This will reload the page.")) {
         // 1. Clear Popped-out cards
         localStorage.removeItem('ig_menu_inpage_popouts_v1');
-        
+
         // 2. Clear Workspace Profile window
         localStorage.removeItem('ig_workspace_profile_window_pos_v1');
-        
+
         // 3. Clear Text Library Filter window
         localStorage.removeItem('ig_tl_notion_filter_pos');
-        
+
         // Reload to apply the fresh state
         window.location.reload();
       }
     };
 
     document.body.appendChild(resetBtn);
-    
+
     core.emit('block:ready', { id: 'floatingMenuRescueModule' });
   }
 });
 
 /* ============================================================
-   BLOCK: Image Library (v1)
+   BLOCK: Image Library (v2)
    ============================================================ */
-/* ============================================================
-   BLOCK: Image Sets Library (v1)
-   ============================================================ */
-LegoCore.registerBlock({
-  id: 'imageSetsLibraryModule',
-  init(core) {
-    const DB_NAME = 'IG_ImageSets_Core_DB';
-    const DB_VERSION = 1;
-    let db = null;
-    let draggedItem = null;
 
-    // 1. Initialize IndexedDB
-    const request = indexedDB.open(DB_NAME, DB_VERSION);
-    request.onerror = e => console.error("[ImageSets] DB Error:", e);
-    request.onupgradeneeded = e => {
-      const database = e.target.result;
-      if (!database.objectStoreNames.contains('sets')) {
-        const store = database.createObjectStore('sets', { keyPath: 'id' });
-        store.createIndex('order', 'order', { unique: false });
-      }
-    };
-    request.onsuccess = e => {
-      db = e.target.result;
-      renderTree();
-    };
-
-    // 2. Core Styles
-    const style = document.createElement('style');
-    style.id = 'ig-image-sets-styles';
-    style.innerHTML = `
-      .ig-isl-container { display: flex; flex-direction: column; gap: 8px; font-family: -apple-system, sans-serif; font-size: 11px; flex: 1; min-height: 0; }
-      .ig-isl-header-btns { display: flex; gap: 4px; }
-      .ig-isl-hbtn { flex: 1; background: var(--igls-surface-2, #1c1c23); color: #e2e8f0; border: 1px solid #334155; border-radius: 4px; padding: 6px 4px; font-size: 10px; font-weight: bold; cursor: pointer; transition: 0.2s; text-align: center; }
-      .ig-isl-hbtn:hover { background: #334155; color: #fff; }
-
-      .ig-isl-tree { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; padding-right: 2px; }
-      .ig-isl-tree::-webkit-scrollbar { width: 4px; }
-      .ig-isl-tree::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
-
-      .ig-isl-row { display: flex; align-items: center; padding: 6px 8px; border-bottom: 1px solid rgba(255,255,255,0.03); background: rgba(255,255,255,0.01); cursor: grab; transition: background 0.2s; }
-      .ig-isl-row:hover { background: rgba(255,255,255,0.05); }
-      .ig-isl-row.alt { background: rgba(255,255,255,0.02); }
-      .ig-isl-row:active { cursor: grabbing; }
-
-      .ig-isl-grip { color: #475569; font-size: 10px; cursor: grab; margin-right: 6px; flex-shrink: 0; }
-      .ig-isl-title { flex: 1; font-size: 11px; color: #f8fafc; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
-      .ig-isl-count-badge { font-size: 9px; background: rgba(255,255,255,0.1); color: #c9a876; padding: 2px 6px; border-radius: 8px; font-weight: bold; margin: 0 8px; flex-shrink: 0; }
-
-      .ig-isl-actions { display: flex; gap: 4px; align-items: center; flex-shrink: 0; }
-      .ig-isl-btn { background: transparent; border: none; color: #64748b; cursor: pointer; font-size: 11px; padding: 3px 6px; border-radius: 4px; transition: 0.2s; }
-      .ig-isl-btn:hover { background: rgba(255,255,255,0.1); color: #fff; }
-      .ig-isl-send-btn { background: #10b981; color: #fff; border-radius: 4px; padding: 4px 8px; font-weight: bold; font-size: 10px; }
-      .ig-isl-send-btn:hover { background: #059669; color: #fff; }
-
-      .ig-isl-drop-top { border-top: 2px solid #10b981 !important; }
-      .ig-isl-drop-bottom { border-bottom: 2px solid #10b981 !important; }
-
-      /* Modals */
-      .ig-isl-modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 2147483647; display: flex; justify-content: center; align-items: center; }
-      .ig-isl-modal { background: #0f172a; border: 1px solid #334155; border-radius: 8px; width: 360px; max-height: 90vh; display: flex; flex-direction: column; box-shadow: 0 10px 25px rgba(0,0,0,0.5); overflow: hidden; }
-      .ig-isl-modal-header { padding: 16px; border-bottom: 1px solid #334155; display: flex; justify-content: space-between; align-items: center; }
-      .ig-isl-modal-header h3 { margin: 0; font-size: 14px; color: #fff; }
-      .ig-isl-modal-body { padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; flex: 1; }
-      .ig-isl-modal-footer { padding: 12px 16px; border-top: 1px solid #334155; display: flex; justify-content: space-between; background: #1e293b; }
-
-      .ig-isl-input { width: 100%; background: #1e293b; border: 1px solid #475569; color: #fff; padding: 8px; border-radius: 4px; font-size: 12px; box-sizing: border-box; outline: none; }
-      .ig-isl-input:focus { border-color: #6366f1; }
-      
-      .ig-isl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(70px, 1fr)); gap: 8px; margin-top: 8px; }
-      .ig-isl-thumb-wrap { position: relative; aspect-ratio: 1; background: #1e293b; border: 1px solid #334155; border-radius: 4px; overflow: hidden; }
-      .ig-isl-thumb-wrap img { width: 100%; height: 100%; object-fit: cover; }
-      .ig-isl-thumb-del { position: absolute; top: 2px; right: 2px; background: rgba(220,38,38,0.9); color: #fff; border: none; width: 18px; height: 18px; border-radius: 3px; font-size: 10px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
-      .ig-isl-thumb-del:hover { background: #b91c1c; }
-    `;
-    document.head.appendChild(style);
-
-    // 3. UI Shell
-    const libUI = document.createElement('div');
-    libUI.className = 'ig-isl-container';
-    libUI.innerHTML = `
-      <div class="ig-isl-header-btns">
-        <button id="ig-isl-new-set" class="ig-isl-hbtn">➕ New Image Set</button>
-      </div>
-      <div id="ig-isl-tree" class="ig-isl-tree"></div>
-    `;
-
-    // 4. Compression Helper
-    function compressThumbnail(file, maxSize = 200) {
-      return new Promise((resolve) => {
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          const img = new Image();
-          img.onload = () => {
-            const canvas = document.createElement('canvas');
-            let w = img.width, h = img.height;
-            if (w > maxSize || h > maxSize) {
-              const ratio = Math.min(maxSize / w, maxSize / h);
-              w *= ratio; h *= ratio;
-            }
-            canvas.width = w; canvas.height = h;
-            canvas.getContext('2d').drawImage(img, 0, 0, w, h);
-            resolve(canvas.toDataURL('image/jpeg', 0.6));
-          };
-          img.src = e.target.result;
-        };
-        reader.readAsDataURL(file);
-      });
-    }
-
-    // 5. Editor Modal
-    function openSetEditor(existingSet) {
-      const isEdit = !!existingSet;
-      // Copy array so we can safely edit drafts without affecting the DB until Save
-      let draftImages = isEdit ? [...existingSet.images] : []; 
-      
-      const overlay = document.createElement('div');
-      overlay.className = 'ig-isl-modal-overlay';
-      overlay.innerHTML = `
-        <div class="ig-isl-modal">
-          <div class="ig-isl-modal-header">
-            <h3>${isEdit ? '✏️ Edit Image Set' : '🖼️ New Image Set'}</h3>
-            <button id="ig-isl-close" style="background:none; border:none; color:#94a3b8; cursor:pointer;">✕</button>
-          </div>
-          <div class="ig-isl-modal-body">
-            <div>
-              <div style="font-size:11px; font-weight:bold; color:#94a3b8; margin-bottom:4px;">Set Title:</div>
-              <input type="text" id="ig-isl-title" class="ig-isl-input" placeholder="e.g. Welcome Package..." value="${isEdit ? existingSet.title : ''}">
-            </div>
-            <div>
-              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
-                <div style="font-size:11px; font-weight:bold; color:#94a3b8;">Images: <span id="ig-isl-count">0</span></div>
-                <button id="ig-isl-add-imgs" style="background:#334155; color:#fff; border:none; padding:4px 8px; border-radius:4px; font-size:10px; cursor:pointer;">➕ Add Files</button>
-                <input type="file" id="ig-isl-file-input" accept="image/*" multiple style="display:none;">
-              </div>
-              <div id="ig-isl-grid" class="ig-isl-grid"></div>
-            </div>
-          </div>
-          <div class="ig-isl-modal-footer">
-            <div style="display:flex; gap:8px;">
-              ${isEdit ? '<button id="ig-isl-delete" style="background:#dc2626; color:#fff; border:none; padding:6px 12px; border-radius:4px; font-weight:bold; cursor:pointer;">🗑️ Delete Set</button>' : '<div></div>'}
-            </div>
-            <div style="display:flex; gap:8px;">
-              <button id="ig-isl-cancel" style="background:transparent; color:#94a3b8; border:none; cursor:pointer; font-weight:bold;">Cancel</button>
-              <button id="ig-isl-save" style="background:#6366f1; color:#fff; border:none; padding:6px 12px; border-radius:4px; font-weight:bold; cursor:pointer;">💾 Save</button>
-            </div>
-          </div>
-        </div>
-      `;
-      document.body.appendChild(overlay);
-
-      const gridEl = overlay.querySelector('#ig-isl-grid');
-      const countEl = overlay.querySelector('#ig-isl-count');
-      const titleInput = overlay.querySelector('#ig-isl-title');
-      const fileInput = overlay.querySelector('#ig-isl-file-input');
-
-      function renderGrid() {
-        gridEl.innerHTML = '';
-        countEl.innerText = draftImages.length;
-        draftImages.forEach((imgObj, idx) => {
-          const wrap = document.createElement('div');
-          wrap.className = 'ig-isl-thumb-wrap';
-          wrap.innerHTML = `
-            <img src="${imgObj.thumb}" alt="thumb">
-            <button class="ig-isl-thumb-del" data-idx="${idx}">✕</button>
-          `;
-          wrap.querySelector('.ig-isl-thumb-del').onclick = () => {
-            draftImages.splice(idx, 1);
-            renderGrid();
-          };
-          gridEl.appendChild(wrap);
-        });
-      }
-      renderGrid();
-
-      overlay.querySelector('#ig-isl-add-imgs').onclick = () => fileInput.click();
-
-      fileInput.onchange = async (e) => {
-        const files = Array.from(e.target.files);
-        if (!files.length) return;
-        const addBtn = overlay.querySelector('#ig-isl-add-imgs');
-        addBtn.innerText = '⏳ Processing...';
-        addBtn.disabled = true;
-
-        for (let file of files) {
-          const thumb = await compressThumbnail(file);
-          draftImages.push({
-            id: 'img_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5),
-            type: file.type,
-            blob: file,
-            thumb: thumb
-          });
-        }
-        fileInput.value = '';
-        addBtn.innerText = '➕ Add Files';
-        addBtn.disabled = false;
-        renderGrid();
-      };
-
-      const closeModal = () => overlay.remove();
-      overlay.querySelector('#ig-isl-close').onclick = closeModal;
-      overlay.querySelector('#ig-isl-cancel').onclick = closeModal;
-
-      if (isEdit) {
-        overlay.querySelector('#ig-isl-delete').onclick = () => {
-          if (!confirm("Permanently delete this entire image set?")) return;
-          const tx = db.transaction(['sets'], 'readwrite');
-          tx.objectStore('sets').delete(existingSet.id);
-          tx.oncomplete = () => { renderTree(); closeModal(); };
-        };
-      }
-
-      overlay.querySelector('#ig-isl-save').onclick = () => {
-        const title = titleInput.value.trim() || 'Untitled Set';
-        if (!draftImages.length) {
-          alert("Please add at least one image to save a set.");
-          return;
-        }
-        const tx = db.transaction(['sets'], 'readwrite');
-        const store = tx.objectStore('sets');
-        
-        if (isEdit) {
-          existingSet.title = title;
-          existingSet.images = draftImages;
-          store.put(existingSet);
-        } else {
-          const countReq = store.count();
-          countReq.onsuccess = () => {
-            store.add({
-              id: 'set_' + Date.now(),
-              title: title,
-              images: draftImages,
-              order: countReq.result
-            });
-          };
-        }
-        tx.oncomplete = () => { renderTree(); closeModal(); };
-      };
-    }
-
-    libUI.querySelector('#ig-isl-new-set').onclick = () => openSetEditor(null);
-
-    // 6. Preview Modal (Read Only)
-    function openPreviewModal(setObj) {
-      const overlay = document.createElement('div');
-      overlay.className = 'ig-isl-modal-overlay';
-      
-      const thumbsHtml = setObj.images.map(img => 
-        `<div class="ig-isl-thumb-wrap"><img src="${img.thumb}" alt="thumb"></div>`
-      ).join('');
-
-      overlay.innerHTML = `
-        <div class="ig-isl-modal">
-          <div class="ig-isl-modal-header">
-            <h3>👁️ Preview: ${setObj.title}</h3>
-            <button id="ig-isl-close-prev" style="background:none; border:none; color:#94a3b8; cursor:pointer;">✕</button>
-          </div>
-          <div class="ig-isl-modal-body">
-            <div class="ig-isl-grid">${thumbsHtml}</div>
-          </div>
-        </div>
-      `;
-      document.body.appendChild(overlay);
-      
-      const close = () => overlay.remove();
-      overlay.querySelector('#ig-isl-close-prev').onclick = close;
-      overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
-    }
-
-    // 7. Drag & Drop Reordering Logic
-    function handleDragStart(e, id) { 
-      draggedItem = id; 
-      e.dataTransfer.effectAllowed = 'move'; 
-      setTimeout(() => e.target.style.opacity = '0.3', 0); 
-    }
-    function handleDragOver(e, id) {
-      e.preventDefault(); e.stopPropagation();
-      const targetEl = e.currentTarget;
-      document.querySelectorAll('.ig-isl-drop-top, .ig-isl-drop-bottom').forEach(el => el.classList.remove('ig-isl-drop-top', 'ig-isl-drop-bottom'));
-      if (!draggedItem || draggedItem === id) return;
-      const rect = targetEl.getBoundingClientRect(); 
-      const y = e.clientY - rect.top; 
-      if (y < rect.height / 2) targetEl.classList.add('ig-isl-drop-top');
-      else targetEl.classList.add('ig-isl-drop-bottom');
-    }
-    function handleDrop(e, targetId) {
-      e.preventDefault(); e.stopPropagation();
-      if (!draggedItem || draggedItem === targetId) return;
-      
-      const targetEl = e.currentTarget; 
-      const rect = targetEl.getBoundingClientRect(); 
-      const y = e.clientY - rect.top; 
-      
-      const tx = db.transaction(['sets'], 'readwrite');
-      const store = tx.objectStore('sets');
-      store.getAll().onsuccess = ev => {
-        const sets = ev.target.result.sort((a,b) => (a.order || 0) - (b.order || 0));
-        const dragIdx = sets.findIndex(s => s.id === draggedItem);
-        const targetIdx = sets.findIndex(s => s.id === targetId);
-        
-        if (dragIdx > -1 && targetIdx > -1) {
-          const [moved] = sets.splice(dragIdx, 1);
-          if (y < rect.height / 2) sets.splice(targetIdx, 0, moved); // Drop top
-          else sets.splice(targetIdx + 1, 0, moved); // Drop bottom
-          
-          sets.forEach((s, i) => { s.order = i; store.put(s); });
-        }
-      };
-      tx.oncomplete = () => { draggedItem = null; renderTree(); };
-    }
-
-    // 8. Injection Send Engine
-    function sendImageSet(setObj, btnEl) {
-      const chatZone = document.querySelector('div[contenteditable="true"]') || document.querySelector('form');
-      if (!chatZone) { alert("Open an active Instagram chat window first."); return; }
-
-      btnEl.innerText = '⏳';
-      const dt = new DataTransfer();
-
-      setObj.images.forEach((imgData, i) => {
-        const ext = imgData.type ? imgData.type.split('/')[1] : 'jpeg';
-        const fileObj = new File([imgData.blob], `image_${i}.${ext}`, { type: imgData.type || 'image/jpeg' });
-        dt.items.add(fileObj);
-      });
-
-      ['dragenter', 'dragover', 'drop'].forEach(eventType => {
-        chatZone.dispatchEvent(new DragEvent(eventType, {
-          bubbles: true, cancelable: true, dataTransfer: dt
-        }));
-      });
-
-      setTimeout(() => { btnEl.innerText = '✅'; setTimeout(() => btnEl.innerText = '📤 Send', 1000); }, 200);
-    }
-
-    // 9. Main Render
-    function renderTree() {
-      if (!db) return;
-      const tree = libUI.querySelector('#ig-isl-tree');
-      tree.innerHTML = '';
-
-      const tx = db.transaction(['sets'], 'readonly');
-      tx.objectStore('sets').getAll().onsuccess = e => {
-        const sets = (e.target.result || []).sort((a,b) => (a.order || 0) - (b.order || 0));
-        
-        if (!sets.length) {
-          tree.innerHTML = '<div style="padding:12px; color:#94a3b8; font-size:10px; text-align:center;">No Image Sets yet. Click New to bundle images together.</div>';
-          return;
-        }
-
-        sets.forEach((set, idx) => {
-          const row = document.createElement('div');
-          row.className = `ig-isl-row ${idx % 2 === 0 ? 'alt' : ''}`;
-          row.draggable = true;
-
-          row.innerHTML = `
-            <span class="ig-isl-grip">⠿</span>
-            <span class="ig-isl-title" title="${set.title}">${set.title}</span>
-            <span class="ig-isl-count-badge">🖼️ ${set.images.length}</span>
-            <div class="ig-isl-actions">
-              <button class="ig-isl-btn prev-btn" title="Preview Contents">👁️</button>
-              <button class="ig-isl-btn edit-btn" title="Edit Set">✏️</button>
-              <button class="ig-isl-send-btn" title="Send all images in this set">📤 Send</button>
-            </div>
-          `;
-
-          // Drag Bindings
-          row.addEventListener('dragstart', (ev) => handleDragStart(ev, set.id));
-          row.addEventListener('dragend', (ev) => { ev.target.style.opacity = '1'; draggedItem = null; });
-          row.addEventListener('dragover', (ev) => handleDragOver(ev, set.id));
-          row.addEventListener('dragleave', (ev) => ev.currentTarget.classList.remove('ig-isl-drop-top', 'ig-isl-drop-bottom'));
-          row.addEventListener('drop', (ev) => handleDrop(ev, set.id));
-
-          // Action Bindings
-          row.querySelector('.prev-btn').onclick = () => openPreviewModal(set);
-          row.querySelector('.edit-btn').onclick = () => openSetEditor(set);
-          row.querySelector('.ig-isl-send-btn').onclick = (ev) => sendImageSet(set, ev.target);
-
-          tree.appendChild(row);
-        });
-      };
-    }
-
-    // 10. Mount to Sidebar
-    function mountCard(attemptsLeft = 10) {
-      if (typeof core.registerMenu === 'function') {
-        core.registerMenu('left', '🖼️ Image Sets', libUI, '⠿', 'image-sets-library');
-        console.log('[ImageSetsLibrary] Grouped List UI loaded.');
-      } else if (attemptsLeft > 0) {
-        setTimeout(() => mountCard(attemptsLeft - 1), 200);
-      }
-    }
-    mountCard();
-
-    core.emit('block:ready', { id: 'imageSetsLibraryModule' });
-  }
-});
 
 /* ============================================================
    BLOCK: Emoji Module (v1)
@@ -7040,7 +6391,7 @@ LegoCore.registerBlock({
   id: 'emojiSettingsModule',
   init(core) {
     const STORAGE_KEY = 'ig_emoji_dict_v1';
-    
+
     const defaultEmojis = [
       { e: '😀', k: 'happy' }, { e: '😂', k: 'laugh' }, { e: '🤣', k: 'rofl' },
       { e: '😍', k: 'hearteyes' }, { e: '🥰', k: 'love' }, { e: '😊', k: 'smile' },
@@ -7119,12 +6470,12 @@ LegoCore.registerBlock({
       const eVal = wrap.querySelector('#ig-emj-val').value.trim();
       const kVal = wrap.querySelector('#ig-emj-key').value.trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
       if (!eVal || !kVal) return alert('Provide both an emoji and a keyword (no spaces).');
-      
+
       // Check if keyword already exists
       const existing = dict.findIndex(i => i.k === kVal);
       if (existing > -1) dict[existing].e = eVal;
       else dict.unshift({ e: eVal, k: kVal });
-      
+
       saveDict();
       wrap.querySelector('#ig-emj-val').value = '';
       wrap.querySelector('#ig-emj-key').value = '';
@@ -7145,7 +6496,7 @@ LegoCore.registerBlock({
       }
     }
     mountCard();
-    
+
     // Send initial payload out just in case QC loads after
     setTimeout(() => core.emit('emoji:updated', dict), 500);
 
@@ -7157,7 +6508,7 @@ LegoCore.registerBlock({
    BLOCK: Bunny.net Sync (v2)
    ============================================================ */
 /* ============================================================
-   BLOCK: Audio Bunny.net Sync (v2 - Smart Sync)
+   BLOCK: Audio Bunny.net Sync (v4 - Bulletproof Skeleton Sync)
    ============================================================ */
 LegoCore.registerBlock({
   id: 'audioBunnySyncModule',
@@ -7166,6 +6517,18 @@ LegoCore.registerBlock({
     let prefs = JSON.parse(localStorage.getItem(BUNNY_PREFS_KEY)) || { zoneName: '', apiKey: '', region: 'default' };
 
     function savePrefs() { localStorage.setItem(BUNNY_PREFS_KEY, JSON.stringify(prefs)); }
+
+    // Helper to format actual file names for the URL
+    function safeString(str) {
+        return (str || 'Untitled').replace(/[^a-zA-Z0-9-_ \u00C0-\u017F]/g, '_').trim();
+    }
+
+    // NEW: Skeleton key generator to completely bypass case/space/punctuation mismatch loops
+    function compareKey(folder, name) {
+        const f = (folder || 'General').toLowerCase().replace(/[^a-z0-9\u00C0-\u017F]/g, '');
+        const n = (name || 'untitled').toLowerCase().replace(/[^a-z0-9\u00C0-\u017F]/g, '');
+        return `${f}||${n}`;
+    }
 
     function blobToArrayBuffer(blob) {
         return new Promise((resolve, reject) => {
@@ -7180,7 +6543,7 @@ LegoCore.registerBlock({
       return new Promise((resolve, reject) => {
         if (!prefs.zoneName || !prefs.apiKey) return reject(new Error('Missing credentials.'));
         const endpoint = prefs.region === 'default' ? 'storage.bunnycdn.com' : `${prefs.region}.storage.bunnycdn.com`;
-        
+
         const cleanPath = path ? path.replace(/^\/+/, '') : '';
         const url = `https://${endpoint}/${prefs.zoneName}/ig_audio_backup/${cleanPath}`;
 
@@ -7214,7 +6577,7 @@ LegoCore.registerBlock({
                 reqOpts.headers['Content-Type'] = 'application/json';
             }
         }
-        
+
         if (responseType) reqOpts.responseType = responseType;
 
         if (typeof GM_xmlhttpRequest !== 'undefined') {
@@ -7230,7 +6593,7 @@ LegoCore.registerBlock({
         try {
             const rootItems = await bunnyRequest('GET', '');
             if (!Array.isArray(rootItems)) return inventory;
-            
+
             for (let item of rootItems) {
                 if (item.IsDirectory) {
                     const folderItems = await bunnyRequest('GET', encodeURIComponent(item.ObjectName) + '/');
@@ -7254,7 +6617,7 @@ LegoCore.registerBlock({
                 }
             }
         } catch (e) {
-            if (e.message.includes('404')) return []; // Directory doesn't exist yet
+            if (e.message.includes('404')) return [];
             throw e;
         }
         return inventory;
@@ -7287,16 +6650,16 @@ LegoCore.registerBlock({
       if (document.getElementById('ig-bunny-sync-modal')) return;
 
       const overlay = document.createElement('div');
-      overlay.className = 'ig-tlp-modal-overlay'; 
+      overlay.className = 'ig-tlp-modal-overlay';
       overlay.id = 'ig-bunny-sync-modal';
 
       overlay.innerHTML = `
         <div class="ig-tlp-modal" style="width:380px;">
           <h3>🐰 Bunny.net Audio Smart Sync</h3>
-          
+
           <div style="font-size:11px; color:#94a3b8; margin-top:8px;">Storage Zone Name</div>
           <input type="text" id="ig-bunny-zone" class="ig-tlp-input" placeholder="e.g. my-audio-zone" value="${prefs.zoneName}">
-          
+
           <div style="font-size:11px; color:#94a3b8; margin-top:8px;">Storage Zone Password (API Key)</div>
           <input type="password" id="ig-bunny-key" class="ig-tlp-input" placeholder="Paste password..." value="${prefs.apiKey}">
 
@@ -7371,11 +6734,12 @@ LegoCore.registerBlock({
             const localClips = await getLocalClips();
             const cloudInventory = await getCloudInventory();
 
-            const localKeys = new Set(localClips.map(c => `${c.folder}||${c.name}`));
-            const cloudKeys = new Set(cloudInventory.map(c => `${c.folder}||${c.name}`));
+            // FIXED: Uses the Alphanumeric Skeleton Key for perfect mapping
+            const localKeys = new Set(localClips.map(c => compareKey(c.folder, c.name)));
+            const cloudKeys = new Set(cloudInventory.map(c => compareKey(c.folder, c.name)));
 
-            const toUpload = localClips.filter(c => !cloudKeys.has(`${c.folder}||${c.name}`));
-            const toDelete = cloudInventory.filter(c => !localKeys.has(`${c.folder}||${c.name}`));
+            const toUpload = localClips.filter(c => !cloudKeys.has(compareKey(c.folder, c.name)));
+            const toDelete = cloudInventory.filter(c => !localKeys.has(compareKey(c.folder, c.name)));
 
             if (!toUpload.length && !toDelete.length) {
                 return unlockUI('✅ Everything is already up to date!');
@@ -7390,8 +6754,8 @@ LegoCore.registerBlock({
                 lockUI(`☁️ Uploading new clip ${i + 1} of ${toUpload.length}...`);
                 const clip = toUpload[i];
                 const arrayBuffer = await blobToArrayBuffer(clip.blob);
-                const safeFolder = clip.folder.replace(/[^a-zA-Z0-9-_ \u00C0-\u017F]/g, '_');
-                const safeName = clip.name.replace(/[^a-zA-Z0-9-_ \u00C0-\u017F]/g, '_');
+                const safeFolder = safeString(clip.folder);
+                const safeName = safeString(clip.name);
                 const path = `${encodeURIComponent(safeFolder)}/${encodeURIComponent(safeName)}.m4a`;
                 await bunnyRequest('PUT', path, arrayBuffer);
                 await new Promise(r => setTimeout(r, 100)); // Rate limit buffer
@@ -7413,8 +6777,9 @@ LegoCore.registerBlock({
             const localClips = await getLocalClips();
             const cloudInventory = await getCloudInventory();
 
-            const localKeys = new Set(localClips.map(c => `${c.folder}||${c.name}`));
-            const toDownload = cloudInventory.filter(c => !localKeys.has(`${c.folder}||${c.name}`));
+            // FIXED: Uses the Alphanumeric Skeleton Key to prevent duplicate downloads
+            const localKeys = new Set(localClips.map(c => compareKey(c.folder, c.name)));
+            const toDownload = cloudInventory.filter(c => !localKeys.has(compareKey(c.folder, c.name)));
 
             if (!toDownload.length) {
                 return unlockUI('✅ Local library is fully synced. No missing files.');
@@ -7424,7 +6789,7 @@ LegoCore.registerBlock({
                 lockUI(`📥 Downloading clip ${i + 1} of ${toDownload.length}: ${toDownload[i].name}...`);
                 const c = toDownload[i];
                 const blob = await bunnyRequest('GET', c.path, null, 'blob');
-                
+
                 await saveClipToLocalDB({
                     name: c.name,
                     folder: c.folder,
@@ -7465,8 +6830,8 @@ LegoCore.registerBlock({
                 lockUI(`☁️ Pushing local library (${i + 1} of ${localClips.length})...`);
                 const clip = localClips[i];
                 const arrayBuffer = await blobToArrayBuffer(clip.blob);
-                const safeFolder = clip.folder.replace(/[^a-zA-Z0-9-_ \u00C0-\u017F]/g, '_');
-                const safeName = clip.name.replace(/[^a-zA-Z0-9-_ \u00C0-\u017F]/g, '_');
+                const safeFolder = safeString(clip.folder);
+                const safeName = safeString(clip.name);
                 const path = `${encodeURIComponent(safeFolder)}/${encodeURIComponent(safeName)}.m4a`;
                 await bunnyRequest('PUT', path, arrayBuffer);
                 await new Promise(r => setTimeout(r, 100));
@@ -7490,7 +6855,7 @@ LegoCore.registerBlock({
         btn.style.marginLeft = '8px';
         btn.style.color = '#10b981';
         btn.onclick = openBunnyModal;
-        
+
         headerBtns.insertBefore(btn, headerBtns.children[1]);
       }
     }
@@ -7511,799 +6876,149 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Mobile UI (v1)
+   BLOCK: Mobile Core (v1)
    ============================================================ */
 /* ============================================================
-   BLOCK: Mobile Bottom Sheet UI Shell (v1)
+   BLOCK: Mobile Core (v2)   [replaces your existing block 1]
    ------------------------------------------------------------
-   A drop-in mobile replacement for the Dual Sidebar UI Shell,
-   built for Firefox on Android (tested target: Galaxy S22, ~360dp).
+   Foundation block for all mobile UI variants. Owns:
 
-   HOW IT WORKS
-   Rather than building its own menu containers (which would create
-   duplicate #ig-left-menu-container / #ig-right-menu-container IDs
-   and break core.registerMenu), this block ADOPTS the containers the
-   Dual Sidebar already created and physically moves those DOM nodes
-   into a bottom sheet.
+     core.isMobile        -> boolean, read this in ANY future block
+     core.mobilePrefs     -> shared, persisted settings (shell, zoom,
+                             tab, keyboardGuard, sheet-only state)
+     core.mobileConst     -> shared layout / zoom numbers
+     core.mobileKeyboard  -> { isOpen() }, plus 'mobile:keyboard-open'
+                             / 'mobile:keyboard-close' events on the
+                             core event bus
 
-   Because the nodes themselves are reused:
-     - core.registerMenu('left'|'right', ...) keeps working unchanged
-     - menuCollapseModule, menuPanelSwitcherModule,
-       menuCardReorderModule, headerToolbarOrganizerModule and
-       profileManagerModule keep working -- their MutationObservers
-       are bound to the element, not to its position in the page
-     - EVERY existing and future feature block mounts on mobile with
-       zero code changes, as long as it mounts via core.registerMenu
+   SHELL SELECTION
+   core.mobilePrefs.get().shell is 'sheet' | 'drawer' | 'fullscreen'.
+   Each shell block (igMobileSheetUI, igMobileDrawerUI,
+   igMobileFullscreenUI) checks this itself and does nothing if it
+   isn't the selected one -- so all three can sit in the same script
+   at once, and you flip between them from the Mobile UI Lab card
+   instead of commenting blocks in and out.
 
-   WHAT IT ADDS
-     - core.isMobile           -> boolean, read this in future blocks
-     - core.mobileSheet        -> { open, collapse, expand, setTab, isMobile }
+   KEYBOARD DETECTION, NOT REACTION
+   This block only detects the keyboard and emits events. What to DO
+   about it (collapse, close, resize, ignore) is each shell's own
+   decision, because the right reaction differs by shell -- see the
+   comments in each shell block.
 
-   PLACEMENT
-   Register this block AFTER 'igDualSidebarUI' (i.e. paste it near the
-   end of the compiled script). On desktop it detects that it isn't
-   needed and returns immediately, leaving the sidebars alone.
+   REGISTER THIS FIRST, before any other mobile block.
 
    TESTING ON DESKTOP
-   localStorage.setItem('ig_force_mobile_v1','1')  -> force mobile shell
-   localStorage.setItem('ig_force_mobile_v1','0')  -> force desktop shell
-   localStorage.removeItem('ig_force_mobile_v1')   -> auto-detect
+     localStorage.setItem('ig_force_mobile_v1','1')  -> force mobile
+     localStorage.setItem('ig_force_mobile_v1','0')  -> force desktop
+     localStorage.removeItem('ig_force_mobile_v1')   -> auto-detect
    ============================================================ */
 LegoCore.registerBlock({
-  id: 'igMobileBottomSheetUI',
+  id: 'mobileCore',
   init(core) {
-
-    /* ========================================================
-       0. MOBILE DETECTION
-       ======================================================== */
     const FORCE_KEY = 'ig_force_mobile_v1';
     const PREF_KEY  = 'ig_mobile_sheet_v1';
 
-    const forced    = localStorage.getItem(FORCE_KEY);
-    const uaMobile  = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
-    const narrow    = window.matchMedia('(max-width: 820px)').matches;
-    const isMobile  = forced === '1' ? true
-                    : forced === '0' ? false
-                    : (uaMobile || narrow);
-
-    // Exposed so any future block can branch on it.
-    core.isMobile = isMobile;
-
-    if (!isMobile) {
-      console.log('[MobileSheet] Desktop detected -- mobile shell inactive.');
-      core.emit('block:ready', { id: 'igMobileBottomSheetUI', active: false });
-      return;
+    /* ---------- Detection ---------- */
+    function detect() {
+      const forced = localStorage.getItem(FORCE_KEY);
+      if (forced === '1') return true;
+      if (forced === '0') return false;
+      const uaMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent);
+      const narrow   = window.matchMedia('(max-width: 820px)').matches;
+      return uaMobile || narrow;
     }
+    core.isMobile = detect();
 
-    /* ========================================================
-       1. PREFERENCES
-       ======================================================== */
-    let prefs = {
-      state: 'half',          // 'collapsed' | 'half' | 'full'
-      lastExpanded: 'half',   // remembered so the grabber tap restores it
-      tab: 'left',            // 'left' | 'right'
-      scale: 100,             // UI zoom inside the sheet
-      keyboardGuard: true     // suppress Quick Chat's focus-stealing
+    /* ---------- Shared layout / zoom constants ---------- */
+    core.mobileConst = {
+      GRAB_H: 54,     // sheet: collapsed handle height, px
+      HALF_F: 0.52,   // sheet: "half open" as a fraction of viewport height
+      FULL_F: 0.92,   // sheet: "full open"  as a fraction of viewport height
+      ZOOM_MIN: 60,
+      ZOOM_MAX: 140,
+      ZOOM_STEP: 10
     };
-    try { Object.assign(prefs, JSON.parse(localStorage.getItem(PREF_KEY)) || {}); } catch (e) {}
-    function savePrefs() {
+
+    /* ---------- Shared preferences ---------- */
+    const defaults = {
+      shell: 'sheet',          // 'sheet' | 'drawer' | 'fullscreen'
+      state: 'half',           // sheet-only: 'collapsed' | 'half' | 'full'
+      lastExpanded: 'half',    // sheet-only
+      tab: 'left',             // 'left' | 'right' -- shared by every shell
+      zoom: 100,               // shared UI zoom, applied inside every shell
+      keyboardGuard: true      // suppress Quick Chat's focus stealing
+    };
+
+    let prefs = Object.assign({}, defaults);
+    try {
+      const saved = JSON.parse(localStorage.getItem(PREF_KEY)) || {};
+      // One-time migration from the first, sheet-only version of this pref.
+      if (saved.scale && !saved.zoom) saved.zoom = saved.scale;
+      Object.assign(prefs, saved);
+    } catch (e) {}
+
+    function save() {
       try { localStorage.setItem(PREF_KEY, JSON.stringify(prefs)); } catch (e) {}
     }
 
-    const GRAB_H  = 54;   // collapsed height (the grabber bar itself)
-    const HALF_F  = 0.52; // fraction of viewport height
-    const FULL_F  = 0.92;
-
-    /* ========================================================
-       2. STYLES
-       Split in two: the sheet chrome, and a compatibility layer
-       that fixes desktop-tuned CSS inside the existing blocks.
-       ======================================================== */
-    const sheetStyle = document.createElement('style');
-    sheetStyle.id = 'igms-sheet-styles';
-    sheetStyle.innerHTML = `
-      :root {
-        --igms-bg: #131318;
-        --igms-surface: #17171d;
-        --igms-surface-2: #1c1c23;
-        --igms-border: rgba(255,255,255,0.08);
-        --igms-text: #ece9e4;
-        --igms-text-dim: #96949c;
-        --igms-accent: #c9a876;
-        --igms-safe: env(safe-area-inset-bottom, 0px);
+    core.mobilePrefs = {
+      get: () => prefs,
+      set(patch, silent) {
+        Object.assign(prefs, patch);
+        save();
+        if (!silent) core.emit('mobile:prefs-changed', prefs);
+      },
+      save,
+      reset() {
+        prefs = Object.assign({}, defaults);
+        save();
+        core.emit('mobile:prefs-changed', prefs);
       }
-
-      #igms-root { display: none; }
-      body.igms-on #igms-root { display: block; }
-
-      #igms-scrim {
-        position: fixed; inset: 0;
-        background: rgba(0,0,0,0.45);
-        z-index: 2147482998;
-        opacity: 0; pointer-events: none;
-        transition: opacity 0.2s ease;
-      }
-      #igms-sheet[data-state="full"] ~ #igms-scrim,
-      body.igms-full #igms-scrim { opacity: 1; pointer-events: auto; }
-
-      #igms-sheet {
-        position: fixed; left: 0; right: 0; bottom: 0;
-        z-index: 2147482999;
-        height: ${GRAB_H}px;
-        background: var(--igms-bg);
-        color: var(--igms-text);
-        border-top: 1px solid var(--igms-border);
-        border-radius: 16px 16px 0 0;
-        box-shadow: 0 -10px 40px rgba(0,0,0,0.6);
-        display: flex; flex-direction: column;
-        overflow: hidden;
-        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-        transition: height 0.26s cubic-bezier(0.22,0.61,0.36,1),
-                    bottom 0.18s ease;
-        padding-bottom: var(--igms-safe);
-        box-sizing: border-box;
-      }
-
-      /* ---- Grabber / toolbar ---- */
-      #igms-grabber {
-        flex-shrink: 0;
-        height: ${GRAB_H}px;
-        display: flex; flex-direction: column;
-        justify-content: center; gap: 4px;
-        padding: 0 8px;
-        touch-action: none;             /* stop Android hijacking the drag */
-        user-select: none;
-        -webkit-user-select: none;
-        cursor: grab;
-      }
-      #igms-grabber:active { cursor: grabbing; }
-
-      #igms-handle-bar {
-        width: 38px; height: 4px; border-radius: 4px;
-        background: rgba(255,255,255,0.22);
-        margin: 0 auto 2px;
-        flex-shrink: 0;
-      }
-
-      #igms-toprow {
-        display: flex; align-items: center; gap: 6px;
-        width: 100%;
-      }
-
-      .igms-tabs { display: flex; gap: 4px; flex: 1; min-width: 0; }
-      .igms-tab {
-        flex: 1; min-width: 0;
-        background: var(--igms-surface-2);
-        color: var(--igms-text-dim);
-        border: 1px solid var(--igms-border);
-        border-radius: 8px;
-        padding: 7px 4px;
-        font-size: 11px; font-weight: 600;
-        cursor: pointer;
-        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-        touch-action: manipulation;
-      }
-      .igms-tab.active {
-        background: var(--igms-accent);
-        color: #171208;
-        border-color: var(--igms-accent);
-      }
-
-      .igms-tools { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
-      .igms-tool-btn {
-        background: transparent;
-        border: 1px solid var(--igms-border);
-        color: var(--igms-text-dim);
-        border-radius: 8px;
-        min-width: 34px; height: 32px;
-        font-size: 13px;
-        display: flex; align-items: center; justify-content: center;
-        cursor: pointer;
-        touch-action: manipulation;
-        padding: 0 6px;
-      }
-      .igms-tool-btn:active { background: rgba(255,255,255,0.1); color: var(--igms-accent); }
-      .igms-tool-btn.on { color: var(--igms-accent); border-color: var(--igms-accent); }
-
-      #igms-scale {
-        background: var(--igms-surface-2);
-        color: var(--igms-text-dim);
-        border: 1px solid var(--igms-border);
-        border-radius: 8px;
-        height: 32px; font-size: 10px; padding: 0 2px;
-      }
-
-      /* ---- Body / panes ---- */
-      #igms-body {
-        flex: 1; min-height: 0;
-        overflow: hidden;
-        display: flex;
-        border-top: 1px solid var(--igms-border);
-      }
-      .igms-pane {
-        flex: 1; min-width: 0; min-height: 0;
-        overflow-y: auto;
-        overflow-x: hidden;
-        overscroll-behavior: contain;      /* no scroll-chaining into IG */
-        -webkit-overflow-scrolling: touch;
-        display: none;
-        padding: 8px;
-        box-sizing: border-box;
-      }
-      #igms-sheet[data-tab="left"]  .igms-pane[data-pane="left"],
-      #igms-sheet[data-tab="right"] .igms-pane[data-pane="right"] { display: block; }
-
-      #igms-sheet[data-state="collapsed"] #igms-body { display: none; }
-
-      /* The adopted containers were flex columns inside the sidebars. */
-      .igms-pane #ig-left-menu-container,
-      .igms-pane #ig-right-menu-container {
-        display: flex; flex-direction: column; gap: 10px;
-        padding: 0; height: auto; overflow: visible;
-      }
-
-      .igms-empty {
-        padding: 24px 12px; text-align: center;
-        font-size: 11px; color: var(--igms-text-dim);
-      }
-    `;
-    document.documentElement.appendChild(sheetStyle);
-
-    /* --------------------------------------------------------
-       Compatibility layer.
-       Appended to documentElement (i.e. AFTER every block's own
-       <style> in <head>) so equal-specificity rules win on source
-       order, and !important beats the inline styles set by the
-       pop-out / floating-window modules.
-       -------------------------------------------------------- */
-    const fixStyle = document.createElement('style');
-    fixStyle.id = 'igms-compat-styles';
-    fixStyle.innerHTML = `
-      /* 1. Hide the desktop shell entirely. */
-      body.igms-on #ig-modular-left-panel,
-      body.igms-on #ig-modular-right-panel,
-      body.igms-on #ig-left-toggle-tab,
-      body.igms-on #ig-right-toggle-tab,
-      body.igms-on #ig-left-resizer,
-      body.igms-on #ig-right-resizer,
-      body.igms-on .ig-interactive-handle { display: none !important; }
-
-      /* 2. Neutralise the desktop page-resizer's layout takeover.
-            If resizing was left enabled on desktop it would otherwise
-            squeeze Instagram into a sliver on the phone. */
-      body.igms-on { width: auto !important; height: auto !important; overflow: visible !important; position: static !important; }
-      body.igms-on #react-root,
-      body.igms-on div[data-testid="mw-direct-inbox"],
-      body.igms-on main {
-        position: static !important;
-        left: 0 !important;
-        width: 100% !important;
-        height: auto !important;
-        overflow: visible !important;
-      }
-
-      /* 3. Pop-out floating windows don't belong on a 360dp screen. */
-      body.igms-on .ig-popout-btn { display: none !important; }
-      body.igms-on .ig-floating-modal {
-        left: 3vw !important;
-        width: 94vw !important;
-        max-width: 94vw !important;
-        top: 8vh !important;
-        max-height: 70vh !important;
-      }
-
-      /* 4. Clamp every fixed-width desktop modal to the viewport. */
-      body.igms-on .ig-tlp-modal,
-      body.igms-on .ig-qcx-modal,
-      body.igms-on .ig-mc-modal,
-      body.igms-on .ig-isl-modal,
-      body.igms-on .ig-audio-modal,
-      body.igms-on .ig-profile-floating-window {
-        width: 94vw !important;
-        max-width: 94vw !important;
-        max-height: 82vh !important;
-        overflow-y: auto !important;
-        box-sizing: border-box !important;
-      }
-      body.igms-on .ig-profile-floating-window {
-        left: 3vw !important;
-        top: 8vh !important;
-      }
-
-      /* 5. Finger-sized hit areas without changing icon sizes. */
-      body.igms-on .ig-card-toolbar button,
-      body.igms-on .ig-audio-btn,
-      body.igms-on .ig-tln-btn,
-      body.igms-on .ig-isl-btn,
-      body.igms-on .ig-mc-flow-del,
-      body.igms-on .ig-mc-flow-edit,
-      body.igms-on .ig-hl-btn,
-      body.igms-on .ig-emj-del {
-        min-width: 34px !important;
-        min-height: 34px !important;
-        padding: 6px !important;
-        touch-action: manipulation;
-      }
-      body.igms-on .ig-audio-send-btn,
-      body.igms-on .ig-isl-send-btn,
-      body.igms-on .ig-mc-send-btn {
-        min-height: 34px !important;
-        padding: 6px 12px !important;
-      }
-
-      /* 6. Column resizers are mouse-only -- hide them, they'd only
-            block touch scrolling. Widths keep their saved values. */
-      body.igms-on .ig-audio-col-resizer,
-      body.igms-on .ig-tln-col-resizer { display: none !important; }
-
-      /* 7. Drag grips: tell Android not to treat the gesture as
-            text-selection / scroll before our handlers see it. */
-      body.igms-on .ig-audio-grip,
-      body.igms-on .ig-tln-drag-grip,
-      body.igms-on .ig-isl-grip,
-      body.igms-on .ig-menu-header { touch-action: none; }
-
-      /* 8. Cards: kill the desktop vertical resize nub, cap list heights
-            so a long library can't push the rest off-screen. */
-      body.igms-on .ig-menu-content {
-        resize: none !important;
-        max-height: none !important;
-        padding: 0 10px 10px !important;
-      }
-      body.igms-on .ig-draggable-menu[data-key="text-library-module"] .ig-menu-content {
-        height: auto !important;
-        min-height: 0 !important;
-      }
-      body.igms-on .ig-tln-tree,
-      body.igms-on .ig-audio-lib-tree,
-      body.igms-on .ig-isl-tree,
-      body.igms-on .ig-mc-flow-list {
-        max-height: 46vh !important;
-        flex: none !important;
-      }
-
-      /* 9. Quick Chat textarea: 16px stops Firefox Android from
-            zooming the page on focus. */
-      body.igms-on #ig-quick-chat-input { font-size: 16px !important; }
-      body.igms-on .ig-mc-input,
-      body.igms-on .ig-ub-input,
-      body.igms-on .ig-tlp-input,
-      body.igms-on .ig-isl-input,
-      body.igms-on .ig-hl-input { font-size: 16px !important; }
-
-      /* 10. The rescue button would sit under the sheet grabber. */
-      body.igms-on > button[title^="Click to reset"] {
-        bottom: calc(${GRAB_H}px + 14px + env(safe-area-inset-bottom, 0px)) !important;
-        left: 10px !important;
-        opacity: 0.35 !important;
-      }
-
-      /* 11. Command dropdown: keep it inside the viewport. */
-      body.igms-on .ig-qcx-dropdown {
-        left: 3vw !important;
-        width: 94vw !important;
-        max-width: 94vw !important;
-      }
-
-      /* 12. Touch thumbnail viewer (see shim below). */
-      #igms-thumb-viewer {
-        position: fixed; z-index: 2147483647;
-        max-width: 80vw; max-height: 60vh;
-        border-radius: 10px; padding: 6px;
-        background: #0f172a; border: 1px solid #334155;
-        box-shadow: 0 10px 30px rgba(0,0,0,0.8);
-        display: none; pointer-events: none;
-      }
-      #igms-thumb-viewer img {
-        max-width: 100%; max-height: 100%;
-        object-fit: contain; border-radius: 6px; display: block;
-      }
-    `;
-    document.documentElement.appendChild(fixStyle);
-
-    /* ========================================================
-       3. BUILD THE SHEET
-       ======================================================== */
-    let root, sheet, scrim, grabber, body, paneLeft, paneRight;
-
-    function build() {
-      if (document.getElementById('igms-root')) return;
-
-      root = document.createElement('div');
-      root.id = 'igms-root';
-
-      sheet = document.createElement('div');
-      sheet.id = 'igms-sheet';
-      sheet.dataset.state = prefs.state;
-      sheet.dataset.tab = prefs.tab;
-
-      sheet.innerHTML = `
-        <div id="igms-grabber">
-          <div id="igms-handle-bar"></div>
-          <div id="igms-toprow">
-            <div class="igms-tabs">
-              <button class="igms-tab" data-tab="left">📚 Library</button>
-              <button class="igms-tab" data-tab="right">🤖 Chat</button>
-            </div>
-            <div class="igms-tools">
-              <button class="igms-tool-btn" id="igms-kbd" title="Keyboard auto-focus">⌨️</button>
-              <button class="igms-tool-btn" id="igms-profiles" title="Workspace profiles">⚙️</button>
-              <select id="igms-scale" title="UI size">
-                <option value="85">85%</option>
-                <option value="90">90%</option>
-                <option value="100">100%</option>
-                <option value="110">110%</option>
-              </select>
-              <button class="igms-tool-btn" id="igms-toggle" title="Expand / collapse">▴</button>
-            </div>
-          </div>
-        </div>
-        <div id="igms-body">
-          <div class="igms-pane" data-pane="left"></div>
-          <div class="igms-pane" data-pane="right"></div>
-        </div>
-      `;
-
-      scrim = document.createElement('div');
-      scrim.id = 'igms-scrim';
-
-      root.appendChild(sheet);
-      root.appendChild(scrim);
-      document.body.appendChild(root);
-
-      grabber   = sheet.querySelector('#igms-grabber');
-      body      = sheet.querySelector('#igms-body');
-      paneLeft  = sheet.querySelector('.igms-pane[data-pane="left"]');
-      paneRight = sheet.querySelector('.igms-pane[data-pane="right"]');
-
-      wireTabs();
-      wireTools();
-      wireDrag();
-      wireViewport();
-
-      applyScale();
-      setState(prefs.state, true);
-      syncContainers();
-      startWatchers();
-    }
-
-    /* ========================================================
-       4. CONTAINER ADOPTION
-       Moves (never clones) the Dual Sidebar's containers in.
-       Runs on a heartbeat so a late-building sidebar, or a card
-       moved by the Panel Switcher, is always re-homed correctly.
-       ======================================================== */
-    function syncContainers() {
-      [['left', paneLeft], ['right', paneRight]].forEach(([side, pane]) => {
-        if (!pane) return;
-        let c = document.getElementById('ig-' + side + '-menu-container');
-
-        // Fall back to creating one if the Dual Sidebar block isn't present.
-        if (!c) {
-          c = document.createElement('div');
-          c.id = 'ig-' + side + '-menu-container';
-          c.className = 'ig-panel-body';
-          pane.appendChild(c);
-          return;
-        }
-        if (c.parentElement !== pane) pane.appendChild(c);
-
-        // Empty-state hint
-        const hasCards = !!c.querySelector('.ig-draggable-menu');
-        let hint = pane.querySelector('.igms-empty');
-        if (!hasCards && !hint) {
-          hint = document.createElement('div');
-          hint.className = 'igms-empty';
-          hint.textContent = side === 'left'
-            ? 'No library cards here yet.'
-            : 'No chat / automation cards here yet.';
-          pane.appendChild(hint);
-        } else if (hasCards && hint) {
-          hint.remove();
-        }
-      });
-    }
-
-    /* ========================================================
-       5. SNAP STATES + POINTER DRAG
-       ======================================================== */
-    function viewportH() {
-      const vv = window.visualViewport;
-      return Math.round(vv ? vv.height : window.innerHeight);
-    }
-    function heightFor(state) {
-      if (state === 'collapsed') return GRAB_H;
-      if (state === 'full') return Math.round(viewportH() * FULL_F);
-      return Math.round(viewportH() * HALF_F);
-    }
-    function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
-
-    function setState(state, silent) {
-      prefs.state = state;
-      if (state !== 'collapsed') prefs.lastExpanded = state;
-      sheet.dataset.state = state;
-      sheet.style.height = heightFor(state) + 'px';
-      document.body.classList.toggle('igms-full', state === 'full');
-      const t = sheet.querySelector('#igms-toggle');
-      if (t) t.textContent = state === 'collapsed' ? '▴' : '▾';
-      if (!silent) savePrefs();
-    }
-
-    function nearestState(h) {
-      const opts = [
-        ['collapsed', heightFor('collapsed')],
-        ['half',      heightFor('half')],
-        ['full',      heightFor('full')]
-      ];
-      opts.sort((a, b) => Math.abs(a[1] - h) - Math.abs(b[1] - h));
-      return opts[0][0];
-    }
-
-    function wireDrag() {
-      let drag = null;
-
-      grabber.addEventListener('pointerdown', (e) => {
-        if (e.target.closest('button, select, input')) return;
-        drag = {
-          startY: e.clientY,
-          startH: sheet.getBoundingClientRect().height,
-          moved: false
-        };
-        try { grabber.setPointerCapture(e.pointerId); } catch (err) {}
-        sheet.style.transition = 'none';
-      });
-
-      grabber.addEventListener('pointermove', (e) => {
-        if (!drag) return;
-        const dy = drag.startY - e.clientY;          // up = positive = taller
-        if (Math.abs(dy) > 5) drag.moved = true;
-        const maxH = Math.round(viewportH() * FULL_F);
-        sheet.style.height = clamp(drag.startH + dy, GRAB_H, maxH) + 'px';
-      });
-
-      function endDrag(e) {
-        if (!drag) return;
-        sheet.style.transition = '';
-        if (!drag.moved) {
-          // Treat as a tap: toggle open/closed.
-          setState(prefs.state === 'collapsed' ? (prefs.lastExpanded || 'half') : 'collapsed');
-        } else {
-          setState(nearestState(sheet.getBoundingClientRect().height));
-        }
-        drag = null;
-        try { grabber.releasePointerCapture(e.pointerId); } catch (err) {}
-      }
-      grabber.addEventListener('pointerup', endDrag);
-      grabber.addEventListener('pointercancel', endDrag);
-
-      scrim.addEventListener('click', () => setState('half'));
-    }
-
-    /* ========================================================
-       6. VIEWPORT / KEYBOARD HANDLING
-       Firefox Android collapses its address bar on scroll and
-       shrinks the visual viewport when the keyboard opens, so we
-       size against visualViewport rather than vh, and lift the
-       sheet above the keyboard inset.
-       ======================================================== */
-    function wireViewport() {
-      const vv = window.visualViewport;
-
-      function update() {
-        const inset = vv
-          ? Math.max(0, Math.round(window.innerHeight - vv.height - vv.offsetTop))
-          : 0;
-        sheet.style.bottom = inset + 'px';
-        if (prefs.state !== 'collapsed') {
-          sheet.style.height = heightFor(prefs.state) + 'px';
-        }
-      }
-
-      if (vv) {
-        vv.addEventListener('resize', update);
-        vv.addEventListener('scroll', update);
-      }
-      window.addEventListener('orientationchange', () => setTimeout(update, 250));
-      window.addEventListener('resize', update);
-      update();
-    }
-
-    /* ========================================================
-       7. TABS + TOOLBAR
-       ======================================================== */
-    function setTab(tab) {
-      prefs.tab = tab;
-      sheet.dataset.tab = tab;
-      sheet.querySelectorAll('.igms-tab').forEach(b => {
-        b.classList.toggle('active', b.dataset.tab === tab);
-      });
-      savePrefs();
-    }
-
-    function wireTabs() {
-      sheet.querySelectorAll('.igms-tab').forEach(btn => {
-        btn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          setTab(btn.dataset.tab);
-          if (prefs.state === 'collapsed') setState(prefs.lastExpanded || 'half');
-        });
-      });
-      setTab(prefs.tab);
-    }
-
-    function applyScale() {
-      const b = sheet.querySelector('#igms-body');
-      if (b) b.style.zoom = (prefs.scale / 100);
-      const sel = sheet.querySelector('#igms-scale');
-      if (sel) sel.value = String(prefs.scale);
-    }
-
-    function wireTools() {
-      sheet.querySelector('#igms-toggle').addEventListener('click', (e) => {
-        e.stopPropagation();
-        setState(prefs.state === 'collapsed' ? (prefs.lastExpanded || 'half')
-               : prefs.state === 'half'      ? 'full'
-               : 'collapsed');
-      });
-
-      sheet.querySelector('#igms-scale').addEventListener('change', (e) => {
-        prefs.scale = parseInt(e.target.value, 10) || 100;
-        applyScale();
-        savePrefs();
-      });
-
-      // Proxy the Profile Manager's button, which lives in the now-hidden
-      // desktop panel header. The element still exists, so click() works.
-      sheet.querySelector('#igms-profiles').addEventListener('click', (e) => {
-        e.stopPropagation();
-        const btn = document.querySelector('#ig-modular-left-panel .ig-profile-btn')
-                 || document.querySelector('#ig-modular-right-panel .ig-profile-btn')
-                 || document.querySelector('.ig-profile-btn');
-        if (btn) btn.click();
-        else alert('Workspace Profiles module is not loaded.');
-      });
-
-      const kbdBtn = sheet.querySelector('#igms-kbd');
-      function paintKbd() {
-        kbdBtn.classList.toggle('on', !prefs.keyboardGuard);
-        kbdBtn.title = prefs.keyboardGuard
-          ? 'Keyboard auto-focus: OFF (tap to enable)'
-          : 'Keyboard auto-focus: ON (tap to disable)';
-      }
-      kbdBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        prefs.keyboardGuard = !prefs.keyboardGuard;
-        savePrefs();
-        paintKbd();
-      });
-      paintKbd();
-    }
-
-    /* ========================================================
-       8. MOBILE SHIMS FOR EXISTING BLOCKS
-       ======================================================== */
-
-    /* 8a. Quick Chat focus guard.
-       quickChatBoxPlugin installs a global interceptor that grabs
-       keyboard focus on any stray tap or keypress. On a phone that
-       means the soft keyboard flies open constantly.
-
-       We can't remove its listeners from outside the closure, so we
-       shadow the input's .focus() method: programmatic focus is only
-       honoured if the user was genuinely typing there in the last few
-       seconds. That keeps rapid-fire re-focus after sending (which is
-       what enableFocusOverwatch is for) while blocking cold-start
-       focus theft. Real taps focus natively and bypass this entirely. */
-    let lastRealFocus = 0;
-    function installFocusGuard() {
-      const input = document.getElementById('ig-quick-chat-input');
-      if (!input || input.dataset.igmsGuarded === '1') return;
-      input.dataset.igmsGuarded = '1';
-
-      input.addEventListener('focus', () => { lastRealFocus = Date.now(); });
-
-      const nativeFocus = HTMLElement.prototype.focus;
-      input.focus = function () {
-        if (!prefs.keyboardGuard) return nativeFocus.call(input);
-        if (document.activeElement === input) return nativeFocus.call(input);
-        if (Date.now() - lastRealFocus < 6000) return nativeFocus.call(input);
-        // Otherwise: silently ignore the programmatic focus grab.
-      };
-    }
-
-    /* 8b. Thumbnail preview.
-       textLibraryImageManager binds preview to onmousedown/onmouseup
-       only, so it is completely inert on a touchscreen. We add a
-       touch path that reads the same data straight from localStorage. */
-    let thumbViewer = null;
-    function installThumbTouch() {
-      if (thumbViewer) return;
-      thumbViewer = document.createElement('div');
-      thumbViewer.id = 'igms-thumb-viewer';
-      thumbViewer.innerHTML = '<img alt="">';
-      document.body.appendChild(thumbViewer);
-
-      const img = thumbViewer.querySelector('img');
-      const hide = () => { thumbViewer.style.display = 'none'; };
-
-      document.addEventListener('touchstart', (e) => {
-        const btn = e.target.closest && e.target.closest('.ig-tln-thumb-btn');
-        if (!btn) return;
-        const row = btn.closest('.ig-tln-snippet');
-        if (!row) return;
-        let lib;
-        try { lib = JSON.parse(localStorage.getItem('ig_text_library_pro_v1')); } catch (err) { return; }
-        const item = lib && lib.items && lib.items.find(i => i.id === row.dataset.id);
-        if (!item || !item.thumbnail) return;
-
-        e.preventDefault();
-        e.stopPropagation();
-        img.src = item.thumbnail;
-        const t = e.touches[0];
-        thumbViewer.style.left = Math.max(8, Math.min(t.clientX - 120, window.innerWidth - 240)) + 'px';
-        thumbViewer.style.top  = Math.max(8, t.clientY - 260) + 'px';
-        thumbViewer.style.display = 'block';
-      }, { passive: false });
-
-      document.addEventListener('touchend', hide);
-      document.addEventListener('touchcancel', hide);
-    }
-
-    /* ========================================================
-       9. WATCHERS
-       ======================================================== */
-    function startWatchers() {
-      // Show the sheet only inside DMs, mirroring the desktop shell.
-      setInterval(() => {
-        const inDirect = window.location.href.includes('/direct/');
-        document.body.classList.toggle('igms-on', inDirect);
-        if (!inDirect) document.body.classList.remove('igms-full');
-      }, 500);
-
-      // Heartbeat: re-home containers, re-arm shims on rebuilt nodes.
-      setInterval(() => {
-        syncContainers();
-        installFocusGuard();
-      }, 1000);
-
-      installThumbTouch();
-      installFocusGuard();
-    }
-
-    /* ========================================================
-       10. PUBLIC API
-       ======================================================== */
-    core.mobileSheet = {
-      isMobile: true,
-      open:     (tab) => { if (tab) setTab(tab); setState(prefs.lastExpanded || 'half'); },
-      expand:   () => setState('full'),
-      collapse: () => setState('collapsed'),
-      setTab,
-      getState: () => prefs.state
     };
 
-    // Keep the Dual Sidebar's prefs API shape alive for anything reading it.
-    if (typeof core.getSidebarPrefs !== 'function') {
-      core.getSidebarPrefs = () => ({
-        leftWidth: 0, rightWidth: 0,
-        leftHidden: prefs.tab !== 'left',
-        rightHidden: prefs.tab !== 'right',
-        uiScale: prefs.scale
+    /* ---------- Shared keyboard detector ----------
+       visualViewport.height shrinks when the soft keyboard opens, but
+       window.innerHeight does not -- so we track the tallest height
+       seen and treat a large drop from it as "keyboard open". */
+    let kbOpen = false;
+    let maxSeenHeight = 0;
+
+    function checkKeyboard() {
+      const vv = window.visualViewport;
+      if (!vv) return;
+      maxSeenHeight = Math.max(maxSeenHeight, vv.height);
+      const shrink = maxSeenHeight - vv.height;
+      const nowOpen = shrink > 120;
+      if (nowOpen !== kbOpen) {
+        kbOpen = nowOpen;
+        core.emit(kbOpen ? 'mobile:keyboard-open' : 'mobile:keyboard-close', { height: vv.height });
+      }
+    }
+
+    core.mobileKeyboard = { isOpen: () => kbOpen };
+
+    if (core.isMobile && window.visualViewport) {
+      window.visualViewport.addEventListener('resize', checkKeyboard);
+      window.addEventListener('orientationchange', () => {
+        maxSeenHeight = 0;
+        setTimeout(checkKeyboard, 300);
       });
     }
 
-    /* NOTE: deliberately NOT emitting 'sidebar:layout-changed'.
-       igSidebarSyncFeature forwards that event to igPageResizerFeature,
-       which rewrites Instagram's layout for a two-sidebar desktop.
-       On mobile that is exactly what we don't want. */
-
-    if (document.body) build();
-    else document.addEventListener('DOMContentLoaded', build);
-
-    console.log('[MobileSheet] Bottom sheet shell active (Firefox Android profile).');
-    core.emit('block:ready', { id: 'igMobileBottomSheetUI', active: true });
+    console.log('[MobileCore] isMobile =', core.isMobile, '| shell =', prefs.shell);
+    core.emit('block:ready', { id: 'mobileCore', isMobile: core.isMobile });
   }
 });
+
+/* ============================================================
+   BLOCK: Mobile Bottom Sheet UI (v1)
+   ============================================================ */
+
+
+/* ============================================================
+   BLOCK: Master Config Bunny Sync (v2)
+   ============================================================ */
+
 
   LegoCore.boot();
 })();
