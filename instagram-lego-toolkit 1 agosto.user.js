@@ -882,10 +882,10 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Audio Library (v9)
+   BLOCK: Audio Library (v14)
    ============================================================ */
 /* ============================================================
-   BLOCK: Audio Library (v9)
+   BLOCK: Audio Library (v13 - Hash-Colored Course Tags & Tooltip Fix)
    ============================================================ */
 LegoCore.registerBlock({
   id: 'audioLibrary',
@@ -898,21 +898,90 @@ LegoCore.registerBlock({
     const COL_PREF_KEY = 'ig_audio_lib_col_width_v1';
     let colWidths = JSON.parse(localStorage.getItem(COL_PREF_KEY)) || { nameWidth: 60 };
 
-    const request = indexedDB.open('IG_Soundboard_Fresh_Core_DB', 2);
-    request.onerror = e => console.error("DB Error:", e);
-    request.onupgradeneeded = e => {
-      db = e.target.result;
-      if (!db.objectStoreNames.contains('clips')) db.createObjectStore('clips', { keyPath: 'id', autoIncrement: true }).createIndex('order', 'order', { unique: false });
-      if (!db.objectStoreNames.contains('folders')) db.createObjectStore('folders', { keyPath: 'name' }).put({ name: "General" });
-    };
-    request.onsuccess = e => {
-      db = e.target.result;
+    // --- DB Helper to prevent concurrent connection deadlocks ---
+    function withDb(cb) {
+      const existing = core.getDb();
+      if (existing) { cb(existing); return; }
+      core.on('db:ready', d => cb(d));
+    }
+
+    withDb(database => {
+      db = database;
       loadFolders();
       renderClips();
-    };
+    });
+
+    // --- RAM-Safe Fetcher: Only pull heavy Blobs when explicitly needed ---
+    function getClipBlob(id) {
+        return new Promise(resolve => {
+            withDb(d => {
+                const tx = d.transaction(['clips'], 'readonly');
+                tx.objectStore('clips').get(id).onsuccess = e => {
+                    resolve(e.target.result ? e.target.result.blob : null);
+                };
+            });
+        });
+    }
+
+    // --- Global Transcript Tooltip ---
+    let txTooltip = document.getElementById('ig-audio-tx-tooltip');
+    if (!txTooltip) {
+        txTooltip = document.createElement('div');
+        txTooltip.id = 'ig-audio-tx-tooltip';
+        txTooltip.className = 'ig-audio-tx-tooltip';
+        document.body.appendChild(txTooltip);
+    }
+
+    // --- HTML Escaper & Pipeline Formatter ---
+    function safeHTML(str) {
+        return String(str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    // String Hash Function for consistent random colors
+    function getHashColor(str) {
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+            hash = str.charCodeAt(i) + ((hash << 5) - hash);
+        }
+        const hue = Math.abs(hash % 360);
+        return `hsl(${hue}, 65%, 45%)`;
+    }
+
+    function formatPipelineName(rawName) {
+        // Regex: 1. Matches starting number 2. Matches separators 3. Optional (coursename) 4. Matches separators 5. The rest
+        const match = rawName.match(/^(\d+)([\s\-\.]*)(?:\(([^)]+)\))?([\s\-\.]*)(.*)$/);
+        if (!match) return safeHTML(rawName);
+
+        const numStr = match[1];
+        const num = parseInt(numStr, 10);
+        const sep1 = match[2] || '';
+        const courseName = match[3];
+        const sep2 = match[4] || '';
+        const rest = match[5] || '';
+
+        let bg = '#64748b'; // default slate
+        if (num === 1) bg = '#10b981'; // Green
+        else if (num === 2) bg = '#ef4444'; // Red
+        else if (num === 3) bg = '#f59e0b'; // Orange
+        else if (num === 4) bg = '#8b5cf6'; // Purple
+        else if (num >= 5) bg = '#3b82f6'; // Blue
+
+        let html = `<span class="ig-pipeline-badge" style="background:${bg};">${numStr}</span>`;
+
+        // Add course tag if detected
+        if (courseName) {
+            const tagColor = getHashColor(courseName.toLowerCase().trim());
+            html += `<span class="ig-course-badge" style="background:${tagColor};">(${safeHTML(courseName.trim())})</span>`;
+            html += `<span>${safeHTML(sep2 + rest)}</span>`;
+        } else {
+            html += `<span>${safeHTML(sep1 + rest)}</span>`;
+        }
+
+        return html;
+    }
 
     const style = document.createElement('style');
-    style.id = 'ig-audio-lib-v3-styles';
+    style.id = 'ig-audio-lib-v13-styles';
     style.innerHTML = `
       .ig-audio-lib-wrap { display: flex; flex-direction: column; gap: 8px; font-size: 11px; flex: 1; min-height: 0; }
       .ig-audio-lib-header { display: flex; justify-content: space-between; align-items: center; gap: 6px; }
@@ -943,19 +1012,21 @@ LegoCore.registerBlock({
       .ig-audio-name { font-size: 11px; color: #f8fafc; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; flex-shrink: 0; }
       .ig-audio-col-resizer { width: 6px; height: 18px; cursor: col-resize; background: rgba(255,255,255,0.05); border-radius: 3px; margin: 0 6px; transition: background 0.1s; flex-shrink: 0; }
       .ig-audio-col-resizer:hover, .ig-audio-col-resizer.active { background: #6366f1; }
-      .ig-audio-color-dot { width: 10px; height: 10px; border-radius: 50%; border: 1px solid rgba(255,255,255,0.2); flex-shrink: 0; margin-right: 8px; }
       .ig-audio-cmd-badge { font-size: 9px; background: rgba(255,255,255,0.1); color: #c9a876; padding: 1px 6px; border-radius: 8px; font-weight: bold; margin-right: 8px; flex-shrink: 0; }
-      .ig-audio-transcript-badge { font-size: 10px; margin-right: 8px; flex-shrink: 0; opacity: 0.7; }
+      .ig-audio-transcript-badge { font-size: 11px; margin-right: 8px; flex-shrink: 0; opacity: 0.75; cursor: help; }
       .ig-audio-actions { display: flex; gap: 4px; align-items: center; margin-left: auto; flex-shrink: 0; }
       .ig-audio-btn { background: transparent; border: none; color: #64748b; cursor: pointer; font-size: 11px; padding: 3px 6px; border-radius: 4px; transition: 0.2s; }
       .ig-audio-btn:hover { background: rgba(255,255,255,0.1); color: #fff; }
       .ig-audio-send-btn { background: #10b981; color: #fff; border-radius: 4px; padding: 4px 8px; font-weight: bold; font-size: 10px; }
       .ig-audio-send-btn:hover { background: #059669; color: #fff; opacity: 0.9; }
-      .ig-audio-footer { display: flex; gap: 6px; margin-top: 4px; }
-      .ig-audio-footer button { flex: 1; padding: 7px; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 10px; transition: opacity 0.2s; }
+      .ig-audio-footer { display: flex; gap: 4px; margin-top: 4px; }
+      .ig-audio-footer button { flex: 1; padding: 7px 4px; color: white; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 10px; transition: opacity 0.2s; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; }
       .ig-audio-footer button:hover { opacity: 0.9; }
       .ig-audio-dl-btn { background: #2e7d32; }
       .ig-audio-ul-btn { background: #4527a0; }
+      .ig-pipeline-badge { display: inline-block; padding: 1px 5px; border-radius: 4px; font-weight: bold; color: #fff; margin-right: 4px; font-size: 10px; box-shadow: 0 1px 2px rgba(0,0,0,0.3); }
+      .ig-course-badge { display: inline-block; padding: 1px 5px; border-radius: 4px; font-weight: bold; color: #fff; margin-right: 4px; font-size: 9px; text-transform: uppercase; box-shadow: 0 1px 2px rgba(0,0,0,0.3); }
+      .ig-audio-tx-tooltip { position: fixed; z-index: 2147483647 !important; transform: translateY(-100%); background: rgba(15, 23, 42, 0.95); backdrop-filter: blur(4px); color: #cbd5e1; padding: 10px 12px; border-radius: 6px; border: 1px solid #475569; max-width: 250px; font-size: 11px; pointer-events: none; display: none; box-shadow: 0 10px 25px rgba(0,0,0,0.6); white-space: pre-wrap; word-wrap: break-word; line-height: 1.4; }
       .ig-audio-modal-overlay { position: fixed; top:0; left:0; right:0; bottom:0; background: rgba(0,0,0,0.6); z-index: 2147483647; display: flex; justify-content: center; align-items: center; }
       .ig-audio-modal { background: #0f172a; border: 1px solid #334155; border-radius: 8px; width: 320px; max-height: 85vh; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
       .ig-audio-modal h3 { margin: 0; font-size: 14px; color: #fff; }
@@ -964,9 +1035,6 @@ LegoCore.registerBlock({
       .ig-audio-modal-textarea { width: 100%; background: #1e293b; border: 1px solid #475569; color: #fff; padding: 8px; border-radius: 4px; font-size: 12px; box-sizing: border-box; outline: none; resize: vertical; min-height: 70px; font-family: inherit; line-height: 1.4; }
       .ig-audio-modal-textarea:focus { border-color: #6366f1; }
       .ig-audio-modal-label { font-size: 11px; font-weight: bold; color: #94a3b8; margin-top: 4px; }
-      .ig-audio-modal-colors { display: flex; gap: 8px; }
-      .ig-audio-modal-color-dot { width: 22px; height: 22px; border-radius: 50%; cursor: pointer; transition: transform 0.1s; }
-      .ig-audio-modal-color-dot:hover { transform: scale(1.1); }
       .ig-audio-modal-play-btn { background: #334155; color: #fff; border: none; border-radius: 6px; padding: 8px; font-weight: bold; cursor: pointer; }
       .ig-audio-modal-play-btn:hover { background: #475569; }
     `;
@@ -995,8 +1063,8 @@ LegoCore.registerBlock({
       </div>
       <div id="ig-audio-lib-tree" class="ig-audio-lib-tree"></div>
       <div class="ig-audio-footer">
-        <button id="ig-audio-dl-btn" class="ig-audio-dl-btn">📥 Download</button>
-        <button id="ig-audio-ul-btn" class="ig-audio-ul-btn">📤 Batch Upload</button>
+        <button id="ig-audio-dl-btn" class="ig-audio-dl-btn">📥 DL</button>
+        <button id="ig-audio-ul-btn" class="ig-audio-ul-btn">📤 Upload</button>
         <input type="file" id="ig-audio-batch-input" accept="audio/*" multiple style="display: none;">
       </div>
     `;
@@ -1102,19 +1170,15 @@ LegoCore.registerBlock({
       }
     });
 
-    function openEditModal(clip) {
-      let selectedColor = clip.color || '#0095f6';
+    async function openEditModal(clip) {
       const overlay = document.createElement('div');
       overlay.className = 'ig-audio-modal-overlay';
-      const colorDotsHtml = ['#0095f6', '#2e7d32', '#f77f00', '#9d0208', '#7209b7'].map(hex =>
-        `<div class="ig-audio-modal-color-dot" data-color="${hex}" style="background:${hex}; border:${hex === selectedColor ? '3px solid #fff' : '3px solid transparent'};"></div>`
-      ).join('');
 
       overlay.innerHTML = `
         <div class="ig-audio-modal">
           <h3>✏️ Edit Clip</h3>
           <div class="ig-audio-modal-label">Name:</div>
-          <input type="text" id="ig-audio-modal-name" class="ig-audio-modal-input" value="${clip.name}">
+          <input type="text" id="ig-audio-modal-name" class="ig-audio-modal-input" value="${String(clip.name || '').replace(/"/g, '&quot;')}">
           <div class="ig-audio-modal-label">Folder:</div>
           <select id="ig-audio-modal-folder" class="ig-audio-modal-input"></select>
           <div class="ig-audio-modal-label">Custom Command (used by Quick Command Bar):</div>
@@ -1123,9 +1187,7 @@ LegoCore.registerBlock({
             <input type="text" id="ig-audio-modal-command" class="ig-audio-modal-input" placeholder="e.g. hola" value="${clip.customCommand || ''}">
           </div>
           <div class="ig-audio-modal-label">Transcript (shown in the Quick Command preview panel):</div>
-          <textarea id="ig-audio-modal-transcript" class="ig-audio-modal-textarea" placeholder="Type out what this clip says...">${(clip.transcript || '').replace(/</g, '&lt;')}</textarea>
-          <div class="ig-audio-modal-label">Tag Color:</div>
-          <div class="ig-audio-modal-colors" id="ig-audio-modal-colors">${colorDotsHtml}</div>
+          <textarea id="ig-audio-modal-transcript" class="ig-audio-modal-textarea" placeholder="Type out what this clip says...">${String(clip.transcript || '').replace(/</g, '&lt;')}</textarea>
           <button id="ig-audio-modal-play" class="ig-audio-modal-play-btn">▶️ Preview</button>
           <div style="display:flex; justify-content:space-between; margin-top:8px;">
             <div style="display:flex; gap:8px;">
@@ -1154,20 +1216,13 @@ LegoCore.registerBlock({
         }
       };
 
-      overlay.querySelectorAll('.ig-audio-modal-color-dot').forEach(dot => {
-        dot.onclick = () => {
-          selectedColor = dot.dataset.color;
-          overlay.querySelectorAll('.ig-audio-modal-color-dot').forEach(d => {
-            d.style.border = d.dataset.color === selectedColor ? '3px solid #fff' : '3px solid transparent';
-          });
-        };
-      });
-
       let previewPlayer = null;
-      overlay.querySelector('#ig-audio-modal-play').onclick = (e) => {
+      overlay.querySelector('#ig-audio-modal-play').onclick = async (e) => {
         const btn = e.target;
         if (!previewPlayer) {
-          previewPlayer = new Audio(URL.createObjectURL(clip.blob));
+          const blob = await getClipBlob(clip.id);
+          if (!blob) return alert("Audio file not found in DB.");
+          previewPlayer = new Audio(URL.createObjectURL(blob));
           btn.innerText = '⏹️ Stop';
           previewPlayer.play();
           previewPlayer.onended = () => { btn.innerText = '▶️ Preview'; previewPlayer = null; };
@@ -1178,13 +1233,15 @@ LegoCore.registerBlock({
         }
       };
 
-      overlay.querySelector('#ig-audio-modal-dl').onclick = () => {
-        const url = URL.createObjectURL(clip.blob);
+      overlay.querySelector('#ig-audio-modal-dl').onclick = async () => {
+        const blob = await getClipBlob(clip.id);
+        if (!blob) return alert("Audio file not found.");
+        const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
         a.download = `${clip.folder || 'General'}.${clip.color || '#0095f6'}.${clip.name}.m4a`;
         document.body.appendChild(a); a.click(); a.remove();
-        URL.revokeObjectURL(url);
+        setTimeout(() => URL.revokeObjectURL(url), 300);
       };
 
       overlay.querySelector('#ig-audio-modal-del').onclick = () => {
@@ -1208,7 +1265,6 @@ LegoCore.registerBlock({
           if (c) {
             c.name = newName;
             c.folder = newFolder;
-            c.color = selectedColor;
             c.customCommand = newCommand;
             c.transcript = newTranscript;
             store.put(c);
@@ -1216,6 +1272,34 @@ LegoCore.registerBlock({
         };
         tx.oncomplete = () => { renderClips(); overlay.remove(); };
       };
+    }
+
+    // --- Hover Tooltip Binding Helper ---
+    function attachTranscriptTooltip(badgeElement, transcriptText) {
+        if (!badgeElement || !transcriptText) return;
+
+        const updatePos = (e) => {
+            if (txTooltip && txTooltip.style.display === 'block') {
+                let x = e.clientX + 15;
+                let y = e.clientY - 10; // TranslateY(-100%) in CSS moves it exactly above cursor
+                if (x + 260 > window.innerWidth) x = window.innerWidth - 265;
+                txTooltip.style.left = x + 'px';
+                txTooltip.style.top = y + 'px';
+            }
+        };
+
+        badgeElement.addEventListener('mouseenter', (e) => {
+            if (txTooltip) {
+                document.body.appendChild(txTooltip); // Append to body to reset z-index context
+                txTooltip.innerHTML = safeHTML(transcriptText);
+                txTooltip.style.display = 'block';
+                updatePos(e);
+            }
+        });
+        badgeElement.addEventListener('mousemove', updatePos);
+        badgeElement.addEventListener('mouseleave', () => {
+            if (txTooltip) txTooltip.style.display = 'none';
+        });
     }
 
     function renderClips(isFilterOnly) {
@@ -1241,7 +1325,15 @@ LegoCore.registerBlock({
       tree.innerHTML = '';
       const tx = db.transaction(['clips'], 'readonly');
       tx.objectStore('clips').getAll().onsuccess = e => {
-        const allClips = (e.target.result || []).sort((a, b) => (a.order || 0) - (b.order || 0));
+        const allClipsRaw = e.target.result || [];
+
+        // RAM-SAFE STRIPPING: Remove bloated Blobs from memory immediately
+        const allClips = allClipsRaw.map(c => {
+            const clone = { ...c };
+            delete clone.blob; // Stop closures from trapping megabytes of audio
+            return clone;
+        }).sort((a, b) => (a.order || 0) - (b.order || 0));
+
         if (!allClips.length) {
           tree.innerHTML = '<div style="padding:12px; color:#94a3b8; font-size:10px;">No audio clips yet.</div>';
           return;
@@ -1330,30 +1422,38 @@ LegoCore.registerBlock({
               rowEl.className = `ig-audio-clip-row ${clipCounter % 2 === 0 ? 'alt' : ''}`;
               rowEl.draggable = true;
               rowEl.dataset.clipId = clip.id;
-              rowEl.dataset.transcript = (clip.transcript || '').toLowerCase();
+              rowEl.dataset.transcript = String(clip.transcript || '').toLowerCase();
 
-              const clipNameLower = clip.name.toLowerCase();
+              const clipNameStr = String(clip.name || '');
+              const clipNameLower = clipNameStr.toLowerCase();
               if (searchTerm && !clipNameLower.includes(searchTerm) && !rowEl.dataset.transcript.includes(searchTerm)) {
                 rowEl.classList.add('ig-audio-hidden');
               }
 
+              // Pipeline Formatter
+              const formattedName = formatPipelineName(clipNameStr);
+
               const cmdBadgeHtml = clip.customCommand ? `<span class="ig-audio-cmd-badge">/${clip.customCommand}</span>` : '';
-              const transcriptBadgeHtml = (clip.transcript || '').trim() ? `<span class="ig-audio-transcript-badge" title="Has a transcript">📄</span>` : '';
+              const transcriptBadgeHtml = String(clip.transcript || '').trim() ? `<span class="ig-audio-transcript-badge">📄</span>` : '';
 
               rowEl.innerHTML = `
                 <span class="ig-audio-grip">⠿</span>
-                <span class="ig-audio-name" style="width: ${colWidths.nameWidth}%;" title="${clip.name}">${clip.name}</span>
+                <span class="ig-audio-name" style="width: ${colWidths.nameWidth}%;" title="${safeHTML(clipNameStr)}">${formattedName}</span>
                 <div class="ig-audio-col-resizer" title="Drag to resize name column"></div>
                 ${cmdBadgeHtml}
                 ${transcriptBadgeHtml}
-                <div class="ig-audio-color-dot" style="background: ${clip.color || '#0095f6'};"></div>
                 <div class="ig-audio-actions">
                   <button class="ig-audio-btn play-btn" title="Play">▶️</button>
-                  <button class="ig-audio-btn tx-btn" title="AI Transcribe">🤖</button>
                   <button class="ig-audio-btn ig-audio-send-btn" title="Send to chat">📤 Send</button>
                   <button class="ig-audio-btn edit-btn" title="Edit">✏️</button>
                 </div>
               `;
+
+              // Attach Tooltip to the fresh badge
+              const txBadge = rowEl.querySelector('.ig-audio-transcript-badge');
+              if (txBadge && clip.transcript) {
+                  attachTranscriptTooltip(txBadge, clip.transcript);
+              }
 
               const resizer = rowEl.querySelector('.ig-audio-col-resizer');
               resizer.addEventListener('mousedown', (e) => {
@@ -1390,11 +1490,13 @@ LegoCore.registerBlock({
               };
 
               let rowPlayer = null;
-              rowEl.querySelector('.play-btn').onclick = (e) => {
+              rowEl.querySelector('.play-btn').onclick = async (e) => {
                 e.stopPropagation();
                 const btn = e.target;
                 if (!rowPlayer) {
-                  rowPlayer = new Audio(URL.createObjectURL(clip.blob));
+                  const blob = await getClipBlob(clip.id);
+                  if (!blob) return alert("Audio not found in DB.");
+                  rowPlayer = new Audio(URL.createObjectURL(blob));
                   btn.innerText = '⏹️';
                   rowPlayer.play();
                   rowPlayer.onended = () => { btn.innerText = '▶️'; rowPlayer = null; };
@@ -1403,38 +1505,13 @@ LegoCore.registerBlock({
                 }
               };
 
-              rowEl.querySelector('.tx-btn').onclick = async (e) => {
+              rowEl.querySelector('.ig-audio-send-btn').onclick = async (e) => {
                 e.stopPropagation();
-                if (!window.IgAudioAI) return alert("AI engine not ready. Wait for Quick Commands to load.");
                 const btn = e.target;
                 const originalText = btn.innerText;
                 btn.innerText = '⏳';
-                btn.disabled = true;
-
-                try {
-                  const text = await window.IgAudioAI.transcribeAudio(clip.blob);
-                  const tx2 = db.transaction(['clips'], 'readwrite');
-                  const store = tx2.objectStore('clips');
-                  store.get(clip.id).onsuccess = ev => {
-                    const c = ev.target.result;
-                    if (c) {
-                      c.transcript = text;
-                      store.put(c);
-                    }
-                  };
-                  tx2.oncomplete = () => renderClips();
-                } catch (err) {
-                  alert("Transcription failed: " + err.message);
-                  btn.innerText = '❌';
-                  setTimeout(() => { btn.innerText = originalText; btn.disabled = false; }, 2000);
-                }
-              };
-
-              rowEl.querySelector('.ig-audio-send-btn').onclick = (e) => {
-                e.stopPropagation();
-                core.injectClipToChat(clip.blob, clip.name);
-                const btn = e.target;
-                const originalText = btn.innerText;
+                const blob = await getClipBlob(clip.id);
+                if (blob) core.injectClipToChat(blob, clip.name);
                 btn.innerText = '✅ Sent';
                 setTimeout(() => btn.innerText = originalText, 1000);
               };
@@ -1460,15 +1537,16 @@ LegoCore.registerBlock({
       tx.objectStore('clips').getAll().onsuccess = async e => {
         const clips = e.target.result || [];
         for (let clip of clips) {
+          if (!clip.blob) continue;
           const url = URL.createObjectURL(clip.blob);
           const a = document.createElement('a');
           a.href = url;
           a.download = `${clip.folder || 'General'}.${clip.color || '#0095f6'}.${clip.name}.m4a`;
           document.body.appendChild(a); a.click(); a.remove();
-          URL.revokeObjectURL(url);
           await new Promise(r => setTimeout(r, 150));
+          URL.revokeObjectURL(url);
         }
-        btn.innerText = '📥 Download';
+        btn.innerText = '📥 DL';
       };
     };
 
@@ -1496,7 +1574,7 @@ LegoCore.registerBlock({
       }
       folders.forEach(f => fStore.put({ name: f }));
       tx.oncomplete = () => {
-        batchBtn.innerText = '📤 Batch Upload';
+        batchBtn.innerText = '📤 Upload';
         loadFolders();
         renderClips();
         core.emit('folders:refresh');
@@ -4219,7 +4297,7 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Commands (v29)
+   BLOCK: Commands (v31)
    ============================================================ */
 /* ============================================================
    BLOCK: Commands (v28.1 - Click Shield Bug Fix & Smooth Hover
@@ -4243,85 +4321,6 @@ LegoCore.registerBlock({
 
     let emojiDict = JSON.parse(localStorage.getItem('ig_emoji_dict_v1')) || [];
     core.on('emoji:updated', (newDict) => { emojiDict = newDict; });
-
-    // --- SHARED GEMINI AI ENGINE (CORS-Safe + Auto-Retry) ---
-    window.IgAudioAI = {
-      getSettings() {
-        return JSON.parse(localStorage.getItem('ig_ai_settings_v1')) || { apiKey: '', autoTranscribe: false };
-      },
-      saveSettings(settings) {
-        localStorage.setItem('ig_ai_settings_v1', JSON.stringify(settings));
-      },
-      async blobToBase64(blob) {
-        return new Promise((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onloadend = () => resolve(reader.result.split(',')[1]);
-          reader.onerror = reject;
-          reader.readAsDataURL(blob);
-        });
-      },
-      async transcribeAudio(blob, retries = 3) {
-        const { apiKey } = this.getSettings();
-        if (!apiKey) throw new Error('No API Key configured. Click ⚙️ to add your Gemini API Key.');
-
-        const base64Audio = await this.blobToBase64(blob);
-        const mimeType = blob.type.split(';')[0] || 'audio/mp4';
-        const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${apiKey}`;
-
-        const payload = {
-          contents: [{
-            parts: [
-              { text: "Generate an accurate verbatim transcript of this audio clip. Return ONLY the raw transcript text, no preface or formatting." },
-              { inline_data: { mime_type: mimeType, data: base64Audio } }
-            ]
-          }]
-        };
-
-        for (let attempt = 1; attempt <= retries; attempt++) {
-          try {
-            const text = await new Promise((resolve, reject) => {
-              if (typeof GM_xmlhttpRequest === 'undefined') {
-                return reject(new Error('GM_xmlhttpRequest is not available. Ensure this runs in a userscript manager.'));
-              }
-
-              GM_xmlhttpRequest({
-                method: 'POST',
-                url: endpoint,
-                headers: { 'Content-Type': 'application/json' },
-                data: JSON.stringify(payload),
-                onload: function(response) {
-                  if (response.status >= 200 && response.status < 300) {
-                    try {
-                      const data = JSON.parse(response.responseText);
-                      const resultText = data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
-                      resolve(resultText);
-                    } catch (e) {
-                      reject(new Error('Failed to parse API response.'));
-                    }
-                  } else {
-                    try {
-                      const errData = JSON.parse(response.responseText);
-                      reject(new Error(errData.error?.message || `API error (${response.status})`));
-                    } catch (e) {
-                      reject(new Error(`API error (${response.status})`));
-                    }
-                  }
-                },
-                onerror: function() {
-                  reject(new Error('Network request failed.'));
-                }
-              });
-            });
-            return text;
-          } catch (err) {
-            if (attempt === retries || (!err.message.includes('high demand') && !err.message.includes('503') && !err.message.includes('429'))) {
-              throw err;
-            }
-            await new Promise(r => setTimeout(r, 2000));
-          }
-        }
-      }
-    };
 
     function withDb(cb) {
       const existing = core.getDb();
@@ -4399,33 +4398,75 @@ LegoCore.registerBlock({
       return htmlText;
     }
 
-    function buildSnippetExcerpt(text, tokens, maxChars = 85) {
-      const raw = String(text || '');
-      if (!raw) return '';
-      if (!tokens.length) return raw.slice(0, maxChars);
-
-      const normText = normalizeStr(raw);
-      let earliestIdx = -1;
-
-      tokens.forEach(tok => {
-        const idx = normText.indexOf(tok);
-        if (idx !== -1 && (earliestIdx === -1 || idx < earliestIdx)) earliestIdx = idx;
-      });
-
-      if (earliestIdx === -1) return raw.slice(0, maxChars);
-
-      const start = Math.max(0, earliestIdx - 20);
-      const end = Math.min(raw.length, start + maxChars);
-      let excerpt = raw.substring(start, end).trim();
-      if (start > 0) excerpt = '...' + excerpt;
-      if (end < raw.length) excerpt = excerpt + '...';
-      return excerpt;
-    }
-
     function matchAllTokens(searchPool, tokens) {
       if (!tokens.length) return true;
       const normalizedPool = normalizeStr(searchPool);
       return tokens.every(tok => normalizedPool.includes(tok));
+    }
+
+    // --- Hash-Colored Number & Name Tags (ported from Audio Library) ---
+    function getHashColor(str) {
+      let hash = 0;
+      for (let i = 0; i < str.length; i++) {
+        hash = str.charCodeAt(i) + ((hash << 5) - hash);
+      }
+      const hue = Math.abs(hash % 360);
+      return `hsl(${hue}, 65%, 45%)`;
+    }
+
+    function formatTitleWithTags(rawName, tokens) {
+      const raw = String(rawName || '');
+      // Matches: leading number, optional separators, optional (course name), separators, rest of title
+      const match = raw.match(/^(\d+)([\s\-\.]*)(?:\(([^)]+)\))?([\s\-\.]*)(.*)$/);
+      if (!match) return highlightTokens(raw, tokens);
+
+      const numStr = match[1];
+      const num = parseInt(numStr, 10);
+      const sep1 = match[2] || '';
+      const courseName = match[3];
+      const sep2 = match[4] || '';
+      const rest = match[5] || '';
+
+      let bg = '#64748b'; // default slate
+      if (num === 1) bg = '#10b981'; // Green
+      else if (num === 2) bg = '#ef4444'; // Red
+      else if (num === 3) bg = '#f59e0b'; // Orange
+      else if (num === 4) bg = '#8b5cf6'; // Purple
+      else if (num >= 5) bg = '#3b82f6'; // Blue
+
+      let html = `<span class="ig-pipeline-badge" style="background:${bg};">${numStr}</span>`;
+
+      if (courseName) {
+        const tagColor = getHashColor(courseName.toLowerCase().trim());
+        html += `<span class="ig-course-badge" style="background:${tagColor};">(${highlightTokens(courseName.trim(), tokens)})</span>`;
+        html += `<span>${highlightTokens(sep2 + rest, tokens)}</span>`;
+      } else {
+        html += `<span>${highlightTokens(sep1 + rest, tokens)}</span>`;
+      }
+
+      return html;
+    }
+
+    // --- Most-Recently-Used Tracking ---
+    const RECENT_USAGE_KEY = 'ig_qcx_recent_usage_v1';
+
+    function getRecentUsageMap() {
+      try { return JSON.parse(localStorage.getItem(RECENT_USAGE_KEY)) || {}; }
+      catch (e) { return {}; }
+    }
+    function getItemId(kind, item) {
+      return kind === 'flow' ? item.flow_ns : item.id;
+    }
+    function markUsed(kind, id) {
+      if (id === undefined || id === null) return;
+      const map = getRecentUsageMap();
+      map[`${kind}:${id}`] = Date.now();
+      try { localStorage.setItem(RECENT_USAGE_KEY, JSON.stringify(map)); } catch (e) {}
+    }
+    function getUsageTimestamp(kind, id) {
+      if (id === undefined || id === null) return 0;
+      const map = getRecentUsageMap();
+      return map[`${kind}:${id}`] || 0;
     }
 
     function getImageSets() {
@@ -4531,7 +4572,9 @@ LegoCore.registerBlock({
         });
       }
 
-      results.sort((a, b) => b.score - a.score);
+      // Relevance score first, most-recently-used as tiebreaker for equal-score items
+      results.forEach(r => { r.lastUsed = getUsageTimestamp(r.kind, getItemId(r.kind, r.item)); });
+      results.sort((a, b) => (b.score - a.score) || (b.lastUsed - a.lastUsed));
       return results.slice(0, 8);
     }
 
@@ -4629,9 +4672,10 @@ LegoCore.registerBlock({
       .ig-qcx-dd-row-top { display: flex; align-items: center; gap: 6px; }
       .ig-qcx-dd-title { flex: 1; font-weight: bold; color: #f8fafc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 11px; }
       .ig-qcx-dd-cmd { font-size: 9px; background: rgba(255,255,255,0.12); color: #c9a876; padding: 1px 6px; border-radius: 8px; font-weight: bold; flex-shrink: 0; }
+      .ig-pipeline-badge { display: inline-block; padding: 1px 5px; border-radius: 4px; font-weight: bold; color: #fff; margin-right: 4px; font-size: 10px; box-shadow: 0 1px 2px rgba(0,0,0,0.3); }
+      .ig-course-badge { display: inline-block; padding: 1px 5px; border-radius: 4px; font-weight: bold; color: #fff; margin-right: 4px; font-size: 9px; text-transform: uppercase; box-shadow: 0 1px 2px rgba(0,0,0,0.3); }
       .ig-qcx-dd-edit-btn { background: transparent; border: none; color: #94a3b8; cursor: pointer; font-size: 11px; padding: 2px; border-radius: 4px; transition: 0.2s; flex-shrink: 0; margin-left: auto; opacity: 0.6; pointer-events: auto; }
       .ig-qcx-dd-edit-btn:hover { color: #fff; background: rgba(255,255,255,0.15); opacity: 1; }
-      .ig-qcx-dd-preview { font-size: 10px; color: #94a3b8; margin-top: 2px; padding-left: 20px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .ig-qcx-dd-empty { padding: 10px; text-align: center; color: #94a3b8; font-size: 10px; }
       /* BUG FIX: pointer-events changed to none to allow clicks through the invisible container */
       .ig-qcx-overlay-row { position: absolute; top: 6px; right: 6px; left: 6px; display: flex; align-items: center; justify-content: flex-end; gap: 4px; pointer-events: none; }
@@ -4720,7 +4764,6 @@ LegoCore.registerBlock({
       previewBar.innerHTML = `
         <span class="ig-qcx-preview-label"></span>
         <button class="ig-qcx-icon-btn ig-qcx-preview-play" title="Play audio">▶️</button>
-        <button class="ig-qcx-icon-btn ig-qcx-preview-tx" title="AI Transcribe (manual press)">🤖</button>
         <button class="ig-qcx-icon-btn ig-qcx-preview-save" title="Save clip to library">💾</button>
         <button class="ig-qcx-icon-btn ig-qcx-preview-discard" title="Discard audio">🗑️</button>
       `;
@@ -4734,7 +4777,6 @@ LegoCore.registerBlock({
 
       const previewLabel = previewBar.querySelector('.ig-qcx-preview-label');
       const previewPlayBtn = previewBar.querySelector('.ig-qcx-preview-play');
-      const previewTxBtn = previewBar.querySelector('.ig-qcx-preview-tx');
       const previewSaveBtn = previewBar.querySelector('.ig-qcx-preview-save');
       const previewDiscardBtn = previewBar.querySelector('.ig-qcx-preview-discard');
 
@@ -4913,11 +4955,6 @@ LegoCore.registerBlock({
         const overlay = document.createElement('div');
         overlay.className = 'ig-qcx-modal-overlay';
 
-        let aiBtnHtml = '';
-        if (isAudio && item.blob) {
-            aiBtnHtml = `<button id="ig-qcx-edit-ai-btn" style="background:#334155; color:#fff; border:none; padding:4px 8px; border-radius:4px; font-size:9px; font-weight:bold; cursor:pointer;">🤖 Auto-Transcribe</button>`;
-        }
-
         const bodyLabel = isAudio ? 'Spoken Transcript:' : isText ? 'Message Text:' : isFlow ? 'Transcript / Notes:' : '';
 
         let bodyHtml = '';
@@ -4925,7 +4962,6 @@ LegoCore.registerBlock({
             bodyHtml = `
                 <div style="display:flex; justify-content:space-between; align-items:center; margin-top:4px;">
                     <div class="ig-qcx-modal-label" style="margin:0;">${bodyLabel}</div>
-                    ${aiBtnHtml}
                 </div>
                 <textarea id="ig-qcx-edit-body" class="ig-qcx-modal-textarea">${String(itemBody).replace(/</g, '&lt;')}</textarea>
             `;
@@ -4966,24 +5002,6 @@ LegoCore.registerBlock({
         const closeMod = () => { overlay.remove(); input.focus(); };
         overlay.querySelector('#ig-qcx-edit-close').onclick = closeMod;
         overlay.querySelector('#ig-qcx-edit-cancel').onclick = closeMod;
-
-        if (isAudio && item.blob) {
-            overlay.querySelector('#ig-qcx-edit-ai-btn').onclick = async (e) => {
-                const btn = e.target;
-                btn.innerText = '🤖 Transcribing...';
-                btn.disabled = true;
-                try {
-                    const text = await window.IgAudioAI.transcribeAudio(item.blob);
-                    overlay.querySelector('#ig-qcx-edit-body').value = text;
-                    btn.innerText = '✅ Done';
-                } catch (err) {
-                    alert('Transcription failed: ' + err.message);
-                    btn.innerText = '🤖 Auto-Transcribe';
-                } finally {
-                    btn.disabled = false;
-                }
-            };
-        }
 
         overlay.querySelector('#ig-qcx-edit-save').onclick = () => {
             const newName = overlay.querySelector('#ig-qcx-edit-name').value.trim();
@@ -5083,31 +5101,19 @@ LegoCore.registerBlock({
             const label = m.kind === 'folder-new' ? `Create "${m.name}"` : m.name;
             row.innerHTML = `<div class="ig-qcx-dd-row-top"><span>${icon}</span><span class="ig-qcx-dd-title">${label}</span></div>`;
           } else if (m.kind === 'flow') {
-            const titleHtml = highlightTokens(m.item.name, tokens);
-            let previewText = 'ManyChat Automation';
-            if (m.item.transcript) {
-                const excerpt = buildSnippetExcerpt(m.item.transcript, tokens);
-                previewText = `📄 ${highlightTokens(excerpt, tokens)}`;
-            }
-            row.innerHTML = `<div class="ig-qcx-dd-row-top"><span>🤖</span><span class="ig-qcx-dd-title">${titleHtml}</span>${editBtnHtml}</div><div class="ig-qcx-dd-preview">${previewText}</div>`;
+            const titleHtml = formatTitleWithTags(m.item.name, tokens);
+            row.innerHTML = `<div class="ig-qcx-dd-row-top"><span>🤖</span><span class="ig-qcx-dd-title">${titleHtml}</span>${editBtnHtml}</div>`;
           } else if (m.kind === 'set') {
-            const titleHtml = highlightTokens(m.item.title, tokens);
-            row.innerHTML = `<div class="ig-qcx-dd-row-top"><span>🖼️</span><span class="ig-qcx-dd-title">${titleHtml}</span>${editBtnHtml}</div><div class="ig-qcx-dd-preview">${m.item.images.length} image(s)</div>`;
+            const titleHtml = formatTitleWithTags(m.item.title, tokens);
+            row.innerHTML = `<div class="ig-qcx-dd-row-top"><span>🖼️</span><span class="ig-qcx-dd-title">${titleHtml}</span>${editBtnHtml}</div>`;
           } else if (m.kind === 'text') {
-            const titleHtml = highlightTokens(m.item.title, tokens);
+            const titleHtml = formatTitleWithTags(m.item.title, tokens);
             const cmdBadge = m.item.customCommand ? `<span class="ig-qcx-dd-cmd">/${m.item.customCommand}</span>` : '';
-            const excerpt = buildSnippetExcerpt(m.item.text, tokens);
-            const previewHtml = highlightTokens(excerpt, tokens);
-            row.innerHTML = `<div class="ig-qcx-dd-row-top"><span>📝</span><span class="ig-qcx-dd-title">${titleHtml}</span>${cmdBadge}${editBtnHtml}</div><div class="ig-qcx-dd-preview">${previewHtml}</div>`;
+            row.innerHTML = `<div class="ig-qcx-dd-row-top"><span>📝</span><span class="ig-qcx-dd-title">${titleHtml}</span>${cmdBadge}${editBtnHtml}</div>`;
           } else {
-            const titleHtml = highlightTokens(m.item.name, tokens);
+            const titleHtml = formatTitleWithTags(m.item.name, tokens);
             const cmdBadge = m.item.customCommand ? `<span class="ig-qcx-dd-cmd">/${m.item.customCommand}</span>` : '';
-            let preview = '';
-            if (m.item.transcript) {
-              const excerpt = buildSnippetExcerpt(m.item.transcript, tokens);
-              preview = `<div class="ig-qcx-dd-preview">📄 ${highlightTokens(excerpt, tokens)}</div>`;
-            }
-            row.innerHTML = `<div class="ig-qcx-dd-row-top"><span>🎵</span><span class="ig-qcx-dd-title">${titleHtml}</span>${cmdBadge}${editBtnHtml}</div>${preview}`;
+            row.innerHTML = `<div class="ig-qcx-dd-row-top"><span>🎵</span><span class="ig-qcx-dd-title">${titleHtml}</span>${cmdBadge}${editBtnHtml}</div>`;
           }
 
           row.onmouseenter = () => {
@@ -5207,15 +5213,19 @@ LegoCore.registerBlock({
         }
         if (m.kind === 'flow') {
           pendingFlowNs = m.item.flow_ns; pendingFlowName = m.item.name;
+          markUsed('flow', m.item.flow_ns);
           input.value = ''; closeDropdown(); showFlowPreview(); input.focus(); return;
         }
         if (m.kind === 'set') {
-          pendingSet = m.item; input.value = ''; closeDropdown(); showSetPreview(); input.focus(); return;
+          pendingSet = m.item; markUsed('set', m.item.id);
+          input.value = ''; closeDropdown(); showSetPreview(); input.focus(); return;
         }
         if (m.kind === 'text') {
+          markUsed('text', m.item.id);
           input.value = m.item.text; clearPending(); closeDropdown(); input.focus();
           input.setSelectionRange(input.value.length, input.value.length);
         } else {
+          markUsed('audio', m.item.id);
           pendingAudioBlob = m.item.blob; pendingAudioName = m.item.name; pendingTranscript = m.item.transcript || '';
           input.value = ''; closeDropdown(); showAudioPreview(); input.focus();
         }
@@ -5225,21 +5235,18 @@ LegoCore.registerBlock({
         previewBar.style.display = 'flex';
         previewLabel.innerText = '🤖 ' + pendingFlowName;
         previewPlayBtn.style.display = 'none';
-        previewTxBtn.style.display = 'none';
         previewSaveBtn.style.display = 'none';
       }
       function showAudioPreview() {
         previewBar.style.display = 'flex';
         previewLabel.innerText = '🎵 ' + pendingAudioName;
         previewPlayBtn.style.display = '';
-        previewTxBtn.style.display = '';
         previewSaveBtn.style.display = '';
       }
       function showSetPreview() {
         previewBar.style.display = 'flex';
         previewLabel.innerText = `🖼️ ${pendingSet.title} (${pendingSet.images.length} img)`;
         previewPlayBtn.style.display = 'none';
-        previewTxBtn.style.display = 'none';
         previewSaveBtn.style.display = 'none';
       }
 
@@ -5250,7 +5257,6 @@ LegoCore.registerBlock({
         if (previewPlayer) { previewPlayer.pause(); previewPlayer = null; }
         previewPlayBtn.innerText = '▶️';
         previewPlayBtn.style.display = '';
-        previewTxBtn.style.display = '';
         previewSaveBtn.style.display = '';
         previewDiscardBtn.style.display = '';
       }
@@ -5262,25 +5268,6 @@ LegoCore.registerBlock({
           previewPlayBtn.innerText = '⏹️'; previewPlayer.play();
           previewPlayer.onended = () => { previewPlayBtn.innerText = '▶️'; previewPlayer = null; };
         } else { previewPlayer.pause(); previewPlayer = null; previewPlayBtn.innerText = '▶️'; }
-      };
-
-      // --- MANUAL AI TRANSCRIPTION TRIGGER ---
-      previewTxBtn.onclick = async () => {
-        if (!pendingAudioBlob) return;
-        const originalLabel = previewLabel.innerText;
-        previewTxBtn.disabled = true;
-        previewLabel.innerHTML = '🤖 <i>Transcribing with Gemini...</i>';
-
-        try {
-          const text = await window.IgAudioAI.transcribeAudio(pendingAudioBlob);
-          pendingTranscript = text;
-          previewLabel.innerText = '📄 "' + (text.length > 30 ? text.slice(0, 30) + '...' : text) + '"';
-        } catch (err) {
-          alert('Transcription Error: ' + err.message);
-          previewLabel.innerText = originalLabel;
-        } finally {
-          previewTxBtn.disabled = false;
-        }
       };
 
       // --- INLINE QUICK SAVE MODAL ---
@@ -5319,7 +5306,7 @@ LegoCore.registerBlock({
             </div>
 
             <div class="ig-qcx-modal-label">Spoken Transcript:</div>
-            <textarea id="ig-qcx-save-transcript" class="ig-qcx-modal-textarea" placeholder="Transcript text... (Press 🤖 in the audio bar to auto-generate)">${String(pendingTranscript || '').replace(/</g, '&lt;')}</textarea>
+            <textarea id="ig-qcx-save-transcript" class="ig-qcx-modal-textarea" placeholder="Transcript text...">${String(pendingTranscript || '').replace(/</g, '&lt;')}</textarea>
 
             <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:8px;">
               <button id="ig-qcx-save-cancel" style="background:transparent; color:#94a3b8; border:none; cursor:pointer; font-weight:bold;">Cancel</button>
@@ -5441,7 +5428,7 @@ LegoCore.registerBlock({
             const overrideUser = userMatch[1].trim().replace(/^@/, ''); input.value = ''; closeDropdown();
             core.emit('mc:manual-override', overrideUser);
             previewBar.style.display = 'flex'; previewLabel.innerText = '✅ Username set to @' + overrideUser;
-            previewPlayBtn.style.display = 'none'; previewTxBtn.style.display = 'none'; previewSaveBtn.style.display = 'none'; previewDiscardBtn.style.display = 'none';
+            previewPlayBtn.style.display = 'none'; previewSaveBtn.style.display = 'none'; previewDiscardBtn.style.display = 'none';
             setTimeout(() => { previewBar.style.display = 'none'; previewDiscardBtn.style.display = ''; }, 2000);
             return;
           }
@@ -5518,8 +5505,6 @@ LegoCore.registerBlock({
         e.stopPropagation();
         if (document.querySelector('.ig-qcx-modal-overlay')) return;
 
-        const currentAiSettings = window.IgAudioAI.getSettings();
-
         const overlay = document.createElement('div');
         overlay.className = 'ig-qcx-modal-overlay';
         overlay.innerHTML = `
@@ -5527,15 +5512,6 @@ LegoCore.registerBlock({
             <div style="display:flex; justify-content:space-between; align-items:center;">
               <h3>⚙️ Settings & Commands</h3>
               <button id="ig-qcx-mgr-close" style="background:none; border:none; color:#94a3b8; cursor:pointer; font-size:14px;">✕</button>
-            </div>
-
-            <div style="background:rgba(255,255,255,0.03); border-radius:6px; padding:8px;">
-                <div style="font-size:11px; color:#94a3b8; font-weight:bold; margin-bottom:6px;">🤖 Gemini API Settings</div>
-                <div style="display:flex; gap:6px; align-items:center;">
-                    <input type="password" id="ig-ai-api-key" placeholder="Paste Gemini API Key" value="${currentAiSettings.apiKey || ''}" style="flex:1; background:#1e293b; border:1px solid #475569; color:#fff; padding:6px; border-radius:4px; font-size:11px; outline:none;">
-                    <button id="ig-ai-save-btn" style="background:#10b981; border:none; color:#fff; padding:6px 12px; border-radius:4px; font-size:10px; font-weight:bold; cursor:pointer;">Save Key</button>
-                </div>
-                <div style="font-size:10px; color:#64748b; margin-top:4px;">Tokens are saved: Transcripts are only fetched when you click 🤖 in the audio bar or library.</div>
             </div>
 
             <div class="ig-qcx-shortcut-row" style="display:flex; align-items:center; justify-content:space-between; background:rgba(255,255,255,0.03); border-radius:6px; padding:8px;">
@@ -5548,17 +5524,6 @@ LegoCore.registerBlock({
         `;
         document.body.appendChild(overlay);
         overlay.querySelector('#ig-qcx-mgr-close').onclick = () => overlay.remove();
-
-        overlay.querySelector('#ig-ai-save-btn').onclick = (btnEvent) => {
-            const keyInput = overlay.querySelector('#ig-ai-api-key').value.trim();
-            window.IgAudioAI.saveSettings({ apiKey: keyInput });
-
-            const btn = btnEvent.target;
-            const originalText = btn.innerText;
-            btn.innerText = '✅ Saved';
-            btn.style.background = '#059669';
-            setTimeout(() => { btn.innerText = originalText; btn.style.background = '#10b981'; }, 1000);
-        };
 
         const shortcutCurrentEl = overlay.querySelector('.ig-qcx-shortcut-current');
         const shortcutChangeBtn = overlay.querySelector('.ig-qcx-shortcut-change');
@@ -5797,7 +5762,7 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: ManyChat Integration (v6)
+   BLOCK: ManyChat Integration (v7)
    ============================================================ */
 /* ============================================================
    BLOCK: ManyChat Integration (v13 - Transcripts & Descriptions)
@@ -6248,10 +6213,10 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: ManyChat Username Detector (v4)
+   BLOCK: ManyChat Username Detector (v5)
    ============================================================ */
 /* ============================================================
-   BLOCK: ManyChat Username Detector (v5.2 - Synchronized Memory)
+   BLOCK: ManyChat Username Detector (v5.3 - Stale State Fix)
    ============================================================ */
 LegoCore.registerBlock({
   id: 'igUsernameManyChatBridge',
@@ -6270,9 +6235,10 @@ LegoCore.registerBlock({
     let lookupInFlight = false;
     let lastHighlightedEl = null;
 
-    // --- MANUAL LOCK FLAG ---
+    // --- MANUAL LOCK FLAGS ---
     let manualOverrideLock = false;
     let currentUrl = location.href;
+    let hasClearedEmptyState = false; // Prevents the input from resetting infinitely while empty
 
     function gmRequest(url, options) {
       return new Promise((resolve, reject) => {
@@ -6386,6 +6352,7 @@ LegoCore.registerBlock({
         activeEngine = e.target.value;
         localStorage.setItem(ENGINE_PREF_STORAGE, activeEngine);
         manualOverrideLock = false;
+        hasClearedEmptyState = false;
         runDetection();
     };
 
@@ -6676,16 +6643,26 @@ LegoCore.registerBlock({
         clearManyChatTarget();
         performLookup(username);
         highlightElement(el);
+        hasClearedEmptyState = false; // Reset lock when user is found
       } else if (!username && lastDetected) {
         setDetected(match);
         setIdDisplay(null);
         clearManyChatTarget();
         highlightElement(null);
+        hasClearedEmptyState = false; // Reset lock as we just lost a user
       } else if (username && username === lastDetected) {
         highlightElement(el);
+        hasClearedEmptyState = false; // Keep unlocked while a user exists
       } else if (!username && !lastDetected) {
         setDetected(match);
         highlightElement(null);
+
+        // Stale State Fix: Only clear the target once when idling in an empty state
+        if (!hasClearedEmptyState) {
+          setIdDisplay(null);
+          clearManyChatTarget();
+          hasClearedEmptyState = true;
+        }
       }
     }
 
@@ -6695,6 +6672,11 @@ LegoCore.registerBlock({
             currentUrl = location.href;
             manualOverrideLock = false; // Release the lock
             lastDetected = ''; // Force a fresh visual scan
+            hasClearedEmptyState = false; // Reset the idle clear lock
+
+            clearManyChatTarget(); // Proactively clear ID
+            setIdDisplay(null);
+
             runDetection();
         }
     }, 500);
@@ -6704,6 +6686,7 @@ LegoCore.registerBlock({
     // BREAK LOCK ON REFRESH
     wrap.querySelector('#ig-ub-refresh-btn').onclick = () => {
         manualOverrideLock = false;
+        hasClearedEmptyState = false;
         runDetection();
     };
 
@@ -7444,10 +7427,10 @@ LegoCore.registerBlock({
 
 
 /* ============================================================
-   BLOCK: Master Config Bunny Sync (v4)
+   BLOCK: Master Config Bunny Sync (v5)
    ============================================================ */
 /* ============================================================
-   BLOCK: Central Cloud Sync Center (v4 - Quick Transcript Push)
+   BLOCK: Central Cloud Sync Center (v5 - Wipe & Clone)
    ============================================================ */
 LegoCore.registerBlock({
   id: 'cloudSyncCenterModule',
@@ -7657,11 +7640,14 @@ LegoCore.registerBlock({
         <div class="ig-csc-title">🔴 Audio Library</div>
         <div class="ig-csc-row">
             <button class="ig-csc-btn ig-csc-btn-green" id="ig-csc-push-audio" title="Upload new clips & remove deleted ones">☁️ Smart Backup</button>
-            <button class="ig-csc-btn ig-csc-btn-blue" id="ig-csc-pull-audio" title="Download missing clips">📥 Pull</button>
-            <button class="ig-csc-btn ig-csc-btn-red" id="ig-csc-force-audio" title="Wipe cloud storage and rewrite from local">♻️ Force</button>
+            <button class="ig-csc-btn ig-csc-btn-blue" id="ig-csc-pull-audio" title="Download missing clips">📥 Pull Additions</button>
         </div>
         <div class="ig-csc-row" style="margin-top:2px;">
             <button class="ig-csc-btn ig-csc-btn-purple" id="ig-csc-push-transcripts" title="Instantly backup only text/transcripts without scanning files">📄 Quick Push Transcripts</button>
+        </div>
+        <div class="ig-csc-row" style="margin-top:2px;">
+            <button class="ig-csc-btn ig-csc-btn-red" id="ig-csc-clone-audio" title="Wipe local database and rebuild exactly from cloud">📥 Clone Cloud</button>
+            <button class="ig-csc-btn ig-csc-btn-red" id="ig-csc-force-audio" title="Wipe cloud storage and rewrite exactly from local">☁️ Force Push</button>
         </div>
       </div>
 
@@ -7669,8 +7655,11 @@ LegoCore.registerBlock({
         <div class="ig-csc-title">🖼️ Image Sets</div>
         <div class="ig-csc-row">
             <button class="ig-csc-btn ig-csc-btn-green" id="ig-csc-push-img" title="Upload new images & remove deleted ones">☁️ Smart Backup</button>
-            <button class="ig-csc-btn ig-csc-btn-blue" id="ig-csc-pull-img" title="Download missing images">📥 Pull</button>
-            <button class="ig-csc-btn ig-csc-btn-red" id="ig-csc-force-img" title="Wipe cloud storage and rewrite from local">♻️ Force</button>
+            <button class="ig-csc-btn ig-csc-btn-blue" id="ig-csc-pull-img" title="Download missing images">📥 Pull Additions</button>
+        </div>
+        <div class="ig-csc-row" style="margin-top:2px;">
+            <button class="ig-csc-btn ig-csc-btn-red" id="ig-csc-clone-img" title="Wipe local storage and clone from cloud">📥 Clone Cloud</button>
+            <button class="ig-csc-btn ig-csc-btn-red" id="ig-csc-force-img" title="Wipe cloud storage and rewrite exactly from local">☁️ Force Push</button>
         </div>
       </div>
       <div id="ig-csc-status-bar" class="ig-csc-status">Ready.</div>
@@ -7735,7 +7724,7 @@ LegoCore.registerBlock({
         } catch (e) { unlockUI(`❌ ${e.message}`, true); }
     };
 
-    // --- AUDIO LOGIC (NOW WITH METADATA SYNC) ---
+    // --- AUDIO LOGIC ---
     wrap.querySelector('#ig-csc-push-audio').onclick = async () => {
         if (!setCreds()) return unlockUI('❌ Missing credentials.', true);
         lockUI('☁️ Scanning Audio...');
@@ -7791,7 +7780,6 @@ LegoCore.registerBlock({
             } catch(e) { console.warn("No audio metadata sidecar found."); }
 
             if (!toDownload.length) {
-                // We can still try to sync metadata if there are no new files
                 let updatedCount = 0;
                 if (Array.isArray(cloudMeta) && cloudMeta.length > 0) {
                     const db = core.getDb();
@@ -7835,7 +7823,7 @@ LegoCore.registerBlock({
 
     wrap.querySelector('#ig-csc-force-audio').onclick = async () => {
         if (!setCreds()) return unlockUI('❌ Missing credentials.', true);
-        if (!confirm("⚠️ Wipe cloud audio and rewrite from local database?")) return;
+        if (!confirm("⚠️ Wipe cloud audio and rewrite exactly from local database?")) return;
         lockUI('♻️ Wiping Cloud Audio...');
         try {
             const cloudInv = await getCloudInventory('ig_audio_backup', /\.m4a$/i);
@@ -7856,7 +7844,50 @@ LegoCore.registerBlock({
             }));
             await bunnyRequest('PUT', 'ig_audio_backup/audio_metadata.json', JSON.stringify(metaPayload));
 
-            unlockUI(`✅ Force Mirror Complete! Pushed ${localClips.length} clips and transcripts.`);
+            unlockUI(`✅ Force Push Complete! Rebuilt cloud with ${localClips.length} clips.`);
+        } catch (e) { unlockUI(`❌ ${e.message}`, true); }
+    };
+
+    wrap.querySelector('#ig-csc-clone-audio').onclick = async () => {
+        if (!setCreds()) return unlockUI('❌ Missing credentials.', true);
+        if (!confirm("⚠️ WIPE LOCAL AUDIO? This will delete all audio clips on this PC and replace them exactly with the cloud backup. Proceed?")) return;
+
+        lockUI('🗑️ Wiping local database...');
+        try {
+            // 1. Wipe local DB completely
+            await new Promise((resolve, reject) => {
+                const db = core.getDb();
+                const tx = db.transaction(['clips', 'folders'], 'readwrite');
+                tx.objectStore('clips').clear();
+                tx.objectStore('folders').clear();
+                tx.oncomplete = resolve;
+                tx.onerror = reject;
+            });
+
+            // 2. Fetch inventory and metadata
+            lockUI('📥 Fetching Audio Inventory & Transcripts...');
+            const cloudInv = await getCloudInventory('ig_audio_backup', /\.m4a$/i);
+            let cloudMeta = [];
+            try { cloudMeta = await bunnyRequest('GET', 'ig_audio_backup/audio_metadata.json'); } catch(e) {}
+
+            if (!cloudInv.length) return unlockUI('✅ Local wiped. Cloud is empty.');
+
+            // 3. Rebuild local DB from cloud
+            for (let i=0; i<cloudInv.length; i++) {
+                lockUI(`📥 Audio: Cloning ${i+1}/${cloudInv.length}...`);
+                const c = cloudInv[i];
+                const blob = await bunnyRequest('GET', c.path, null, 'blob');
+                const meta = (Array.isArray(cloudMeta) ? cloudMeta : []).find(m => compareKey(m.folder, m.name) === compareKey(c.folder, c.name)) || {};
+
+                await saveClipToLocalDB({
+                    name: c.name, folder: c.folder, blob: blob,
+                    color: meta.color || '#0095f6',
+                    customCommand: meta.customCommand || '',
+                    transcript: meta.transcript || ''
+                });
+                await new Promise(r => setTimeout(r, 100));
+            }
+            unlockUI(`✅ Local Audio Cloned: ${cloudInv.length} clips restored.`);
         } catch (e) { unlockUI(`❌ ${e.message}`, true); }
     };
 
@@ -7994,6 +8025,51 @@ LegoCore.registerBlock({
                 await new Promise(r => setTimeout(r, 100));
             }
             unlockUI(`✅ Force Mirror Complete! Pushed ${allLocalImgs.length} images.`);
+        } catch (e) { unlockUI(`❌ ${e.message}`, true); }
+    };
+
+    wrap.querySelector('#ig-csc-clone-img').onclick = async () => {
+        if (!setCreds()) return unlockUI('❌ Missing credentials.', true);
+        if (!confirm("⚠️ WIPE LOCAL IMAGES? This will delete all image sets on this PC and replace them exactly with the cloud backup. Proceed?")) return;
+
+        lockUI('🗑️ Wiping local images...');
+        try {
+            // 1. Wipe local Image DB
+            const imgDb = await getImageDb();
+            if (!imgDb) throw new Error("Image DB not initialized.");
+            await new Promise((resolve, reject) => {
+                const tx = imgDb.transaction(['sets'], 'readwrite');
+                tx.objectStore('sets').clear();
+                tx.oncomplete = resolve;
+                tx.onerror = reject;
+            });
+
+            // 2. Fetch inventory
+            lockUI('📥 Fetching Image Inventory...');
+            const cloudInv = await getCloudInventory('ig_image_backup', /\.(jpg|png|jpeg)$/i);
+            if (!cloudInv.length) return unlockUI('✅ Local wiped. Cloud is empty.');
+
+            // 3. Rebuild Image DB from Cloud
+            const tx = imgDb.transaction(['sets'], 'readwrite');
+            const store = tx.objectStore('sets');
+            const setGroups = {};
+            cloudInv.forEach(c => { if (!setGroups[c.folder]) setGroups[c.folder] = []; setGroups[c.folder].push(c); });
+
+            let dCount = 0;
+            let order = 0;
+            for (let setName of Object.keys(setGroups)) {
+                order++;
+                let newSet = { id: 'set_' + Date.now() + Math.random(), title: setName, images: [], order: order };
+                for (let file of setGroups[setName]) {
+                    dCount++; lockUI(`📥 Img: Cloning ${dCount}/${cloudInv.length}...`);
+                    const blob = await bunnyRequest('GET', file.path, null, 'blob');
+                    const thumb = await compressThumbnail(blob);
+                    newSet.images.push({ id: file.name, type: blob.type || 'image/jpeg', blob: blob, thumb: thumb });
+                    await new Promise(r => setTimeout(r, 100));
+                }
+                store.put(newSet);
+            }
+            tx.oncomplete = () => unlockUI(`✅ Local Images Cloned: ${cloudInv.length} files restored.`);
         } catch (e) { unlockUI(`❌ ${e.message}`, true); }
     };
 
