@@ -96,7 +96,7 @@ const LegoCore = (function () {
         const dataTransfer = new DataTransfer();
         dataTransfer.items.add(fileObj);
 
-        const chatZone = getActiveChatZone(); 
+        const chatZone = getActiveChatZone();
 
         if (chatZone) {
             ['dragenter', 'dragover', 'drop'].forEach(eventType => {
@@ -117,7 +117,7 @@ const LegoCore = (function () {
         const dataTransfer = new DataTransfer();
         dataTransfer.items.add(fileObj);
 
-        const chatZone = getActiveChatZone(); 
+        const chatZone = getActiveChatZone();
         if (chatZone) {
             ['dragenter', 'dragover', 'drop'].forEach(eventType => {
                 chatZone.dispatchEvent(new DragEvent(eventType, {
@@ -130,7 +130,7 @@ const LegoCore = (function () {
     }
 
     function injectTextToChat(text) {
-        const chatZone = getActiveChatZone(); 
+        const chatZone = getActiveChatZone();
         if (chatZone) {
             chatZone.focus();
             document.execCommand('insertText', false, text);
@@ -1599,7 +1599,7 @@ LegoCore.registerBlock({
         }
 
         .ig-panel-title { font-size: 10.5px; font-weight: 600; color: var(--igls-text-dim); text-transform: uppercase; }
-        
+
         .ig-panel-search { padding: 10px 12px 0 12px; flex-shrink: 0; }
         .ig-panel-search input {
           width: 100%; box-sizing: border-box; background: var(--igls-surface-2);
@@ -2243,7 +2243,7 @@ LegoCore.registerBlock({
       // Attach listener to minimize button
       const collapseBtn = header.querySelector('.ig-collapse-btn');
       if (collapseBtn) {
-        collapseBtn.innerText = '−'; 
+        collapseBtn.innerText = '−';
         collapseBtn.addEventListener('click', (e) => {
           e.stopPropagation();
           modal.classList.add('is-iconified');
@@ -2300,10 +2300,10 @@ LegoCore.registerBlock({
       modal.addEventListener('mousedown', (e) => {
         // Only accept left-click and ignore nested buttons (like minimize, dock, etc)
         if (e.button !== 0 || e.target.closest('button')) return;
-        
+
         const isHeaderClick = e.target.closest('.ig-menu-header');
         const isIconified = modal.classList.contains('is-iconified');
-        
+
         // Only start drag if we click the header, OR if the whole window is currently a tiny icon
         if (!isHeaderClick && !isIconified) return;
 
@@ -2323,12 +2323,12 @@ LegoCore.registerBlock({
         if (!isDragging) return;
         const dx = e.clientX - startX;
         const dy = e.clientY - startY;
-        
+
         // If mouse moves more than 3px, we register this as a drag, not a click
         if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
           moved = true;
         }
-        
+
         modal.style.left = (initLeft + dx) + 'px';
         modal.style.top = (initTop + dy) + 'px';
       }
@@ -2340,7 +2340,7 @@ LegoCore.registerBlock({
         document.removeEventListener('mouseup', onMouseUp);
 
         const isIconified = modal.classList.contains('is-iconified');
-        
+
         // If it was a tiny icon and we didn't drag it around, it was a click to Expand
         if (isIconified && !moved) {
           modal.classList.remove('is-iconified');
@@ -2630,15 +2630,15 @@ LegoCore.registerBlock({
     let profileData = {
       activeProfile: 'Default',
       profiles: {
-        'Default': {}, 
+        'Default': {},
         'Quick Message Only': { 'audio-quick': true, 'audio-rec': false, 'audio-lib': false, 'command-center-launcher': false },
         'Studio Workstation': { 'audio-quick': false, 'audio-rec': true, 'audio-lib': true, 'command-center-launcher': true },
         'Library Focus': { 'audio-quick': false, 'audio-rec': false, 'audio-lib': true, 'command-center-launcher': true }
       },
-      hiddenCards: {} 
+      hiddenCards: {}
     };
 
-    let windowPos = { top: 60, left: 90 }; 
+    let windowPos = { top: 60, left: 90 };
 
     try {
       const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
@@ -2813,7 +2813,7 @@ LegoCore.registerBlock({
         if (confirm(`Are you sure you want to delete profile "${current}"?`)) {
           delete profileData.profiles[current];
           profileData.activeProfile = 'Default';
-          profileData.hiddenCards = {}; 
+          profileData.hiddenCards = {};
           applyVisibility(); saveProfiles(); win.remove(); openProfileWindow();
         }
       };
@@ -2899,9 +2899,9 @@ LegoCore.registerBlock({
   id: 'igPageResizerFeature',
   init(core) {
     const STATE_KEY = 'ig_page_resizer_state_v2';
-    
+
     let resizerState = JSON.parse(localStorage.getItem(STATE_KEY)) || {
-      enabled: false, editing: false, leftWidth: 156, rightWidth: 248, leftOffset: null, rightOffset: null 
+      enabled: false, editing: false, leftWidth: 156, rightWidth: 248, leftOffset: null, rightOffset: null
     };
 
     function saveState() {
@@ -2949,7 +2949,7 @@ LegoCore.registerBlock({
         transition: background 0.15s, border-color 0.15s; flex: 1;
       }
       .ig-resizer-code-btn:hover { background: rgba(255,255,255,0.1); border-color: var(--igls-accent, #c9a876); }
-      
+
       /* Precision Controls UI */
       .ig-prec-container {
         font-size: 10px; color: var(--igls-text-dim, #96949c);
@@ -3013,7 +3013,7 @@ LegoCore.registerBlock({
 
     function updateCardUI() {
       const toggleResizingBtn = document.getElementById('ig-toggle-resizing-btn');
-      if (!toggleResizingBtn) return; 
+      if (!toggleResizingBtn) return;
 
       const toggleEditingBtn = document.getElementById('ig-toggle-editing-btn');
       const statusText = document.getElementById('ig-resizer-status-text');
@@ -3026,7 +3026,7 @@ LegoCore.registerBlock({
       toggleEditingBtn.style.color = resizerState.editing ? '#fff' : 'var(--igls-text, #ece9e4)';
       statusText.innerText = `Status: ${resizerState.enabled ? (resizerState.editing ? 'RESIZING ACTIVE (Editing)' : 'RESIZING ACTIVE (Locked)') : 'RESIZING OFF'}`;
       statusText.className = `ig-resizer-status ${resizerState.enabled ? 'is-on' : 'is-off'}`;
-      
+
       valLeft.innerText = resizerState.leftWidth;
       valRight.innerText = resizerState.rightWidth;
     }
@@ -3034,7 +3034,7 @@ LegoCore.registerBlock({
     core.on('profile-window:opened', ({ container }) => {
       const section = document.createElement('div');
       section.className = 'ig-profile-section';
-      
+
       section.innerHTML = `
         <span class="ig-profile-section-title">Webpage Resizer</span>
         <div class="ig-resizer-status ${resizerState.enabled ? 'is-on' : 'is-off'}" id="ig-resizer-status-text">
@@ -3044,17 +3044,17 @@ LegoCore.registerBlock({
           <button class="ig-profile-action-btn" id="ig-toggle-resizing-btn" style="flex:1; padding:8px;"></button>
           <button class="ig-profile-action-btn" id="ig-toggle-editing-btn" style="flex:1; padding:8px;"></button>
         </div>
-        
+
         <!-- Precision Taps & Hold Area -->
         <div class="ig-prec-container">
           <div style="display:flex; align-items:center; gap:4px;">
-            <span style="width:24px;">Left:</span> 
+            <span style="width:24px;">Left:</span>
             <span id="ig-val-left" style="color:#fff; font-weight:bold; width:24px;">${resizerState.leftWidth}</span>
             <button class="ig-prec-btn" data-target="left" data-dir="-1">-</button>
             <button class="ig-prec-btn" data-target="left" data-dir="1">+</button>
           </div>
           <div style="display:flex; align-items:center; gap:4px;">
-            <span style="width:28px;">Right:</span> 
+            <span style="width:28px;">Right:</span>
             <span id="ig-val-right" style="color:#fff; font-weight:bold; width:24px;">${resizerState.rightWidth}</span>
             <button class="ig-prec-btn" data-target="right" data-dir="-1">-</button>
             <button class="ig-prec-btn" data-target="right" data-dir="1">+</button>
@@ -3109,14 +3109,14 @@ LegoCore.registerBlock({
             return;
           }
           e.preventDefault();
-          
+
           adjustWidth(target, dir); // Immediate tap
-          
+
           // Wait 300ms, then rapid continuous adjustment
           holdTimeout = setTimeout(() => {
             holdInterval = setInterval(() => {
               adjustWidth(target, dir);
-            }, 25); 
+            }, 25);
           }, 300);
         };
 
@@ -3178,7 +3178,7 @@ LegoCore.registerBlock({
       if (!activeDragHandle || !resizerState.enabled || !resizerState.editing) return;
       if (activeDragHandle === 'left') resizerState.leftWidth = Math.min(500, Math.max(50, e.clientX));
       else if (activeDragHandle === 'right') resizerState.rightWidth = Math.min(500, Math.max(50, window.innerWidth - e.clientX));
-      
+
       applyPageDimensions();
       updateCardUI();
     });
@@ -3202,7 +3202,7 @@ LegoCore.registerBlock({
     });
 
     if (resizerState.leftOffset === null) {
-      setTimeout(recalculateOffsets, 500); 
+      setTimeout(recalculateOffsets, 500);
     }
     applyPageDimensions();
 
@@ -3452,7 +3452,7 @@ LegoCore.registerBlock({
 
     // SAFE PASTE (NO SYNTHETIC ENTER)
     function injectText(text) {
-      const chatZone = core.getActiveChatZone(); 
+      const chatZone = core.getActiveChatZone();
       if (!chatZone) { alert("Open an active Instagram chat window first."); return; }
 
       chatZone.focus();
@@ -3841,18 +3841,18 @@ LegoCore.registerBlock({
    ============================================================ */
 /* ============================================================
    BLOCK: Text Library Image Manager (Right-Side Icon & Viewer)
-   - Completely separate extension. 
+   - Completely separate extension.
    - Handles file uploading, compression, and hover viewing.
    ============================================================ */
 LegoCore.registerBlock({
   id: 'textLibraryImageManager',
   init(core) {
     const PRO_KEY = 'ig_text_library_pro_v1';
-    
+
     const style = document.createElement('style');
     style.innerHTML = `
-      .ig-tln-thumb-btn { 
-        background: transparent; border: none; font-size: 11px; cursor: pointer; 
+      .ig-tln-thumb-btn {
+        background: transparent; border: none; font-size: 11px; cursor: pointer;
         padding: 4px; border-radius: 4px; transition: 0.1s; margin-right: 2px;
       }
       .ig-tln-thumb-btn:hover { background: rgba(255,255,255,0.1); }
@@ -3895,24 +3895,24 @@ LegoCore.registerBlock({
       contentArea.querySelectorAll('.ig-tln-snippet').forEach(row => {
         const id = row.dataset.id;
         const item = libraryData.items.find(i => i.id === id);
-        
+
         if (item && item.thumbnail && !row.querySelector('.ig-tln-thumb-btn')) {
           const actionsDiv = row.querySelector('.ig-tln-actions');
           const btn = document.createElement('button');
           btn.className = 'ig-tln-thumb-btn ig-tln-thumb-icon';
           btn.title = 'Hold to view thumbnail';
           btn.innerText = '🖼️';
-          
+
           btn.onmousedown = (e) => {
             e.stopPropagation();
             thumbViewerImg.src = item.thumbnail;
-            thumbViewer.style.left = (e.clientX - 265) + 'px'; 
+            thumbViewer.style.left = (e.clientX - 265) + 'px';
             thumbViewer.style.top = (e.clientY + 10) + 'px';
             thumbViewer.style.display = 'block';
           };
           const hide = () => thumbViewer.style.display = 'none';
           btn.onmouseup = hide; btn.onmouseleave = hide; btn.onclick = e => e.stopPropagation();
-          
+
           actionsDiv.insertBefore(btn, actionsDiv.firstChild);
         }
       });
@@ -3925,11 +3925,11 @@ LegoCore.registerBlock({
             const overlay = node;
             const modal = overlay.querySelector('#ig-tlp-modal-box');
             const tagSection = Array.from(modal.querySelectorAll('div')).find(d => d.innerText.includes('Assign Tags:'));
-            
+
             if (!tagSection || modal.querySelector('#ig-tlc-thumb-upload')) return;
 
             const currentThumb = overlay.dataset.thumbnail || '';
-            
+
             const thumbUI = document.createElement('div');
             thumbUI.innerHTML = `
               <div style="font-size:11px; font-weight:bold; color:#94a3b8; margin-top:4px;">Thumbnail Image (Optional):</div>
@@ -3939,7 +3939,7 @@ LegoCore.registerBlock({
               </div>
               <img id="ig-tlc-thumb-preview" src="${currentThumb}" style="max-height:40px; border-radius:4px; display:${currentThumb ? 'block' : 'none'}; object-fit:contain; margin-top:4px;">
             `;
-            
+
             modal.insertBefore(thumbUI, tagSection);
 
             const upload = thumbUI.querySelector('#ig-tlc-thumb-upload');
@@ -3950,7 +3950,7 @@ LegoCore.registerBlock({
               const file = e.target.files[0];
               if (file) {
                 compressImage(file, 400, (base64) => {
-                  overlay.dataset.thumbnail = base64; 
+                  overlay.dataset.thumbnail = base64;
                   preview.src = base64;
                   preview.style.display = 'block';
                   clear.style.display = 'block';
@@ -3959,7 +3959,7 @@ LegoCore.registerBlock({
             };
 
             clear.onclick = () => {
-              overlay.dataset.thumbnail = 'CLEAR'; 
+              overlay.dataset.thumbnail = 'CLEAR';
               preview.style.display = 'none';
               clear.style.display = 'none';
               upload.value = '';
@@ -4263,11 +4263,11 @@ LegoCore.registerBlock({
       async transcribeAudio(blob, retries = 3) {
         const { apiKey } = this.getSettings();
         if (!apiKey) throw new Error('No API Key configured. Click ⚙️ to add your Gemini API Key.');
-        
+
         const base64Audio = await this.blobToBase64(blob);
         const mimeType = blob.type.split(';')[0] || 'audio/mp4';
         const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-3.6-flash:generateContent?key=${apiKey}`;
-        
+
         const payload = {
           contents: [{
             parts: [
@@ -4336,7 +4336,7 @@ LegoCore.registerBlock({
     function saveTextLibraryData(data) { localStorage.setItem(TEXT_LIB_KEY, JSON.stringify(data)); }
 
     function getShortcutCombo() {
-      try { const raw = localStorage.getItem(SHORTCUT_KEY); return raw ? JSON.parse(raw) : { ...DEFAULT_SHORTCUT }; } 
+      try { const raw = localStorage.getItem(SHORTCUT_KEY); return raw ? JSON.parse(raw) : { ...DEFAULT_SHORTCUT }; }
       catch (e) { return { ...DEFAULT_SHORTCUT }; }
     }
     function saveShortcutCombo(combo) { localStorage.setItem(SHORTCUT_KEY, JSON.stringify(combo)); }
@@ -4385,7 +4385,7 @@ LegoCore.registerBlock({
       const raw = String(text || '');
       if (!raw) return '';
       let htmlText = raw.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-      
+
       if (tokens && tokens.length) {
         const patterns = tokens.map(tokenToAccentRegex).filter(Boolean);
         if (patterns.length) {
@@ -4445,7 +4445,7 @@ LegoCore.registerBlock({
       return new Promise(async resolve => {
         let imageSets = [];
         try { imageSets = await getImageSets(); } catch(e) {}
-        
+
         withDb(db => {
           if (!db) return resolve({ clips: [], textItems: [], mcFlows: [], imageSets });
           try {
@@ -4748,14 +4748,14 @@ LegoCore.registerBlock({
         const rect = input.getBoundingClientRect();
         const gap = 8;
         const spaceAbove = Math.max(120, rect.top - gap - 12);
-        
+
         dropdownEl.style.left = rect.left + 'px';
         dropdownEl.style.width = rect.width + 'px';
-        
+
         dropdownEl.style.top = 'auto';
         dropdownEl.style.bottom = (window.innerHeight - rect.top + gap) + 'px';
         dropdownEl.style.maxHeight = Math.min(320, spaceAbove) + 'px';
-        
+
         document.body.appendChild(dropdownEl);
       }
 
@@ -4773,7 +4773,7 @@ LegoCore.registerBlock({
         transcriptPanelEl.style.bottom = dropdownEl.style.bottom;
         transcriptPanelEl.style.maxHeight = dropdownEl.style.maxHeight;
         transcriptPanelEl.style.width = panelWidth + 'px';
-        
+
         document.body.appendChild(transcriptPanelEl);
       }
 
@@ -4781,50 +4781,50 @@ LegoCore.registerBlock({
         if (!dropdownOpen || !matches.length) { transcriptPanelEl.style.display = 'none'; return; }
         const m = matches[selectedIndex];
         transcriptPanelEl.style.display = 'flex';
-        
+
         const activeTokens = currentSearchTokens;
 
         if (m && m.kind === 'audio') {
           const rawTranscript = String(m.item.transcript || '').trim();
-          const highlightedBody = rawTranscript 
-            ? highlightTokens(rawTranscript, activeTokens) 
+          const highlightedBody = rawTranscript
+            ? highlightTokens(rawTranscript, activeTokens)
             : '<span class="ig-qcx-transcript-empty">No transcript yet.</span>';
 
           transcriptPanelEl.innerHTML = `
             <div class="ig-qcx-transcript-title">🎵 ${m.item.name}</div>
             <div class="ig-qcx-transcript-body">${highlightedBody}</div>
           `;
-          
+
           const firstMark = transcriptPanelEl.querySelector('mark');
           if (firstMark) {
             firstMark.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
           }
         } else if (m && m.kind === 'flow') {
           const rawTranscript = String(m.item.transcript || '').trim();
-          const highlightedBody = rawTranscript 
-            ? highlightTokens(rawTranscript, activeTokens) 
+          const highlightedBody = rawTranscript
+            ? highlightTokens(rawTranscript, activeTokens)
             : '<span class="ig-qcx-transcript-empty">No notes or transcript saved for this automation.</span>';
 
           transcriptPanelEl.innerHTML = `
             <div class="ig-qcx-transcript-title">🤖 ${m.item.name}</div>
             <div class="ig-qcx-transcript-body">${highlightedBody}</div>
           `;
-          
+
           const firstMark = transcriptPanelEl.querySelector('mark');
           if (firstMark) {
             firstMark.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
           }
         } else if (m && m.kind === 'text') {
           const rawTranscript = String(m.item.text || '').trim();
-          const highlightedBody = rawTranscript 
-            ? highlightTokens(rawTranscript, activeTokens) 
+          const highlightedBody = rawTranscript
+            ? highlightTokens(rawTranscript, activeTokens)
             : '<span class="ig-qcx-transcript-empty">No text saved.</span>';
 
           transcriptPanelEl.innerHTML = `
             <div class="ig-qcx-transcript-title">📝 ${m.item.title}</div>
             <div class="ig-qcx-transcript-body">${highlightedBody}</div>
           `;
-          
+
           const firstMark = transcriptPanelEl.querySelector('mark');
           if (firstMark) {
             firstMark.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
@@ -4877,10 +4877,10 @@ LegoCore.registerBlock({
       let previewPlayer = null;
 
       function openDropdown() {
-        dropdownOpen = true; 
+        dropdownOpen = true;
         document.body.appendChild(dropdownEl);
         document.body.appendChild(transcriptPanelEl);
-        positionDropdown(); 
+        positionDropdown();
         dropdownEl.style.display = 'flex';
         renderDropdown();
         window.addEventListener('scroll', onViewportChange, true);
@@ -4898,13 +4898,13 @@ LegoCore.registerBlock({
       function openItemEditModal(m) {
         if (document.querySelector('.ig-qcx-modal-overlay')) return;
         const item = m.item;
-        
+
         const isAudio = m.kind === 'audio';
         const isText = m.kind === 'text';
         const isFlow = m.kind === 'flow';
         const isSet = m.kind === 'set';
 
-        if (!isAudio && !isText && !isFlow && !isSet) return; 
+        if (!isAudio && !isText && !isFlow && !isSet) return;
 
         const itemName = item.name || item.title || '';
         const itemCmd = item.customCommand || '';
@@ -4912,14 +4912,14 @@ LegoCore.registerBlock({
 
         const overlay = document.createElement('div');
         overlay.className = 'ig-qcx-modal-overlay';
-        
+
         let aiBtnHtml = '';
         if (isAudio && item.blob) {
             aiBtnHtml = `<button id="ig-qcx-edit-ai-btn" style="background:#334155; color:#fff; border:none; padding:4px 8px; border-radius:4px; font-size:9px; font-weight:bold; cursor:pointer;">🤖 Auto-Transcribe</button>`;
         }
 
         const bodyLabel = isAudio ? 'Spoken Transcript:' : isText ? 'Message Text:' : isFlow ? 'Transcript / Notes:' : '';
-        
+
         let bodyHtml = '';
         if (!isSet) {
             bodyHtml = `
@@ -4948,13 +4948,13 @@ LegoCore.registerBlock({
               <h3>✏️ Quick Edit (${m.kind})</h3>
               <button id="ig-qcx-edit-close" style="background:none; border:none; color:#94a3b8; cursor:pointer; font-size:14px;">✕</button>
             </div>
-            
+
             <div class="ig-qcx-modal-label">Name / Title:</div>
             <input type="text" id="ig-qcx-edit-name" class="ig-qcx-modal-input" value="${itemName.replace(/"/g, '&quot;')}">
-            
+
             ${cmdHtml}
             ${bodyHtml}
-            
+
             <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:8px;">
               <button id="ig-qcx-edit-cancel" style="background:transparent; color:#94a3b8; border:none; cursor:pointer; font-weight:bold;">Cancel</button>
               <button id="ig-qcx-edit-save" style="background:#10b981; color:#fff; border:none; padding:7px 14px; border-radius:4px; font-weight:bold; cursor:pointer;">💾 Save Changes</button>
@@ -5007,7 +5007,7 @@ LegoCore.registerBlock({
                     };
                     tx.oncomplete = () => {
                         core.emit('library:refresh');
-                        recomputeMatches(); 
+                        recomputeMatches();
                         closeMod();
                     };
                 });
@@ -5070,7 +5070,7 @@ LegoCore.registerBlock({
         matches.forEach((m, idx) => {
           const row = document.createElement('div');
           row.className = 'ig-qcx-dd-row' + (idx === selectedIndex ? ' selected' : '');
-          
+
           let editBtnHtml = '';
           if (['audio', 'text', 'flow', 'set'].includes(m.kind)) {
               editBtnHtml = `<button class="ig-qcx-dd-edit-btn" title="Quick Edit">✏️</button>`;
@@ -5109,15 +5109,15 @@ LegoCore.registerBlock({
             }
             row.innerHTML = `<div class="ig-qcx-dd-row-top"><span>🎵</span><span class="ig-qcx-dd-title">${titleHtml}</span>${cmdBadge}${editBtnHtml}</div>${preview}`;
           }
-          
-          row.onmouseenter = () => { 
+
+          row.onmouseenter = () => {
             if (selectedIndex !== idx) {
-                selectedIndex = idx; 
-                updateSelection(); 
+                selectedIndex = idx;
+                updateSelection();
             }
           };
           row.onclick = () => { selectedIndex = idx; pickSelected(); };
-          
+
           const editBtn = row.querySelector('.ig-qcx-dd-edit-btn');
           if (editBtn) {
               editBtn.onclick = (e) => {
@@ -5163,14 +5163,14 @@ LegoCore.registerBlock({
 
         // STRICT GUARD RESTORED: Stop here if not starting with slash
         if (!val.startsWith('/')) { closeDropdown(); return; }
-        
+
         if (/^\/save\s+audio\s+[^.]+\..*$/i.test(val)) { closeDropdown(); return; }
 
         let mode = 'all';
         const remainder = val.slice(1);
         const lower = remainder.toLowerCase();
         let q = remainder;
-        
+
         if (lower.startsWith('user ') || lower === 'user') { closeDropdown(); return; }
         if (lower.startsWith('text ')) { mode = 'text'; q = remainder.slice(5); }
         else if (lower === 'text') { mode = 'text'; q = ''; }
@@ -5182,11 +5182,11 @@ LegoCore.registerBlock({
         else if (lower === 'set') { mode = 'set'; q = ''; }
 
         currentSearchTokens = getSearchTokens(q);
-        
+
         const { clips, textItems, mcFlows, imageSets } = await getAllSearchableItems();
         matches = computeMatches(q, mode, clips, textItems, mcFlows, imageSets);
-        selectedIndex = 0; 
-        
+        selectedIndex = 0;
+
         if (matches.length > 0) openDropdown(); else closeDropdown();
       }
 
@@ -5221,24 +5221,24 @@ LegoCore.registerBlock({
         }
       }
 
-      function showFlowPreview() { 
-        previewBar.style.display = 'flex'; 
-        previewLabel.innerText = '🤖 ' + pendingFlowName; 
-        previewPlayBtn.style.display = 'none'; 
+      function showFlowPreview() {
+        previewBar.style.display = 'flex';
+        previewLabel.innerText = '🤖 ' + pendingFlowName;
+        previewPlayBtn.style.display = 'none';
         previewTxBtn.style.display = 'none';
         previewSaveBtn.style.display = 'none';
       }
-      function showAudioPreview() { 
-        previewBar.style.display = 'flex'; 
-        previewLabel.innerText = '🎵 ' + pendingAudioName; 
-        previewPlayBtn.style.display = ''; 
+      function showAudioPreview() {
+        previewBar.style.display = 'flex';
+        previewLabel.innerText = '🎵 ' + pendingAudioName;
+        previewPlayBtn.style.display = '';
         previewTxBtn.style.display = '';
         previewSaveBtn.style.display = '';
       }
-      function showSetPreview() { 
-        previewBar.style.display = 'flex'; 
-        previewLabel.innerText = `🖼️ ${pendingSet.title} (${pendingSet.images.length} img)`; 
-        previewPlayBtn.style.display = 'none'; 
+      function showSetPreview() {
+        previewBar.style.display = 'flex';
+        previewLabel.innerText = `🖼️ ${pendingSet.title} (${pendingSet.images.length} img)`;
+        previewPlayBtn.style.display = 'none';
         previewTxBtn.style.display = 'none';
         previewSaveBtn.style.display = 'none';
       }
@@ -5248,7 +5248,7 @@ LegoCore.registerBlock({
         pendingFlowNs = null; pendingFlowName = ''; pendingSet = null;
         previewBar.style.display = 'none';
         if (previewPlayer) { previewPlayer.pause(); previewPlayer = null; }
-        previewPlayBtn.innerText = '▶️'; 
+        previewPlayBtn.innerText = '▶️';
         previewPlayBtn.style.display = '';
         previewTxBtn.style.display = '';
         previewSaveBtn.style.display = '';
@@ -5299,10 +5299,10 @@ LegoCore.registerBlock({
               <h3>💾 Save Audio Clip</h3>
               <button id="ig-qcx-save-close" style="background:none; border:none; color:#94a3b8; cursor:pointer; font-size:14px;">✕</button>
             </div>
-            
+
             <div class="ig-qcx-modal-label">Clip Name:</div>
             <input type="text" id="ig-qcx-save-name" class="ig-qcx-modal-input" value="${defaultName.replace(/"/g, '&quot;')}">
-            
+
             <div class="ig-qcx-modal-label">Folder / Group:</div>
             <div style="display:flex; gap:6px;">
               <select id="ig-qcx-save-folder-select" class="ig-qcx-modal-input" style="flex:1;">
@@ -5320,7 +5320,7 @@ LegoCore.registerBlock({
 
             <div class="ig-qcx-modal-label">Spoken Transcript:</div>
             <textarea id="ig-qcx-save-transcript" class="ig-qcx-modal-textarea" placeholder="Transcript text... (Press 🤖 in the audio bar to auto-generate)">${String(pendingTranscript || '').replace(/</g, '&lt;')}</textarea>
-            
+
             <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:8px;">
               <button id="ig-qcx-save-cancel" style="background:transparent; color:#94a3b8; border:none; cursor:pointer; font-weight:bold;">Cancel</button>
               <button id="ig-qcx-save-confirm" style="background:#10b981; color:#fff; border:none; padding:7px 14px; border-radius:4px; font-weight:bold; cursor:pointer;">💾 Commit to Library</button>
@@ -5331,7 +5331,7 @@ LegoCore.registerBlock({
 
         const folderSel = overlay.querySelector('#ig-qcx-save-folder-select');
         const folderNewInput = overlay.querySelector('#ig-qcx-save-folder-new');
-        
+
         folderSel.onchange = () => {
           if (folderSel.value === '__new__') {
             folderNewInput.style.display = 'block';
@@ -5383,7 +5383,7 @@ LegoCore.registerBlock({
       previewDiscardBtn.onclick = () => clearPending();
 
       function sendImageSet(setObj, btnEl) {
-        const chatZone = core.getActiveChatZone(); 
+        const chatZone = core.getActiveChatZone();
         if (!chatZone) { alert("Open an active Instagram chat window first."); return; }
         const original = btnEl.innerText; btnEl.innerText = '⏳';
         const dt = new DataTransfer();
@@ -5399,7 +5399,7 @@ LegoCore.registerBlock({
       }
 
       function sendText(text) {
-        const chatZone = core.getActiveChatZone(); 
+        const chatZone = core.getActiveChatZone();
         if (!chatZone) { alert("Open an active chat window first."); return; }
         chatZone.focus();
         document.execCommand('insertText', false, text);
@@ -5451,8 +5451,8 @@ LegoCore.registerBlock({
       });
       document.addEventListener('click', (e) => { if (dropdownOpen && !wrapper.contains(e.target) && !dropdownEl.contains(e.target)) closeDropdown(); });
 
-      let mediaRecorder; 
-      let audioChunks = []; 
+      let mediaRecorder;
+      let audioChunks = [];
       let isRecording = false;
       let isFinishing = false;
       let lagTimeoutId = null;
@@ -5462,7 +5462,7 @@ LegoCore.registerBlock({
       navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
         mediaRecorder = new MediaRecorder(stream);
         mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
-        
+
         mediaRecorder.onstop = async () => {
           let blob = new Blob(audioChunks, { type: 'audio/mp4' });
           audioChunks = [];
@@ -5478,9 +5478,9 @@ LegoCore.registerBlock({
           if (trimStart || trimEnd) blob = await detectAndTrimSilence(blob, trimStart, trimEnd, threshold);
           if (mySession !== activeSessionId) return;
 
-          pendingAudioBlob = blob; 
+          pendingAudioBlob = blob;
           pendingAudioName = 'quick_audio_' + Date.now();
-          pendingTranscript = ''; 
+          pendingTranscript = '';
           showAudioPreview();
         };
       }).catch(err => console.warn("[QuickCommandExtension] Mic error:", err));
@@ -5528,7 +5528,7 @@ LegoCore.registerBlock({
               <h3>⚙️ Settings & Commands</h3>
               <button id="ig-qcx-mgr-close" style="background:none; border:none; color:#94a3b8; cursor:pointer; font-size:14px;">✕</button>
             </div>
-            
+
             <div style="background:rgba(255,255,255,0.03); border-radius:6px; padding:8px;">
                 <div style="font-size:11px; color:#94a3b8; font-weight:bold; margin-bottom:6px;">🤖 Gemini API Settings</div>
                 <div style="display:flex; gap:6px; align-items:center;">
@@ -5552,7 +5552,7 @@ LegoCore.registerBlock({
         overlay.querySelector('#ig-ai-save-btn').onclick = (btnEvent) => {
             const keyInput = overlay.querySelector('#ig-ai-api-key').value.trim();
             window.IgAudioAI.saveSettings({ apiKey: keyInput });
-            
+
             const btn = btnEvent.target;
             const originalText = btn.innerText;
             btn.innerText = '✅ Saved';
@@ -5767,15 +5767,15 @@ LegoCore.registerBlock({
 
       const observer = new MutationObserver(() => {
         // FIX: Pause observer to prevent infinite loop during DOM appendChild operations
-        observer.disconnect(); 
-        
+        observer.disconnect();
+
         container.querySelectorAll('.ig-draggable-menu').forEach(card => processCard(card, side, container));
         applyStoredOrder(container, side);
-        
+
         // Resume observer after DOM is settled
-        observer.observe(container, { childList: true }); 
+        observer.observe(container, { childList: true });
       });
-      
+
       observer.observe(container, { childList: true });
     }
 
@@ -6107,8 +6107,8 @@ LegoCore.registerBlock({
 
     function openEditFlowModal(flow) {
       if (document.getElementById('ig-mc-edit-flow-modal')) return;
-      const overlay = document.createElement('div'); 
-      overlay.className = 'ig-mc-modal-overlay'; 
+      const overlay = document.createElement('div');
+      overlay.className = 'ig-mc-modal-overlay';
       overlay.id = 'ig-mc-edit-flow-modal';
       overlay.innerHTML = `
         <div class="ig-mc-modal">
@@ -6132,21 +6132,21 @@ LegoCore.registerBlock({
       document.body.appendChild(overlay);
       overlay.querySelector('#ig-mc-edit-close').onclick = () => overlay.remove();
       overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
-      const idInput = overlay.querySelector('#ig-mc-edit-id-input'); 
+      const idInput = overlay.querySelector('#ig-mc-edit-id-input');
       const idPreview = overlay.querySelector('#ig-mc-edit-flow-id-preview');
       const transcriptInput = overlay.querySelector('#ig-mc-edit-transcript-input');
       idInput.addEventListener('input', () => { idPreview.textContent = idInput.value || '(empty)'; });
       overlay.querySelector('#ig-mc-edit-copy').onclick = () => { navigator.clipboard.writeText(idInput.value).then(() => { showMessage('Flow ID copied to clipboard.', 'success'); }).catch(() => {}); };
       overlay.querySelector('#ig-mc-edit-save').onclick = () => {
-        const newName = overlay.querySelector('#ig-mc-edit-name-input').value.trim(); 
+        const newName = overlay.querySelector('#ig-mc-edit-name-input').value.trim();
         const newId = idInput.value.trim();
         const newTx = transcriptInput.value.trim();
         if (!newName || !newId) { alert('Name and Flow ID cannot be empty.'); return; }
-        flow.name = newName; 
-        flow.flow_ns = newId; 
+        flow.name = newName;
+        flow.flow_ns = newId;
         flow.transcript = newTx;
-        saveFlows(); 
-        renderFlows(); 
+        saveFlows();
+        renderFlows();
         overlay.remove();
       };
     }
@@ -6158,7 +6158,7 @@ LegoCore.registerBlock({
       if (!subscriberId) { showMessage('Set a Target Subscriber ID first.', 'error'); return; }
       const numericId = parseInt(subscriberId, 10);
       if (isNaN(numericId)) { showMessage('Invalid Subscriber ID. Must be a number.', 'error'); return; }
-      
+
       const payload = { subscriber_id: numericId, flow_ns: flow.flow_ns };
       showMessage('Sending "' + flow.name + '"...', null);
       try {
@@ -6414,12 +6414,12 @@ LegoCore.registerBlock({
 
     function fillManyChatTarget(subscriberId) {
       // Isolate memory strictly to THIS specific tab
-      sessionStorage.setItem('mc_target_subscriber_v1', String(subscriberId)); 
-      
+      sessionStorage.setItem('mc_target_subscriber_v1', String(subscriberId));
+
       // Update ALL ghosted and active inputs to ensure complete synchronization
       const allInputs = document.querySelectorAll('#ig-mc-target-input');
       if (!allInputs.length) return false;
-      
+
       allInputs.forEach(input => {
           input.value = String(subscriberId);
           input.dispatchEvent(new Event('input', { bubbles: true }));
@@ -6805,7 +6805,7 @@ LegoCore.registerBlock({
     const resetBtn = document.createElement('button');
     resetBtn.innerText = '⛑️ Reset Menus';
     resetBtn.title = 'Click to reset all floating window positions if they get stuck off-screen';
-    
+
     resetBtn.style.cssText = `
       position: fixed;
       bottom: 12px;
@@ -6838,20 +6838,20 @@ LegoCore.registerBlock({
       if (confirm("Reset all floating menu positions? This will reload the page.")) {
         // 1. Clear Popped-out cards
         localStorage.removeItem('ig_menu_inpage_popouts_v1');
-        
+
         // 2. Clear Workspace Profile window
         localStorage.removeItem('ig_workspace_profile_window_pos_v1');
-        
+
         // 3. Clear Text Library Filter window
         localStorage.removeItem('ig_tl_notion_filter_pos');
-        
+
         // Reload to apply the fresh state
         window.location.reload();
       }
     };
 
     document.body.appendChild(resetBtn);
-    
+
     core.emit('block:ready', { id: 'floatingMenuRescueModule' });
   }
 });
@@ -6957,8 +6957,8 @@ LegoCore.registerBlock({
 
     function openSetEditor(existingSet) {
       const isEdit = !!existingSet;
-      let draftImages = isEdit ? [...existingSet.images] : []; 
-      
+      let draftImages = isEdit ? [...existingSet.images] : [];
+
       const overlay = document.createElement('div');
       overlay.className = 'ig-isl-modal-overlay';
       overlay.innerHTML = `
@@ -7049,7 +7049,7 @@ LegoCore.registerBlock({
         if (!draftImages.length) { alert("Please add at least one image to save a set."); return; }
         const tx = db.transaction(['sets'], 'readwrite');
         const store = tx.objectStore('sets');
-        
+
         if (isEdit) {
           existingSet.title = title; existingSet.images = draftImages; store.put(existingSet);
         } else {
@@ -7089,13 +7089,13 @@ LegoCore.registerBlock({
       const targetEl = e.currentTarget;
       document.querySelectorAll('.ig-isl-drop-top, .ig-isl-drop-bottom').forEach(el => el.classList.remove('ig-isl-drop-top', 'ig-isl-drop-bottom'));
       if (!draggedItem || draggedItem === id) return;
-      const rect = targetEl.getBoundingClientRect(); const y = e.clientY - rect.top; 
+      const rect = targetEl.getBoundingClientRect(); const y = e.clientY - rect.top;
       if (y < rect.height / 2) targetEl.classList.add('ig-isl-drop-top'); else targetEl.classList.add('ig-isl-drop-bottom');
     }
     function handleDrop(e, targetId) {
       e.preventDefault(); e.stopPropagation();
       if (!draggedItem || draggedItem === targetId) return;
-      const targetEl = e.currentTarget; const rect = targetEl.getBoundingClientRect(); const y = e.clientY - rect.top; 
+      const targetEl = e.currentTarget; const rect = targetEl.getBoundingClientRect(); const y = e.clientY - rect.top;
       const tx = db.transaction(['sets'], 'readwrite');
       const store = tx.objectStore('sets');
       store.getAll().onsuccess = ev => {
@@ -7112,7 +7112,7 @@ LegoCore.registerBlock({
     }
 
     function sendImageSet(setObj, btnEl) {
-      const chatZone = core.getActiveChatZone(); 
+      const chatZone = core.getActiveChatZone();
       if (!chatZone) { alert("Open an active Instagram chat window first."); return; }
       const original = btnEl.innerText; btnEl.innerText = '⏳';
       const dt = new DataTransfer();
@@ -7190,7 +7190,7 @@ LegoCore.registerBlock({
   id: 'emojiSettingsModule',
   init(core) {
     const STORAGE_KEY = 'ig_emoji_dict_v1';
-    
+
     const defaultEmojis = [
       { e: '😀', k: 'happy' }, { e: '😂', k: 'laugh' }, { e: '🤣', k: 'rofl' },
       { e: '😍', k: 'hearteyes' }, { e: '🥰', k: 'love' }, { e: '😊', k: 'smile' },
@@ -7269,12 +7269,12 @@ LegoCore.registerBlock({
       const eVal = wrap.querySelector('#ig-emj-val').value.trim();
       const kVal = wrap.querySelector('#ig-emj-key').value.trim().toLowerCase().replace(/[^a-z0-9_]/g, '');
       if (!eVal || !kVal) return alert('Provide both an emoji and a keyword (no spaces).');
-      
+
       // Check if keyword already exists
       const existing = dict.findIndex(i => i.k === kVal);
       if (existing > -1) dict[existing].e = eVal;
       else dict.unshift({ e: eVal, k: kVal });
-      
+
       saveDict();
       wrap.querySelector('#ig-emj-val').value = '';
       wrap.querySelector('#ig-emj-key').value = '';
@@ -7295,7 +7295,7 @@ LegoCore.registerBlock({
       }
     }
     mountCard();
-    
+
     // Send initial payload out just in case QC loads after
     setTimeout(() => core.emit('emoji:updated', dict), 500);
 
@@ -7453,7 +7453,7 @@ LegoCore.registerBlock({
   id: 'cloudSyncCenterModule',
   init(core) {
     const BUNNY_PREFS_KEY = 'ig_bunny_sync_prefs_v1';
-    
+
     // Everything to bundle into master_config.json
     const MASTER_KEYS = [
         'ig_text_library_pro_v1', 'ig_tl_col_widths_v1', 'mc_flows_cache_v1',
@@ -7586,7 +7586,7 @@ LegoCore.registerBlock({
         try {
             const rootItems = await bunnyRequest('GET', folderPath + '/');
             if (!Array.isArray(rootItems)) return inventory;
-            
+
             for (let item of rootItems) {
                 if (item.IsDirectory) {
                     const files = await bunnyRequest('GET', `${folderPath}/${encodeURIComponent(item.ObjectName)}/`);
@@ -7685,7 +7685,7 @@ LegoCore.registerBlock({
     // UI State Management
     const statusEl = wrap.querySelector('#ig-csc-status-bar');
     const allBtns = Array.from(wrap.querySelectorAll('.ig-csc-btn'));
-    
+
     function setCreds() {
         prefs.zoneName = wrap.querySelector('#ig-csc-zone').value.trim();
         prefs.apiKey = wrap.querySelector('#ig-csc-key').value.trim();
@@ -7751,10 +7751,10 @@ LegoCore.registerBlock({
 
             // Extract transcripts and metadata into a sidecar file
             const metaPayload = localClips.map(c => ({
-                name: c.name, folder: c.folder, color: c.color, 
+                name: c.name, folder: c.folder, color: c.color,
                 customCommand: c.customCommand || '', transcript: c.transcript || ''
             }));
-            
+
             if (!toUpload.length && !toDelete.length) {
                 lockUI('☁️ Syncing metadata updates...');
                 await bunnyRequest('PUT', 'ig_audio_backup/audio_metadata.json', JSON.stringify(metaPayload));
@@ -7768,10 +7768,10 @@ LegoCore.registerBlock({
                 await bunnyRequest('PUT', `ig_audio_backup/${encodeURIComponent(safeString(c.folder))}/${encodeURIComponent(safeString(c.name))}.m4a`, await blobToArrayBuffer(c.blob));
                 await new Promise(r => setTimeout(r, 100));
             }
-            
+
             lockUI('☁️ Saving Transcripts & Metadata...');
             await bunnyRequest('PUT', 'ig_audio_backup/audio_metadata.json', JSON.stringify(metaPayload));
-            
+
             unlockUI(`✅ Audio Backup: Uploaded ${toUpload.length}, Deleted ${toDelete.length}. Transcripts saved.`);
         } catch (e) { unlockUI(`❌ ${e.message}`, true); }
     };
@@ -7786,8 +7786,8 @@ LegoCore.registerBlock({
             const toDownload = cloudInv.filter(c => !localKeys.has(compareKey(c.folder, c.name)));
 
             let cloudMeta = [];
-            try { 
-                cloudMeta = await bunnyRequest('GET', 'ig_audio_backup/audio_metadata.json'); 
+            try {
+                cloudMeta = await bunnyRequest('GET', 'ig_audio_backup/audio_metadata.json');
             } catch(e) { console.warn("No audio metadata sidecar found."); }
 
             if (!toDownload.length) {
@@ -7818,12 +7818,12 @@ LegoCore.registerBlock({
                 lockUI(`📥 Audio: Pulling ${i+1}/${toDownload.length}...`);
                 const c = toDownload[i];
                 const blob = await bunnyRequest('GET', c.path, null, 'blob');
-                
+
                 const meta = (Array.isArray(cloudMeta) ? cloudMeta : []).find(m => compareKey(m.folder, m.name) === compareKey(c.folder, c.name)) || {};
-                
-                await saveClipToLocalDB({ 
-                    name: c.name, folder: c.folder, blob: blob, 
-                    color: meta.color || '#0095f6', 
+
+                await saveClipToLocalDB({
+                    name: c.name, folder: c.folder, blob: blob,
+                    color: meta.color || '#0095f6',
                     customCommand: meta.customCommand || '',
                     transcript: meta.transcript || ''
                 });
@@ -7848,10 +7848,10 @@ LegoCore.registerBlock({
                 await bunnyRequest('PUT', `ig_audio_backup/${encodeURIComponent(safeString(c.folder))}/${encodeURIComponent(safeString(c.name))}.m4a`, await blobToArrayBuffer(c.blob));
                 await new Promise(r => setTimeout(r, 100));
             }
-            
+
             lockUI('☁️ Pushing Audio Metadata...');
             const metaPayload = localClips.map(c => ({
-                name: c.name, folder: c.folder, color: c.color, 
+                name: c.name, folder: c.folder, color: c.color,
                 customCommand: c.customCommand || '', transcript: c.transcript || ''
             }));
             await bunnyRequest('PUT', 'ig_audio_backup/audio_metadata.json', JSON.stringify(metaPayload));
@@ -7863,21 +7863,21 @@ LegoCore.registerBlock({
     // --- QUICK PUSH TRANSCRIPTS (BYPASS) ---
     wrap.querySelector('#ig-csc-push-transcripts').onclick = async () => {
         if (!setCreds()) return unlockUI('❌ Missing credentials.', true);
-        
+
         const btn = wrap.querySelector('#ig-csc-push-transcripts');
         const originalText = btn.innerText;
         btn.innerText = '⏳ Saving...';
         btn.disabled = true;
-        
+
         try {
             const localClips = await getLocalClips();
             const metaPayload = localClips.map(c => ({
-                name: c.name, folder: c.folder, color: c.color, 
+                name: c.name, folder: c.folder, color: c.color,
                 customCommand: c.customCommand || '', transcript: c.transcript || ''
             }));
-            
+
             await bunnyRequest('PUT', 'ig_audio_backup/audio_metadata.json', JSON.stringify(metaPayload));
-            
+
             btn.innerText = '✅ Saved!';
             btn.style.background = '#10b981'; // Success green
             setTimeout(() => {
@@ -7885,7 +7885,7 @@ LegoCore.registerBlock({
                 btn.style.background = ''; // Reverts to purple class default
                 btn.disabled = false;
             }, 1500);
-            
+
             unlockUI(`✅ Transcripts and Metadata quickly synced (${localClips.length} items).`);
         } catch (e) {
             btn.innerText = '❌ Failed';
