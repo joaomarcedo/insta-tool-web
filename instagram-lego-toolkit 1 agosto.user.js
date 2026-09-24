@@ -21,8 +21,10 @@
    ============================================================ */
 /* ================================================================
    CORE ENGINE: Instagram Soundboard & Chat Infrastructure (Safe & Clean)
-   Handles IndexedDB storage, audio recording, silence trimming,
-   hotkey configurations, and chat injection bridges.
+   v2 — Shared Inventory Search (v28.1 token/MRU engine) + Image Set Bridge
+        + Sequence State
+   Handles IndexedDB storage, hotkey configurations, chat injection
+   bridges, shared search/scoring, item fetching and sequence state.
 ================================================================ */
 const LegoCore = (function () {
     let db;
@@ -41,8 +43,15 @@ const LegoCore = (function () {
     const DB_NAME = 'IG_Soundboard_Fresh_Core_DB';
     const DB_VERSION = 2;
 
+    // Shared storage keys (read-only for core, except sequences)
+    const IMAGE_DB_NAME = 'IG_ImageSets_Core_DB';
+    const TEXT_LIB_KEY = 'ig_text_library_pro_v1';
+    const MC_FLOWS_KEY = 'mc_flows_cache_v1';
+    const SEQUENCES_KEY = 'ig_sequences_v1';
+
     const listeners = {};
     function on(event, fn) { (listeners[event] = listeners[event] || []).push(fn); }
+    function off(event, fn) { if (listeners[event]) listeners[event] = listeners[event].filter(f => f !== fn); }
     function emit(event, payload) {
         (listeners[event] || []).forEach(fn => {
             try { fn(payload); } catch (e) { console.error('[LegoCore] listener error:', e); }
@@ -70,6 +79,29 @@ const LegoCore = (function () {
         emit('db:ready', db);
     };
 
+    function withDb(cb) {
+        if (db) { cb(db); return; }
+        const handler = readyDb => { off('db:ready', handler); cb(readyDb); };
+        on('db:ready', handler);
+    }
+    function whenDbReady() { return new Promise(resolve => withDb(resolve)); }
+
+    // Small shared helpers
+    function escapeHtml(str) {
+        return String(str === undefined || str === null ? '' : str).replace(/[&<>"']/g, c => (
+            { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+        ));
+    }
+    function readJson(key, fallback) {
+        try {
+            const raw = localStorage.getItem(key);
+            if (raw === null) return fallback;
+            const val = JSON.parse(raw);
+            return val === null || val === undefined ? fallback : val;
+        } catch (e) { return fallback; }
+    }
+    function norm(s) { return String(s === undefined || s === null ? '' : s).trim().toLowerCase(); }
+
     // 2. Shortcut Configurations
     const getShortcutConfig = (action, defaultKey, defaultMod) => {
         return {
@@ -90,54 +122,74 @@ const LegoCore = (function () {
     }
 
     // 3. Chat Injection Bridges (SAFE PASTE ONLY - NO SYNTHETIC ENTER KEYS)
-    function injectClipToChat(blob, name) {
+    //    All bridges return true on success, false otherwise.
+    //    Pass { silent: true } to suppress the "open a chat" alert.
+    function dispatchDropSequence(chatZone, dataTransfer) {
+        ['dragenter', 'dragover', 'drop'].forEach(eventType => {
+            chatZone.dispatchEvent(new DragEvent(eventType, {
+                bubbles: true,
+                cancelable: true,
+                dataTransfer: dataTransfer
+            }));
+        });
+    }
+
+    function noChatZone(opts) {
+        if (!opts || !opts.silent) alert("Open an active Instagram chat window first.");
+        return false;
+    }
+
+    function injectClipToChat(blob, name, opts = {}) {
+        if (!blob) return false;
+        const chatZone = getActiveChatZone();
+        if (!chatZone) return noChatZone(opts);
+
         const audioFile = new Blob([blob], { type: 'audio/mp4' });
-        const fileObj = new File([audioFile], `${name}.m4a`, { type: 'audio/mp4' });
+        const fileObj = new File([audioFile], `${name || 'clip'}.m4a`, { type: 'audio/mp4' });
         const dataTransfer = new DataTransfer();
         dataTransfer.items.add(fileObj);
-
-        const chatZone = getActiveChatZone();
-
-        if (chatZone) {
-            ['dragenter', 'dragover', 'drop'].forEach(eventType => {
-                const event = new DragEvent(eventType, {
-                    bubbles: true,
-                    cancelable: true,
-                    dataTransfer: dataTransfer
-                });
-                chatZone.dispatchEvent(event);
-            });
-        } else {
-            alert("Open an active Instagram chat window first.");
-        }
+        dispatchDropSequence(chatZone, dataTransfer);
+        return true;
     }
 
-    function injectImageToChat(blob, name) {
-        const fileObj = new File([blob], `${name}.jpg`, { type: blob.type || 'image/jpeg' });
+    function injectImageToChat(blob, name, opts = {}) {
+        if (!blob) return false;
+        const chatZone = getActiveChatZone();
+        if (!chatZone) return noChatZone(opts);
+
+        const fileObj = new File([blob], `${name || 'image'}.jpg`, { type: blob.type || 'image/jpeg' });
         const dataTransfer = new DataTransfer();
         dataTransfer.items.add(fileObj);
-
-        const chatZone = getActiveChatZone();
-        if (chatZone) {
-            ['dragenter', 'dragover', 'drop'].forEach(eventType => {
-                chatZone.dispatchEvent(new DragEvent(eventType, {
-                    bubbles: true, cancelable: true, dataTransfer: dataTransfer
-                }));
-            });
-        } else {
-            alert("Open an active Instagram chat window first.");
-        }
+        dispatchDropSequence(chatZone, dataTransfer);
+        return true;
     }
 
-    function injectTextToChat(text) {
+    // NEW: packages a whole image set into ONE DataTransfer (one drop = one album)
+    function injectImageSetToChat(imagesArray, opts = {}) {
+        const images = (imagesArray || []).filter(img => img && img.blob);
+        if (!images.length) return false;
         const chatZone = getActiveChatZone();
-        if (chatZone) {
-            chatZone.focus();
-            document.execCommand('insertText', false, text);
-            chatZone.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-        } else {
-            alert("Open an active Instagram chat window first.");
-        }
+        if (!chatZone) return noChatZone(opts);
+
+        const dataTransfer = new DataTransfer();
+        images.forEach((img, i) => {
+            const type = img.type || img.blob.type || 'image/jpeg';
+            const ext = ((type.split('/')[1] || 'jpeg').split('+')[0]) || 'jpeg';
+            dataTransfer.items.add(new File([img.blob], `image_${i}.${ext}`, { type }));
+        });
+        dispatchDropSequence(chatZone, dataTransfer);
+        return true;
+    }
+
+    function injectTextToChat(text, opts = {}) {
+        if (!text) return false;
+        const chatZone = getActiveChatZone();
+        if (!chatZone) return noChatZone(opts);
+
+        chatZone.focus();
+        document.execCommand('insertText', false, text);
+        chatZone.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+        return true;
     }
 
     // 4. Window Draggable Helpers
@@ -206,13 +258,336 @@ const LegoCore = (function () {
             if (!dragging) return;
             dragging = false;
             header.style.cursor = "grab";
-            document.removeEventListener('mousemove', onMouseMove);
+            // FIX: previously removed `onMouseMove` (undefined here) -> ReferenceError on drop
+            document.removeEventListener('mousemove', onMove);
             document.removeEventListener('mouseup', onUp);
             const rect = panel.getBoundingClientRect();
             localStorage.setItem(storageKey, JSON.stringify({ bottom: 'auto', left: `${rect.left}px`, top: `${rect.top}px` }));
         }
     }
 
+    // 5. Shared Data Readers
+    function getClips() {
+        return whenDbReady().then(readyDb => new Promise(resolve => {
+            try {
+                const req = readyDb.transaction(['clips'], 'readonly').objectStore('clips').getAll();
+                req.onsuccess = e => resolve(e.target.result || []);
+                req.onerror = () => resolve([]);
+            } catch (e) { resolve([]); }
+        }));
+    }
+
+    // Opens the Image Sets DB WITHOUT ever creating it: if it doesn't exist yet,
+    // the upgrade is aborted so the image module can still create it properly later.
+    function openImageDb() {
+        return new Promise(resolve => {
+            let req;
+            try { req = indexedDB.open(IMAGE_DB_NAME); } catch (e) { resolve(null); return; }
+            req.onupgradeneeded = e => { try { e.target.transaction.abort(); } catch (_) { /* noop */ } };
+            req.onsuccess = e => resolve(e.target.result);
+            req.onerror = e => { if (e && e.preventDefault) e.preventDefault(); resolve(null); };
+            req.onblocked = () => resolve(null);
+        });
+    }
+
+    async function getImageSets() {
+        const idb = await openImageDb();
+        if (!idb) return [];
+        if (!idb.objectStoreNames.contains('sets')) { idb.close(); return []; }
+        return new Promise(resolve => {
+            try {
+                const tx = idb.transaction(['sets'], 'readonly');
+                const req = tx.objectStore('sets').getAll();
+                req.onsuccess = ev => resolve(ev.target.result || []);
+                req.onerror = () => resolve([]);
+                tx.oncomplete = () => idb.close();
+                tx.onabort = () => idb.close();
+            } catch (e) { idb.close(); resolve([]); }
+        });
+    }
+
+    function getTextSnippets() {
+        const data = readJson(TEXT_LIB_KEY, { items: [], tags: [] });
+        return (Array.isArray(data.items) ? data.items : []).filter(i => i && i.type === 'snippet');
+    }
+
+    function getMcFlows() {
+        const flows = readJson(MC_FLOWS_KEY, []);
+        return Array.isArray(flows) ? flows : [];
+    }
+
+    function getSequences() {
+        const list = readJson(SEQUENCES_KEY, []);
+        if (!Array.isArray(list)) return [];
+        return list.filter(s => s && typeof s === 'object' && Array.isArray(s.steps));
+    }
+
+    function saveSequences(list) {
+        localStorage.setItem(SEQUENCES_KEY, JSON.stringify(Array.isArray(list) ? list : []));
+        emit('sequences:updated', getSequences());
+    }
+
+    async function getSearchableInventory() {
+        const [clips, imageSets] = await Promise.all([getClips(), getImageSets()]);
+        return {
+            clips,
+            textItems: getTextSnippets(),
+            mcFlows: getMcFlows(),
+            imageSets,
+            sequences: getSequences()
+        };
+    }
+
+    // 6. Shared Search (ported 1:1 from quickCommandExtension v28.1 + 'sequence' kind)
+    //    Token-based, accent-insensitive, all tokens must match; MRU as tiebreaker.
+    const ALL_KINDS = ['text', 'audio', 'flow', 'set', 'sequence'];
+    const SEARCH_PREFIXES = [
+        ['text', 'text'], ['audio', 'audio'], ['flow', 'flow'], ['set', 'set'],
+        ['sequence', 'sequence'], ['seq', 'sequence']
+    ];
+    const RECENT_USAGE_KEY = 'ig_qcx_recent_usage_v1';
+
+    function normalizeStr(str) {
+        return String(str || '')
+            .normalize('NFD')
+            .replace(/[̀-ͯ]/g, '')
+            .toLowerCase()
+            .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?"'¡¿]/g, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+    function getSearchTokens(query) {
+        const n = normalizeStr(query);
+        return n ? n.split(' ').filter(t => t.length > 0) : [];
+    }
+    function matchAllTokens(searchPool, tokens) {
+        if (!tokens.length) return true;
+        const pool = normalizeStr(searchPool);
+        return tokens.every(tok => pool.includes(tok));
+    }
+
+    // --- Most-Recently-Used tracking (same storage key as v28.1, so history is kept) ---
+    function getRecentUsageMap() { return readJson(RECENT_USAGE_KEY, {}) || {}; }
+    function getItemId(kind, item) { return kind === 'flow' ? item.flow_ns : item.id; }
+    function markUsed(kind, id) {
+        if (id === undefined || id === null) return;
+        const map = getRecentUsageMap();
+        map[`${kind}:${id}`] = Date.now();
+        try { localStorage.setItem(RECENT_USAGE_KEY, JSON.stringify(map)); } catch (e) { /* quota */ }
+    }
+    function getUsageTimestamp(kind, id, map) {
+        if (id === undefined || id === null) return 0;
+        return (map || getRecentUsageMap())[`${kind}:${id}`] || 0;
+    }
+
+    // "audio intro" -> { mode:'audio', q:'intro' }   "hola" -> { mode:'all', q:'hola' }
+    function parseSearchPrefix(raw) {
+        const text = String(raw || '');
+        const lower = text.toLowerCase();
+        for (const [prefix, mode] of SEARCH_PREFIXES) {
+            if (lower === prefix) return { mode, q: '' };
+            if (lower.startsWith(prefix + ' ')) return { mode, q: text.slice(prefix.length + 1) };
+        }
+        return { mode: 'all', q: text };
+    }
+
+    // Pure scoring. opts.kinds = whitelist of kinds that may ever appear; opts.limit caps results.
+    function scoreInventory(query, mode, inventory, opts = {}) {
+        const inv = inventory || {};
+        const allowed = new Set(opts.kinds || ALL_KINDS);
+        const active = (!mode || mode === 'all') ? allowed : new Set([mode].filter(k => allowed.has(k)));
+        const tokens = getSearchTokens(query);
+        const rawQuery = normalizeStr(query);
+        const results = [];
+
+        if (active.has('text')) {
+            (inv.textItems || []).forEach(item => {
+                const cmd = normalizeStr(item.customCommand);
+                const title = normalizeStr(item.title);
+                const body = normalizeStr(item.text);
+                if (matchAllTokens(`${title} ${cmd} ${body}`, tokens)) {
+                    const cmdExact = cmd && cmd === rawQuery;
+                    const cmdPrefix = cmd && rawQuery && cmd.startsWith(rawQuery);
+                    const titleHasAll = matchAllTokens(title, tokens);
+                    const score = cmdExact ? 110 : cmdPrefix ? 95 : titleHasAll ? 70 : 45;
+                    results.push({ kind: 'text', item, score, matchedField: titleHasAll ? 'title' : 'body' });
+                }
+            });
+        }
+        if (active.has('audio')) {
+            (inv.clips || []).forEach(clip => {
+                const cmd = normalizeStr(clip.customCommand);
+                const name = normalizeStr(clip.name);
+                const transcript = normalizeStr(clip.transcript);
+                if (matchAllTokens(`${name} ${cmd} ${transcript}`, tokens)) {
+                    const cmdExact = cmd && cmd === rawQuery;
+                    const cmdPrefix = cmd && rawQuery && cmd.startsWith(rawQuery);
+                    const nameHasAll = matchAllTokens(name, tokens);
+                    const score = cmdExact ? 110 : cmdPrefix ? 95 : nameHasAll ? 70 : 50;
+                    results.push({ kind: 'audio', item: clip, score, matchedField: nameHasAll ? 'name' : 'transcript' });
+                }
+            });
+        }
+        if (active.has('flow')) {
+            (inv.mcFlows || []).forEach(flow => {
+                const name = normalizeStr(flow.name);
+                const folder = normalizeStr(flow.folder);
+                const transcript = normalizeStr(flow.transcript);
+                if (matchAllTokens(`${name} ${folder} ${transcript}`, tokens)) {
+                    const nameHasAll = matchAllTokens(name, tokens);
+                    const score = name === rawQuery ? 90 : nameHasAll ? 70 : 55;
+                    results.push({ kind: 'flow', item: flow, score, matchedField: nameHasAll ? 'name' : 'transcript' });
+                }
+            });
+        }
+        if (active.has('set')) {
+            (inv.imageSets || []).forEach(set => {
+                const title = normalizeStr(set.title);
+                if (matchAllTokens(title, tokens)) {
+                    const score = title === rawQuery ? 85 : 50;
+                    results.push({ kind: 'set', item: set, score, matchedField: 'title' });
+                }
+            });
+        }
+        if (active.has('sequence')) {
+            (inv.sequences || []).forEach(seq => {
+                const name = normalizeStr(seq.name);
+                const stepTitles = normalizeStr((seq.steps || []).map(s => s && s.title).join(' '));
+                if (matchAllTokens(`${name} ${stepTitles}`, tokens)) {
+                    const nameHasAll = matchAllTokens(name, tokens);
+                    const score = name === rawQuery ? 90 : nameHasAll ? 70 : 45;
+                    results.push({ kind: 'sequence', item: seq, score, matchedField: nameHasAll ? 'name' : 'steps' });
+                }
+            });
+        }
+
+        const usage = getRecentUsageMap();
+        results.forEach(r => { r.lastUsed = getUsageTimestamp(r.kind, getItemId(r.kind, r.item), usage); });
+        results.sort((a, b) => (b.score - a.score) || (b.lastUsed - a.lastUsed));
+        return results.slice(0, opts.limit || 8);
+    }
+
+    async function searchInventory(query, mode = 'all', opts = {}) {
+        const inventory = opts.inventory || await getSearchableInventory();
+        return scoreInventory(query, mode, inventory, opts);
+    }
+
+    // 7. Step Resolution + Data Fetcher
+    //    Steps store { kind, refId, title, folder? }. The id is tried first, but because
+    //    audio ids (autoIncrement) and pulled image-set ids differ between devices after a
+    //    Bunny sync, title (+folder) is used as a fallback so synced sequences keep working.
+    function resolveFromList(list, step, getId, getName, getFolder) {
+        const idStr = String(step.refId === undefined || step.refId === null ? '' : step.refId);
+        const title = norm(step.title);
+        const folder = step.folder !== undefined && step.folder !== null ? norm(step.folder) : null;
+
+        const byId = idStr ? (list.find(x => String(getId(x)) === idStr) || null) : null;
+        if (byId && (!title || norm(getName(byId)) === title)) return byId;
+
+        if (title) {
+            let candidates = list.filter(x => norm(getName(x)) === title);
+            if (folder && getFolder) {
+                const inFolder = candidates.filter(x => norm(getFolder(x) || 'General') === folder);
+                if (inFolder.length) candidates = inFolder;
+            }
+            if (candidates.length) return candidates[0];
+        }
+        return byId; // item was renamed but id still valid
+    }
+
+    function resolveStep(step, inventory) {
+        if (!step || !inventory) return null;
+        if (step.kind === 'audio') {
+            const clip = resolveFromList(inventory.clips || [], step, c => c.id, c => c.name, c => c.folder);
+            return clip && clip.blob ? clip : null;
+        }
+        if (step.kind === 'set') {
+            const set = resolveFromList(inventory.imageSets || [], step, s => s.id, s => s.title);
+            return set && Array.isArray(set.images) && set.images.some(i => i && i.blob) ? set : null;
+        }
+        if (step.kind === 'text') {
+            const item = resolveFromList(inventory.textItems || [], step, t => t.id, t => t.title);
+            return item && item.text ? item : null;
+        }
+        return null;
+    }
+
+    // Returns a ready-to-inject payload, or null when the item no longer exists.
+    //   audio -> { kind, id, name, blob, transcript }
+    //   set   -> { kind, id, title, images: [{ blob, type }] }
+    //   text  -> { kind, id, title, text }
+    async function fetchItemData(kind, refId, hint = {}) {
+        const step = Object.assign({}, hint, { kind, refId });
+        try {
+            if (kind === 'audio') {
+                const clip = resolveStep(step, { clips: await getClips() });
+                return clip ? { kind, id: clip.id, name: clip.name || 'clip', blob: clip.blob, transcript: clip.transcript || '' } : null;
+            }
+            if (kind === 'set') {
+                const set = resolveStep(step, { imageSets: await getImageSets() });
+                if (!set) return null;
+                const images = set.images.filter(i => i && i.blob).map(i => ({ blob: i.blob, type: i.type || i.blob.type || 'image/jpeg' }));
+                return images.length ? { kind, id: set.id, title: set.title || 'Image set', images } : null;
+            }
+            if (kind === 'text') {
+                const item = resolveStep(step, { textItems: getTextSnippets() });
+                return item ? { kind, id: item.id, title: item.title || '', text: item.text } : null;
+            }
+        } catch (e) {
+            console.error('[LegoCore] fetchItemData error:', e);
+        }
+        return null;
+    }
+
+    // 8. Global Sequence State
+    let activeSequence = null;   // { id, name, steps: [...] }
+    let sequenceStepIndex = 0;
+
+    function normalizeSequence(input) {
+        if (!input) return null;
+        const steps = Array.isArray(input) ? input : (Array.isArray(input.steps) ? input.steps : null);
+        if (!steps) return null;
+        return {
+            id: Array.isArray(input) ? null : (input.id || null),
+            name: Array.isArray(input) ? 'Sequence' : (input.name || 'Sequence'),
+            steps: steps.filter(s => s && s.kind).map(s => Object.assign({}, s))
+        };
+    }
+
+    // Accepts a saved sequence object OR a raw steps array. Returns true if activated.
+    function setActiveSequence(input) {
+        const seq = normalizeSequence(input);
+        if (!seq || !seq.steps.length) return false;
+        if (activeSequence) {
+            const previous = activeSequence;
+            activeSequence = null; sequenceStepIndex = 0;
+            emit('sequence:ended', { reason: 'replaced', sequence: previous });
+        }
+        activeSequence = seq;
+        sequenceStepIndex = 0;
+        if (seq.id) markUsed('sequence', seq.id);
+        emit('sequence:started', { sequence: seq });
+        return true;
+    }
+
+    function getActiveSequence() { return activeSequence; }
+    function getSequenceStepIndex() { return sequenceStepIndex; }
+
+    function setSequenceStepIndex(index) {
+        if (!activeSequence) return;
+        sequenceStepIndex = Math.max(0, Math.min(activeSequence.steps.length, index | 0));
+        emit('sequence:step', { sequence: activeSequence, index: sequenceStepIndex });
+    }
+
+    function cancelSequence(reason = 'cancelled') {
+        if (!activeSequence) return;
+        const ended = activeSequence;
+        activeSequence = null;
+        sequenceStepIndex = 0;
+        emit('sequence:ended', { reason, sequence: ended });
+    }
+
+    // 9. Block Registry
     const registeredBlocks = [];
     function registerBlock(block) { registeredBlocks.push(block); }
     function boot() {
@@ -222,7 +597,19 @@ const LegoCore = (function () {
     }
 
     const api = {
-        on, emit, registerBlock, getDb: () => db, getShortcutConfig, injectClipToChat, injectImageToChat, injectTextToChat, getActiveChatZone, makeDraggable, makeIsolatedDraggable, boot
+        on, off, emit, registerBlock, boot,
+        getDb: () => db, whenDbReady, getShortcutConfig, escapeHtml,
+        // injection bridges
+        injectClipToChat, injectImageToChat, injectImageSetToChat, injectTextToChat, getActiveChatZone,
+        // drag helpers
+        makeDraggable, makeIsolatedDraggable,
+        // shared inventory + search
+        getSearchableInventory, searchInventory, scoreInventory, parseSearchPrefix,
+        normalizeStr, getSearchTokens, matchAllTokens, markUsed, getUsageTimestamp,
+        // items + sequences data
+        fetchItemData, resolveStep, getSequences, saveSequences,
+        // sequence state
+        setActiveSequence, getActiveSequence, getSequenceStepIndex, setSequenceStepIndex, cancelSequence
     };
 
     return api;
@@ -882,7 +1269,7 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Audio Library (v14)
+   BLOCK: Audio Library (v2)
    ============================================================ */
 /* ============================================================
    BLOCK: Audio Library (v13 - Hash-Colored Course Tags & Tooltip Fix)
@@ -959,19 +1346,19 @@ LegoCore.registerBlock({
         const sep2 = match[4] || '';
         const rest = match[5] || '';
 
-        let bg = '#64748b'; // default slate
-        if (num === 1) bg = '#10b981'; // Green
-        else if (num === 2) bg = '#ef4444'; // Red
-        else if (num === 3) bg = '#f59e0b'; // Orange
-        else if (num === 4) bg = '#8b5cf6'; // Purple
-        else if (num >= 5) bg = '#3b82f6'; // Blue
+        // 🎨 Colors come from the Tag Colors block (falls back to the old colors if it's missing)
+        const tc = core.tagColors;
+        const bg = tc ? tc.getNumberColor(numStr)
+          : num === 1 ? '#10b981' : num === 2 ? '#ef4444' : num === 3 ? '#f59e0b' : num === 4 ? '#8b5cf6' : num >= 5 ? '#3b82f6' : '#64748b';
+        const fg = tc ? tc.getTextColor(bg) : '#fff';
 
-        let html = `<span class="ig-pipeline-badge" style="background:${bg};">${numStr}</span>`;
+        let html = `<span class="ig-pipeline-badge" style="background:${bg}; color:${fg};">${numStr}</span>`;
 
         // Add course tag if detected
         if (courseName) {
-            const tagColor = getHashColor(courseName.toLowerCase().trim());
-            html += `<span class="ig-course-badge" style="background:${tagColor};">(${safeHTML(courseName.trim())})</span>`;
+            const tagColor = tc ? tc.getCourseColor(courseName) : getHashColor(courseName.toLowerCase().trim());
+            const tagFg = tc ? tc.getTextColor(tagColor) : '#fff';
+            html += `<span class="ig-course-badge" style="background:${tagColor}; color:${tagFg};">(${safeHTML(courseName.trim())})</span>`;
             html += `<span>${safeHTML(sep2 + rest)}</span>`;
         } else {
             html += `<span>${safeHTML(sep1 + rest)}</span>`;
@@ -1080,6 +1467,7 @@ LegoCore.registerBlock({
 
     core.on('library:refresh', () => renderClips());
     core.on('folders:refresh', () => loadFolders());
+    core.on('tagcolors:updated', () => renderClips()); // 🎨 re-color tags live
 
     libUI.querySelector('#ig-audio-folder-filter').onchange = () => renderClips();
     libUI.querySelector('#ig-audio-tag-filter').onchange = () => renderClips();
@@ -3318,10 +3706,12 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Quick Chat Box (v7)
+   BLOCK: Quick Chat Box (v2)
    ============================================================ */
 /* ============================================================
    BLOCK: Quick Chat Box (Safe & Clean Edition)
+   v2 — Sequence-aware: yields Enter/Escape and pauses Keep Focus
+        while a sequence is active
    ============================================================ */
 LegoCore.registerBlock({
   id: 'quickChatBoxPlugin',
@@ -3359,6 +3749,10 @@ LegoCore.registerBlock({
     inputField.addEventListener('focus', () => inputField.style.borderColor = '#6366f1');
     inputField.addEventListener('blur', () => inputField.style.borderColor = '#334155');
 
+    function sequenceIsActive() {
+      return typeof core.getActiveSequence === 'function' && !!core.getActiveSequence();
+    }
+
     function sendMessage() {
       const liveInput = document.getElementById('ig-quick-chat-input');
       if (!liveInput) return;
@@ -3385,11 +3779,15 @@ LegoCore.registerBlock({
 
     sendBtn.onclick = sendMessage;
     inputField.addEventListener('keydown', (e) => {
+      // SEQUENCE GATE: while a sequence is active, Enter/Escape belong to the Sequence Manager.
+      if (sequenceIsActive() && (e.key === 'Enter' || e.key === 'Escape')) return;
       if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
     });
 
     function forceQuickChatFocus() {
       if (!window.location.href.includes('/direct/')) return;
+      // Don't steal focus from Instagram's composer mid-sequence (the next real Enter must land there)
+      if (sequenceIsActive()) return;
       const liveInput = document.getElementById('ig-quick-chat-input');
       if (liveInput && prefs.keepFocus) liveInput.focus();
     }
@@ -3425,7 +3823,7 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Text Library Module (Saved Snippets) (v6)
+   BLOCK: Text Library Module (Saved Snippets) (v2)
    ============================================================ */
 /* ============================================================
    BLOCK: Text Library Module (Saved Snippets) (v6 - Safe Paste Edition)
@@ -3452,6 +3850,7 @@ LegoCore.registerBlock({
     }
 
     function saveData() { localStorage.setItem(PRO_KEY, JSON.stringify(libraryData)); }
+    core.on('textlib:external-refresh', () => { libraryData = JSON.parse(localStorage.getItem(PRO_KEY)) || libraryData; renderTree(); }); // reload after Commands saves/edits a snippet
 
     let activeFolderFilter = 'All';
     let activeTagFilter = 'All';
@@ -3530,7 +3929,7 @@ LegoCore.registerBlock({
 
     // SAFE PASTE (NO SYNTHETIC ENTER)
     function injectText(text) {
-      const chatZone = core.getActiveChatZone();
+      const chatZone = core.getActiveChatZone(); 
       if (!chatZone) { alert("Open an active Instagram chat window first."); return; }
 
       chatZone.focus();
@@ -4297,10 +4696,16 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Commands (v31)
+   BLOCK: Commands (v5)
    ============================================================ */
 /* ============================================================
-   BLOCK: Commands (v28.1 - Click Shield Bug Fix & Smooth Hover
+   BLOCK: Commands (v30 - 📌 Floating always-on-top window + "/save" text snippets
+                      + Image drop/paste tray (reorder, save as set, paste)
+                      + Instant search setting
+                    v29 - Core Shared Search + Sequences (/seq)
+                      + Sequence-aware Enter/Escape
+                      + /save audio fix + HTML-safe titles
+                    v28.1 - Click Shield Bug Fix & Smooth Hover
                       + Quick Edit Modal & Inline AI
                       + Strict Slash Guard Restored
                       + Permanent Markdown Highlights
@@ -4339,6 +4744,48 @@ LegoCore.registerBlock({
       catch (e) { return { ...DEFAULT_SHORTCUT }; }
     }
     function saveShortcutCombo(combo) { localStorage.setItem(SHORTCUT_KEY, JSON.stringify(combo)); }
+
+    // Instant search: when ON, the item list appears as soon as you type — no leading "/" needed.
+    const INSTANT_KEY = 'ig_qcx_instant_search_v1';
+    let instantSearch = localStorage.getItem(INSTANT_KEY) === 'true';
+    function setInstantSearch(on) { instantSearch = !!on; localStorage.setItem(INSTANT_KEY, String(instantSearch)); }
+
+    // Floating window state (docked by default; 📌 pops it out). Synced via Bunny.
+    const FLOAT_KEY = 'ig_qcx_float_v1';
+    function getFloatState() {
+      try { return Object.assign({ floating: false, x: null, y: null, w: 360, h: null }, JSON.parse(localStorage.getItem(FLOAT_KEY)) || {}); }
+      catch (e) { return { floating: false, x: null, y: null, w: 360, h: null }; }
+    }
+    function saveFloatState(s) { localStorage.setItem(FLOAT_KEY, JSON.stringify(s)); }
+
+    // Same thumbnail format the Image Sets module stores (200px JPEG data URL)
+    function compressThumbnail(file, maxSize = 200) {
+      return new Promise((resolve) => {
+        const url = URL.createObjectURL(file);
+        const img = new Image();
+        img.onload = () => {
+          let w = img.width, h = img.height;
+          if (w > maxSize || h > maxSize) { const r = Math.min(maxSize / w, maxSize / h); w *= r; h *= r; }
+          const canvas = document.createElement('canvas');
+          canvas.width = w; canvas.height = h;
+          canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+          URL.revokeObjectURL(url);
+          resolve(canvas.toDataURL('image/jpeg', 0.6));
+        };
+        img.onerror = () => { URL.revokeObjectURL(url); resolve(''); };
+        img.src = url;
+      });
+    }
+
+    // "/save" for text: "my text /save" or "/save my text" (but never "/save audio …")
+    function parseSaveText(val) {
+      const v = (val || '').trim();
+      if (/^\/save\s+audio\b/i.test(v)) return null;
+      let m = v.match(/^\/save(?:\s+([\s\S]*))?$/i);
+      if (m) return (m[1] || '').trim();
+      m = v.match(/^([\s\S]*\S)\s+\/save$/i);
+      return m ? m[1].trim() : null;
+    }
     function formatCombo(combo) {
       if (!combo || !combo.key) return 'Not set';
       const parts = [];
@@ -4354,19 +4801,13 @@ LegoCore.registerBlock({
       return e.key.toLowerCase() === combo.key.toLowerCase() && !!e.ctrlKey === !!combo.ctrl && !!e.altKey === !!combo.alt && !!e.shiftKey === !!combo.shift && !!e.metaKey === !!combo.meta;
     }
 
-    function normalizeStr(str) {
-      return String(str || '')
-        .normalize('NFD')
-        .replace(/[\u0300-\u036f]/g, '')
-        .toLowerCase()
-        .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?"'¡¿]/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-    }
+    // Search engine now lives in LegoCore (shared with the Sequence Manager builder)
+    const normalizeStr = core.normalizeStr;
+    const getSearchTokens = core.getSearchTokens;
+    const esc = core.escapeHtml;
 
-    function getSearchTokens(query) {
-      const norm = normalizeStr(query);
-      return norm ? norm.split(' ').filter(t => t.length > 0) : [];
+    function sequenceIsActive() {
+      return typeof core.getActiveSequence === 'function' && !!core.getActiveSequence();
     }
 
     function tokenToAccentRegex(token) {
@@ -4398,12 +4839,6 @@ LegoCore.registerBlock({
       return htmlText;
     }
 
-    function matchAllTokens(searchPool, tokens) {
-      if (!tokens.length) return true;
-      const normalizedPool = normalizeStr(searchPool);
-      return tokens.every(tok => normalizedPool.includes(tok));
-    }
-
     // --- Hash-Colored Number & Name Tags (ported from Audio Library) ---
     function getHashColor(str) {
       let hash = 0;
@@ -4427,18 +4862,18 @@ LegoCore.registerBlock({
       const sep2 = match[4] || '';
       const rest = match[5] || '';
 
-      let bg = '#64748b'; // default slate
-      if (num === 1) bg = '#10b981'; // Green
-      else if (num === 2) bg = '#ef4444'; // Red
-      else if (num === 3) bg = '#f59e0b'; // Orange
-      else if (num === 4) bg = '#8b5cf6'; // Purple
-      else if (num >= 5) bg = '#3b82f6'; // Blue
+      // 🎨 Colors come from the Tag Colors block (falls back to the old colors if it's missing)
+      const tc = core.tagColors;
+      const bg = tc ? tc.getNumberColor(numStr)
+        : num === 1 ? '#10b981' : num === 2 ? '#ef4444' : num === 3 ? '#f59e0b' : num === 4 ? '#8b5cf6' : num >= 5 ? '#3b82f6' : '#64748b';
+      const fg = tc ? tc.getTextColor(bg) : '#fff';
 
-      let html = `<span class="ig-pipeline-badge" style="background:${bg};">${numStr}</span>`;
+      let html = `<span class="ig-pipeline-badge" style="background:${bg}; color:${fg};">${numStr}</span>`;
 
       if (courseName) {
-        const tagColor = getHashColor(courseName.toLowerCase().trim());
-        html += `<span class="ig-course-badge" style="background:${tagColor};">(${highlightTokens(courseName.trim(), tokens)})</span>`;
+        const tagColor = tc ? tc.getCourseColor(courseName) : getHashColor(courseName.toLowerCase().trim());
+        const tagFg = tc ? tc.getTextColor(tagColor) : '#fff';
+        html += `<span class="ig-course-badge" style="background:${tagColor}; color:${tagFg};">(${highlightTokens(courseName.trim(), tokens)})</span>`;
         html += `<span>${highlightTokens(sep2 + rest, tokens)}</span>`;
       } else {
         html += `<span>${highlightTokens(sep1 + rest, tokens)}</span>`;
@@ -4447,136 +4882,9 @@ LegoCore.registerBlock({
       return html;
     }
 
-    // --- Most-Recently-Used Tracking ---
-    const RECENT_USAGE_KEY = 'ig_qcx_recent_usage_v1';
-
-    function getRecentUsageMap() {
-      try { return JSON.parse(localStorage.getItem(RECENT_USAGE_KEY)) || {}; }
-      catch (e) { return {}; }
-    }
-    function getItemId(kind, item) {
-      return kind === 'flow' ? item.flow_ns : item.id;
-    }
-    function markUsed(kind, id) {
-      if (id === undefined || id === null) return;
-      const map = getRecentUsageMap();
-      map[`${kind}:${id}`] = Date.now();
-      try { localStorage.setItem(RECENT_USAGE_KEY, JSON.stringify(map)); } catch (e) {}
-    }
-    function getUsageTimestamp(kind, id) {
-      if (id === undefined || id === null) return 0;
-      const map = getRecentUsageMap();
-      return map[`${kind}:${id}`] || 0;
-    }
-
-    function getImageSets() {
-      return new Promise(resolve => {
-        const req = indexedDB.open('IG_ImageSets_Core_DB', 1);
-        req.onsuccess = e => {
-          const db = e.target.result;
-          if (!db.objectStoreNames.contains('sets')) { resolve([]); return; }
-          const tx = db.transaction(['sets'], 'readonly');
-          tx.objectStore('sets').getAll().onsuccess = ev => resolve(ev.target.result || []);
-        };
-        req.onerror = () => resolve([]);
-      });
-    }
-
-    function getAllSearchableItems() {
-      return new Promise(async resolve => {
-        let imageSets = [];
-        try { imageSets = await getImageSets(); } catch(e) {}
-
-        withDb(db => {
-          if (!db) return resolve({ clips: [], textItems: [], mcFlows: [], imageSets });
-          try {
-            const tx = db.transaction(['clips'], 'readonly');
-            const req = tx.objectStore('clips').getAll();
-            req.onsuccess = e => {
-              const clips = e.target.result || [];
-              const textData = getTextLibraryData();
-              const textItems = textData.items.filter(i => i.type === 'snippet');
-              let mcFlows = [];
-              try { mcFlows = JSON.parse(localStorage.getItem(MC_FLOWS_KEY)) || []; } catch (err) {}
-              resolve({ clips, textItems, mcFlows, imageSets });
-            };
-            req.onerror = () => resolve({ clips: [], textItems: [], mcFlows: [], imageSets });
-          } catch(e) {
-            resolve({ clips: [], textItems: [], mcFlows: [], imageSets });
-          }
-        });
-      });
-    }
-
-    function computeMatches(query, mode, clips, textItems, mcFlows, imageSets) {
-      const tokens = getSearchTokens(query);
-      const rawQuery = normalizeStr(query);
-      let results = [];
-
-      if (mode !== 'audio' && mode !== 'flow' && mode !== 'set') {
-        textItems.forEach(item => {
-          const cmd = normalizeStr(item.customCommand);
-          const title = normalizeStr(item.title);
-          const body = normalizeStr(item.text);
-          const combined = `${title} ${cmd} ${body}`;
-
-          if (matchAllTokens(combined, tokens)) {
-            const cmdExact = cmd && cmd === rawQuery;
-            const cmdPrefix = cmd && rawQuery && cmd.startsWith(rawQuery);
-            const titleHasAll = matchAllTokens(title, tokens);
-            const score = cmdExact ? 110 : cmdPrefix ? 95 : titleHasAll ? 70 : 45;
-            results.push({ kind: 'text', item, score, matchedField: titleHasAll ? 'title' : 'body' });
-          }
-        });
-      }
-
-      if (mode !== 'text' && mode !== 'flow' && mode !== 'set') {
-        clips.forEach(clip => {
-          const cmd = normalizeStr(clip.customCommand);
-          const name = normalizeStr(clip.name);
-          const transcript = normalizeStr(clip.transcript);
-          const combined = `${name} ${cmd} ${transcript}`;
-
-          if (matchAllTokens(combined, tokens)) {
-            const cmdExact = cmd && cmd === rawQuery;
-            const cmdPrefix = cmd && rawQuery && cmd.startsWith(rawQuery);
-            const nameHasAll = matchAllTokens(name, tokens);
-            const score = cmdExact ? 110 : cmdPrefix ? 95 : nameHasAll ? 70 : 50;
-            results.push({ kind: 'audio', item: clip, score, matchedField: nameHasAll ? 'name' : 'transcript' });
-          }
-        });
-      }
-
-      if (mode !== 'text' && mode !== 'audio' && mode !== 'set') {
-        mcFlows.forEach(flow => {
-          const name = normalizeStr(flow.name);
-          const folder = normalizeStr(flow.folder);
-          const transcript = normalizeStr(flow.transcript);
-          const combined = `${name} ${folder} ${transcript}`;
-
-          if (matchAllTokens(combined, tokens)) {
-            const nameHasAll = matchAllTokens(name, tokens);
-            const score = name === rawQuery ? 90 : nameHasAll ? 70 : 55;
-            results.push({ kind: 'flow', item: flow, score, matchedField: nameHasAll ? 'name' : 'transcript' });
-          }
-        });
-      }
-
-      if (mode !== 'text' && mode !== 'audio' && mode !== 'flow') {
-        imageSets.forEach(set => {
-          const title = normalizeStr(set.title);
-          if (matchAllTokens(title, tokens)) {
-            const score = title === rawQuery ? 85 : 50;
-            results.push({ kind: 'set', item: set, score, matchedField: 'title' });
-          }
-        });
-      }
-
-      // Relevance score first, most-recently-used as tiebreaker for equal-score items
-      results.forEach(r => { r.lastUsed = getUsageTimestamp(r.kind, getItemId(r.kind, r.item)); });
-      results.sort((a, b) => (b.score - a.score) || (b.lastUsed - a.lastUsed));
-      return results.slice(0, 8);
-    }
+    // MRU tracking, getImageSets, getAllSearchableItems and computeMatches moved to LegoCore:
+    //   core.markUsed / core.getSearchableInventory / core.searchInventory / core.parseSearchPrefix
+    const markUsed = core.markUsed;
 
     function getAllFolders() {
       return new Promise(resolve => {
@@ -4713,6 +5021,37 @@ LegoCore.registerBlock({
       .ig-qcx-transcript-title { font-size: 11px; font-weight: bold; color: #f8fafc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-bottom: 4px; border-bottom: 1px solid rgba(255,255,255,0.08); }
       .ig-qcx-transcript-body { font-size: 11px; color: #cbd5e1; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
       .ig-qcx-transcript-empty { font-size: 10px; color: #64748b; font-style: italic; }
+      .ig-qcx-hdr-btn { background: transparent; border: none; color: var(--igls-text-dim, #96949c); cursor: pointer; font-size: 12px; padding: 2px 5px; border-radius: 4px; transition: 0.15s; }
+      .ig-qcx-hdr-btn:hover { color: var(--igls-accent, #c9a876); background: rgba(255,255,255,0.1); }
+      /* Floating window — max z-index + kept last among equal-z siblings, so it sits above the sidebars */
+      .ig-qcx-float { position: fixed; z-index: 2147483647 !important; display: flex; flex-direction: column; min-width: 260px; min-height: 110px; max-width: 95vw; max-height: 90vh; background: var(--igls-surface, #111118); border: 1px solid #475569; border-radius: 10px; box-shadow: 0 14px 44px rgba(0,0,0,0.65); resize: both; overflow: hidden; box-sizing: border-box; }
+      .ig-qcx-float-bar { display: flex; align-items: center; gap: 4px; padding: 5px 6px 5px 10px; background: #1e293b; cursor: move; user-select: none; flex-shrink: 0; }
+      .ig-qcx-float-title { flex: 1; font-size: 11px; font-weight: bold; color: #e2e8f0; }
+      .ig-qcx-float-body { flex: 1; min-height: 0; overflow: auto; padding: 8px; display: flex; flex-direction: column; }
+      .ig-qcx-float-stub { display: flex; align-items: center; justify-content: space-between; gap: 6px; font-size: 10px; color: #94a3b8; padding: 6px 8px; background: rgba(255,255,255,0.03); border-radius: 6px; }
+      .ig-qcx-float-stub button { background: #1e293b; border: 1px solid #475569; color: #fff; padding: 3px 8px; border-radius: 4px; font-size: 10px; cursor: pointer; }
+      /* Image tray */
+      .ig-qcx-drop-hover { outline: 2px dashed #10b981 !important; outline-offset: 2px; }
+      .ig-qcx-tray { display: none; flex-direction: column; gap: 6px; background: #0f172a; border: 1px dashed #475569; border-radius: 6px; padding: 6px; margin-bottom: 6px; }
+      .ig-qcx-tray.show { display: flex; }
+      .ig-qcx-tray-strip { display: flex; gap: 6px; overflow-x: auto; padding-bottom: 2px; }
+      .ig-qcx-tray-strip::-webkit-scrollbar { height: 4px; }
+      .ig-qcx-tray-strip::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+      .ig-qcx-tray-thumb { position: relative; width: 54px; height: 54px; flex-shrink: 0; border-radius: 4px; overflow: hidden; border: 1px solid #334155; background: #1e293b; cursor: grab; }
+      .ig-qcx-tray-thumb img { width: 100%; height: 100%; object-fit: cover; pointer-events: none; }
+      .ig-qcx-tray-thumb.dragging { opacity: 0.3; }
+      .ig-qcx-tray-thumb.drop-before { box-shadow: -3px 0 0 #10b981; }
+      .ig-qcx-tray-thumb.drop-after { box-shadow: 3px 0 0 #10b981; }
+      .ig-qcx-tray-num { position: absolute; left: 2px; bottom: 2px; background: rgba(0,0,0,0.7); color: #fff; font-size: 9px; font-weight: bold; padding: 0 4px; border-radius: 3px; pointer-events: none; }
+      .ig-qcx-tray-del { position: absolute; top: 2px; right: 2px; background: rgba(220,38,38,0.9); color: #fff; border: none; width: 16px; height: 16px; border-radius: 3px; font-size: 9px; cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0; }
+      .ig-qcx-tray-bar { display: flex; align-items: center; gap: 4px; }
+      .ig-qcx-tray-count { flex: 1; font-size: 10px; font-weight: bold; color: #94a3b8; }
+      .ig-qcx-tray-btn { background: #1e293b; border: 1px solid #475569; color: #fff; padding: 3px 8px; border-radius: 4px; font-size: 10px; font-weight: bold; cursor: pointer; }
+      .ig-qcx-tray-btn:hover { background: #334155; }
+      .ig-qcx-tray-btn.primary { background: #6366f1; border-color: #6366f1; }
+      .ig-qcx-tray-btn.go { background: #10b981; border-color: #10b981; }
+      .ig-qcx-tag-row { display: flex; flex-wrap: wrap; gap: 4px; }
+      .ig-qcx-tag-row label { display: flex; align-items: center; gap: 4px; font-size: 10px; color: #e2e8f0; background: rgba(255,255,255,0.05); padding: 3px 6px; border-radius: 4px; cursor: pointer; }
     `;
     document.head.appendChild(style);
 
@@ -4735,7 +5074,7 @@ LegoCore.registerBlock({
     function enhanceCard(card, oldInput, oldSendBtn, header) {
       const input = oldInput.cloneNode(true);
       oldInput.parentNode.replaceChild(input, oldInput);
-      input.placeholder = 'Type msg, / to search, : for emoji...';
+      input.placeholder = 'Type msg, / to search, /seq for sequences, : for emoji...';
       input.style.paddingRight = '76px';
 
       const sendBtn = oldSendBtn.cloneNode(true);
@@ -4833,7 +5172,7 @@ LegoCore.registerBlock({
             : '<span class="ig-qcx-transcript-empty">No transcript yet.</span>';
 
           transcriptPanelEl.innerHTML = `
-            <div class="ig-qcx-transcript-title">🎵 ${m.item.name}</div>
+            <div class="ig-qcx-transcript-title">🎵 ${esc(m.item.name)}</div>
             <div class="ig-qcx-transcript-body">${highlightedBody}</div>
           `;
 
@@ -4848,7 +5187,7 @@ LegoCore.registerBlock({
             : '<span class="ig-qcx-transcript-empty">No notes or transcript saved for this automation.</span>';
 
           transcriptPanelEl.innerHTML = `
-            <div class="ig-qcx-transcript-title">🤖 ${m.item.name}</div>
+            <div class="ig-qcx-transcript-title">🤖 ${esc(m.item.name)}</div>
             <div class="ig-qcx-transcript-body">${highlightedBody}</div>
           `;
 
@@ -4863,7 +5202,7 @@ LegoCore.registerBlock({
             : '<span class="ig-qcx-transcript-empty">No text saved.</span>';
 
           transcriptPanelEl.innerHTML = `
-            <div class="ig-qcx-transcript-title">📝 ${m.item.title}</div>
+            <div class="ig-qcx-transcript-title">📝 ${esc(m.item.title)}</div>
             <div class="ig-qcx-transcript-body">${highlightedBody}</div>
           `;
 
@@ -4871,8 +5210,19 @@ LegoCore.registerBlock({
           if (firstMark) {
             firstMark.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
           }
+        } else if (m && m.kind === 'sequence') {
+          const steps = Array.isArray(m.item.steps) ? m.item.steps : [];
+          const icons = { audio: '🎵', set: '🖼️', text: '📝' };
+          const listHtml = steps.length
+            ? steps.map((st, i) => `${i + 1}. ${icons[st.kind] || '•'} ${highlightTokens(st.title || '(untitled)', activeTokens)}`).join('\n')
+            : '<span class="ig-qcx-transcript-empty">Empty sequence.</span>';
+
+          transcriptPanelEl.innerHTML = `
+            <div class="ig-qcx-transcript-title">📋 ${esc(m.item.name || 'Untitled')}</div>
+            <div class="ig-qcx-transcript-body">${listHtml}</div>
+          `;
         } else {
-          transcriptPanelEl.innerHTML = `<div class="ig-qcx-transcript-empty">Highlight an audio clip, snippet, or automation to preview its text.</div>`;
+          transcriptPanelEl.innerHTML = `<div class="ig-qcx-transcript-empty">Highlight an audio clip, snippet, automation or sequence to preview its text.</div>`;
         }
         positionTranscriptPanel();
       }
@@ -4897,7 +5247,7 @@ LegoCore.registerBlock({
         if (document.querySelector('.ig-qcx-shortcut-overlay') || document.querySelector('.ig-qcx-modal-overlay')) return;
         if (eventMatchesCombo(e, getShortcutCombo())) {
           e.preventDefault();
-          card.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+          if (!getFloatState().floating) card.scrollIntoView({ block: 'nearest', inline: 'nearest' });
           input.focus();
           input.select();
         }
@@ -4907,6 +5257,7 @@ LegoCore.registerBlock({
       let matches = [];
       let currentSearchTokens = [];
       let selectedIndex = 0;
+      let searchToken = 0;
       let isEmojiMode = false;
       let emojiStartIndex = -1;
 
@@ -4917,9 +5268,12 @@ LegoCore.registerBlock({
       let pendingFlowName = '';
       let pendingSet = null;
       let previewPlayer = null;
+      core.on('tagcolors:updated', () => { if (dropdownOpen) renderDropdown(); }); // 🎨 re-color tags live
 
       function openDropdown() {
         dropdownOpen = true;
+        // While the dropdown is open, Enter/Escape belong to it, not to an active sequence
+        input.setAttribute('data-seq-exempt', '1');
         document.body.appendChild(dropdownEl);
         document.body.appendChild(transcriptPanelEl);
         positionDropdown();
@@ -4929,6 +5283,8 @@ LegoCore.registerBlock({
         window.addEventListener('resize', onViewportChange);
       }
       function closeDropdown() {
+        searchToken++;
+        input.removeAttribute('data-seq-exempt');
         dropdownOpen = false; isEmojiMode = false; dropdownEl.style.display = 'none';
         transcriptPanelEl.style.display = 'none'; matches = []; currentSearchTokens = []; selectedIndex = 0;
         window.removeEventListener('scroll', onViewportChange, true);
@@ -5037,7 +5393,7 @@ LegoCore.registerBlock({
                     found.customCommand = newCmd;
                     found.text = newBody;
                     saveTextLibraryData(data);
-                    core.emit('tl:tree-rendered', document.querySelector('.ig-tln-container'));
+                    core.emit('textlib:external-refresh');
                     recomputeMatches();
                     closeMod();
                 }
@@ -5092,27 +5448,33 @@ LegoCore.registerBlock({
           let editBtnHtml = '';
           if (['audio', 'text', 'flow', 'set'].includes(m.kind)) {
               editBtnHtml = `<button class="ig-qcx-dd-edit-btn" title="Quick Edit">✏️</button>`;
+          } else if (m.kind === 'sequence') {
+              editBtnHtml = `<button class="ig-qcx-dd-edit-btn" title="Edit in Sequence Manager">✏️</button>`;
           }
 
           if (m.kind === 'emoji') {
-            row.innerHTML = `<div class="ig-qcx-dd-row-top"><span style="font-size:16px;">${m.item.e}</span><span class="ig-qcx-dd-title" style="font-family:monospace;">:${m.item.k}</span></div>`;
+            row.innerHTML = `<div class="ig-qcx-dd-row-top"><span style="font-size:16px;">${m.item.e}</span><span class="ig-qcx-dd-title" style="font-family:monospace;">:${esc(m.item.k)}</span></div>`;
           } else if (m.kind === 'folder' || m.kind === 'folder-new') {
             const icon = m.kind === 'folder-new' ? '➕' : '📁';
-            const label = m.kind === 'folder-new' ? `Create "${m.name}"` : m.name;
+            const label = m.kind === 'folder-new' ? `Create "${esc(m.name)}"` : esc(m.name);
             row.innerHTML = `<div class="ig-qcx-dd-row-top"><span>${icon}</span><span class="ig-qcx-dd-title">${label}</span></div>`;
           } else if (m.kind === 'flow') {
             const titleHtml = formatTitleWithTags(m.item.name, tokens);
             row.innerHTML = `<div class="ig-qcx-dd-row-top"><span>🤖</span><span class="ig-qcx-dd-title">${titleHtml}</span>${editBtnHtml}</div>`;
+          } else if (m.kind === 'sequence') {
+            const titleHtml = formatTitleWithTags(m.item.name, tokens);
+            const n = Array.isArray(m.item.steps) ? m.item.steps.length : 0;
+            row.innerHTML = `<div class="ig-qcx-dd-row-top"><span>📋</span><span class="ig-qcx-dd-title">${titleHtml}</span><span class="ig-qcx-dd-cmd">▶ ${n} step${n === 1 ? '' : 's'}</span>${editBtnHtml}</div>`;
           } else if (m.kind === 'set') {
             const titleHtml = formatTitleWithTags(m.item.title, tokens);
             row.innerHTML = `<div class="ig-qcx-dd-row-top"><span>🖼️</span><span class="ig-qcx-dd-title">${titleHtml}</span>${editBtnHtml}</div>`;
           } else if (m.kind === 'text') {
             const titleHtml = formatTitleWithTags(m.item.title, tokens);
-            const cmdBadge = m.item.customCommand ? `<span class="ig-qcx-dd-cmd">/${m.item.customCommand}</span>` : '';
+            const cmdBadge = m.item.customCommand ? `<span class="ig-qcx-dd-cmd">/${esc(m.item.customCommand)}</span>` : '';
             row.innerHTML = `<div class="ig-qcx-dd-row-top"><span>📝</span><span class="ig-qcx-dd-title">${titleHtml}</span>${cmdBadge}${editBtnHtml}</div>`;
           } else {
             const titleHtml = formatTitleWithTags(m.item.name, tokens);
-            const cmdBadge = m.item.customCommand ? `<span class="ig-qcx-dd-cmd">/${m.item.customCommand}</span>` : '';
+            const cmdBadge = m.item.customCommand ? `<span class="ig-qcx-dd-cmd">/${esc(m.item.customCommand)}</span>` : '';
             row.innerHTML = `<div class="ig-qcx-dd-row-top"><span>🎵</span><span class="ig-qcx-dd-title">${titleHtml}</span>${cmdBadge}${editBtnHtml}</div>`;
           }
 
@@ -5128,6 +5490,12 @@ LegoCore.registerBlock({
           if (editBtn) {
               editBtn.onclick = (e) => {
                   e.stopPropagation();
+                  if (m.kind === 'sequence') {
+                      input.value = '';
+                      closeDropdown();
+                      core.emit('sequence:edit-request', { id: m.item.id });
+                      return;
+                  }
                   openItemEditModal(m);
                   closeDropdown();
               };
@@ -5157,9 +5525,11 @@ LegoCore.registerBlock({
         isEmojiMode = false;
         const saveFolderMatch = val.match(/^\/save\s+audio\s+([^.]*)$/i);
         if (saveFolderMatch) {
+          const token = ++searchToken;
           const rawQuery = saveFolderMatch[1].trim();
           const query = normalizeStr(rawQuery);
           const folders = await getAllFolders();
+          if (token !== searchToken) return; // stale (user kept typing)
           const filtered = folders.filter(f => !query || normalizeStr(f).includes(query));
           matches = filtered.map(f => ({ kind: 'folder', name: f }));
           if (query && !folders.some(f => normalizeStr(f) === query)) matches.push({ kind: 'folder-new', name: rawQuery });
@@ -5167,30 +5537,27 @@ LegoCore.registerBlock({
           selectedIndex = 0; openDropdown(); return;
         }
 
-        // STRICT GUARD RESTORED: Stop here if not starting with slash
-        if (!val.startsWith('/')) { closeDropdown(); return; }
+        // "/save" for text: keep the list closed and claim Enter (even during an active sequence)
+        if (parseSaveText(val) !== null) { closeDropdown(); input.setAttribute('data-seq-exempt', '1'); return; }
+
+        // Slash mode: only a leading "/" opens the list. Instant mode: any non-blank text does.
+        const hasSlash = val.startsWith('/');
+        if (!hasSlash && (!instantSearch || !val.trim())) { closeDropdown(); return; }
 
         if (/^\/save\s+audio\s+[^.]+\..*$/i.test(val)) { closeDropdown(); return; }
 
-        let mode = 'all';
-        const remainder = val.slice(1);
+        const remainder = hasSlash ? val.slice(1) : val.trimStart();
         const lower = remainder.toLowerCase();
-        let q = remainder;
-
         if (lower.startsWith('user ') || lower === 'user') { closeDropdown(); return; }
-        if (lower.startsWith('text ')) { mode = 'text'; q = remainder.slice(5); }
-        else if (lower === 'text') { mode = 'text'; q = ''; }
-        else if (lower.startsWith('audio ')) { mode = 'audio'; q = remainder.slice(6); }
-        else if (lower === 'audio') { mode = 'audio'; q = ''; }
-        else if (lower.startsWith('flow ')) { mode = 'flow'; q = remainder.slice(5); }
-        else if (lower === 'flow') { mode = 'flow'; q = ''; }
-        else if (lower.startsWith('set ')) { mode = 'set'; q = remainder.slice(4); }
-        else if (lower === 'set') { mode = 'set'; q = ''; }
+
+        // Prefixes: /text /audio /flow /set /seq (or /sequence) — parsed + scored in LegoCore
+        const { mode, q } = core.parseSearchPrefix(remainder);
+        const token = ++searchToken;
+        const results = await core.searchInventory(q, mode, { limit: 8 });
+        if (token !== searchToken) return; // stale (user kept typing)
 
         currentSearchTokens = getSearchTokens(q);
-
-        const { clips, textItems, mcFlows, imageSets } = await getAllSearchableItems();
-        matches = computeMatches(q, mode, clips, textItems, mcFlows, imageSets);
+        matches = results;
         selectedIndex = 0;
 
         if (matches.length > 0) openDropdown(); else closeDropdown();
@@ -5210,6 +5577,16 @@ LegoCore.registerBlock({
         if (m.kind === 'folder' || m.kind === 'folder-new') {
           input.value = `/save audio ${m.name}.`; closeDropdown(); input.focus();
           input.setSelectionRange(input.value.length, input.value.length); return;
+        }
+        if (m.kind === 'sequence') {
+          // Sequences are not buffered: picking one activates it right away (raises the HUD).
+          input.value = ''; closeDropdown(); clearPending();
+          if (!core.setActiveSequence(m.item)) {   // setActiveSequence also records MRU
+            previewBar.style.display = 'flex'; previewLabel.innerText = '⚠️ Sequence is empty';
+            previewPlayBtn.style.display = 'none'; previewSaveBtn.style.display = 'none';
+            setTimeout(() => clearPending(), 1500);
+          }
+          input.focus(); return;
         }
         if (m.kind === 'flow') {
           pendingFlowNs = m.item.flow_ns; pendingFlowName = m.item.name;
@@ -5271,12 +5648,14 @@ LegoCore.registerBlock({
       };
 
       // --- INLINE QUICK SAVE MODAL ---
-      async function openSaveClipModal() {
+      async function openSaveClipModal(prefill) {
+        prefill = (prefill && typeof prefill === 'object' && !(prefill instanceof Event)) ? prefill : {};
         if (!pendingAudioBlob) return alert("No audio loaded to save.");
         if (document.querySelector('.ig-qcx-modal-overlay')) return;
 
         const folders = await getAllFolders();
-        const defaultName = pendingTranscript ? pendingTranscript.slice(0, 30).trim() : pendingAudioName;
+        if (prefill.folder && !folders.includes(prefill.folder)) folders.unshift(prefill.folder);
+        const defaultName = prefill.name || (pendingTranscript ? pendingTranscript.slice(0, 30).trim() : pendingAudioName);
 
         const overlay = document.createElement('div');
         overlay.className = 'ig-qcx-modal-overlay';
@@ -5288,12 +5667,12 @@ LegoCore.registerBlock({
             </div>
 
             <div class="ig-qcx-modal-label">Clip Name:</div>
-            <input type="text" id="ig-qcx-save-name" class="ig-qcx-modal-input" value="${defaultName.replace(/"/g, '&quot;')}">
+            <input type="text" id="ig-qcx-save-name" class="ig-qcx-modal-input" value="${esc(defaultName)}">
 
             <div class="ig-qcx-modal-label">Folder / Group:</div>
             <div style="display:flex; gap:6px;">
               <select id="ig-qcx-save-folder-select" class="ig-qcx-modal-input" style="flex:1;">
-                ${folders.map(f => `<option value="${f}">${f}</option>`).join('')}
+                ${folders.map(f => `<option value="${esc(f)}" ${f === prefill.folder ? 'selected' : ''}>${esc(f)}</option>`).join('')}
                 <option value="__new__">+ New Folder...</option>
               </select>
               <input type="text" id="ig-qcx-save-folder-new" class="ig-qcx-modal-input" placeholder="New folder name" style="flex:1; display:none;">
@@ -5366,22 +5745,13 @@ LegoCore.registerBlock({
         };
       }
 
-      previewSaveBtn.onclick = openSaveClipModal;
+      previewSaveBtn.onclick = () => openSaveClipModal();
       previewDiscardBtn.onclick = () => clearPending();
 
       function sendImageSet(setObj, btnEl) {
-        const chatZone = core.getActiveChatZone();
-        if (!chatZone) { alert("Open an active Instagram chat window first."); return; }
+        // Shared core bridge: the whole set goes in ONE DataTransfer (one drop = one album)
+        if (!core.injectImageSetToChat(setObj.images || [])) return;
         const original = btnEl.innerText; btnEl.innerText = '⏳';
-        const dt = new DataTransfer();
-        setObj.images.forEach((imgData, i) => {
-          const ext = imgData.type ? imgData.type.split('/')[1] : 'jpeg';
-          const fileObj = new File([imgData.blob], `image_${i}.${ext}`, { type: imgData.type || 'image/jpeg' });
-          dt.items.add(fileObj);
-        });
-        ['dragenter', 'dragover', 'drop'].forEach(eventType => {
-          chatZone.dispatchEvent(new DragEvent(eventType, { bubbles: true, cancelable: true, dataTransfer: dt }));
-        });
         setTimeout(() => { btnEl.innerText = '✅'; setTimeout(() => { btnEl.innerText = original; clearPending(); }, 1000); }, 200);
       }
 
@@ -5411,18 +5781,400 @@ LegoCore.registerBlock({
       }
       sendBtn.onclick = sendCurrent;
 
+      // Short status message in the preview bar (same pattern as /user)
+      function flashNote(text, ms) {
+        if (pendingAudioBlob || pendingFlowNs || pendingSet) return;
+        previewBar.style.display = 'flex'; previewLabel.innerText = text;
+        previewPlayBtn.style.display = 'none'; previewSaveBtn.style.display = 'none'; previewDiscardBtn.style.display = 'none';
+        clearTimeout(flashNote.t);
+        flashNote.t = setTimeout(() => {
+          if (pendingAudioBlob || pendingFlowNs || pendingSet) return;
+          previewBar.style.display = 'none';
+          previewPlayBtn.style.display = ''; previewSaveBtn.style.display = ''; previewDiscardBtn.style.display = '';
+        }, ms || 1800);
+      }
+
+      // ================= /save → SAVE TEXT SNIPPET =================
+      function openSaveSnippetModal(text) {
+        if (document.querySelector('.ig-qcx-modal-overlay')) return;
+        const data = getTextLibraryData();
+        const folders = data.items.filter(i => i.type === 'folder').sort((a, b) => (a.order || 0) - (b.order || 0));
+        const tags = data.tags || [];
+        const firstLine = (text.split('\n')[0] || '').trim();
+        const defaultTitle = firstLine.length > 30 ? firstLine.slice(0, 30).trim() + '…' : firstLine;
+
+        const overlay = document.createElement('div');
+        overlay.className = 'ig-qcx-modal-overlay';
+        overlay.innerHTML = `
+          <div class="ig-qcx-modal">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+              <h3>📝 Save Snippet</h3>
+              <button class="ig-qcx-snip-close" style="background:none; border:none; color:#94a3b8; cursor:pointer; font-size:14px;">✕</button>
+            </div>
+            <div class="ig-qcx-modal-label">Title:</div>
+            <input type="text" class="ig-qcx-modal-input ig-qcx-snip-title" value="${esc(defaultTitle)}" placeholder="Snippet title">
+            <div class="ig-qcx-modal-label">Folder:</div>
+            <div style="display:flex; gap:6px;">
+              <select class="ig-qcx-modal-input ig-qcx-snip-folder" style="flex:1;">
+                <option value="root">📁 (No folder)</option>
+                ${folders.map(f => `<option value="${esc(f.id)}">📁 ${esc(f.name)}</option>`).join('')}
+                <option value="__new__">+ New folder…</option>
+              </select>
+              <input type="text" class="ig-qcx-modal-input ig-qcx-snip-folder-new" placeholder="New folder name" style="flex:1; display:none;">
+            </div>
+            ${tags.length ? `<div class="ig-qcx-modal-label">Tags:</div>
+            <div class="ig-qcx-tag-row">${tags.map(t => `<label><input type="checkbox" class="ig-qcx-snip-tag" data-id="${esc(t.id)}"><span style="color:${esc(t.color || '#c9a876')};">${esc(t.name)}</span></label>`).join('')}</div>` : ''}
+            <div class="ig-qcx-modal-label">/Command (optional):</div>
+            <input type="text" class="ig-qcx-modal-input ig-qcx-snip-cmd" placeholder="e.g. precio">
+            <div class="ig-qcx-modal-label">Text:</div>
+            <textarea class="ig-qcx-modal-textarea ig-qcx-snip-text" style="min-height:90px; max-height:220px;">${esc(text)}</textarea>
+            <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:4px;">
+              <button class="ig-qcx-snip-cancel" style="background:transparent; color:#94a3b8; border:none; cursor:pointer; font-weight:bold;">Cancel</button>
+              <button class="ig-qcx-snip-save" style="background:#10b981; color:#fff; border:none; padding:7px 14px; border-radius:4px; font-weight:bold; cursor:pointer;">💾 Save</button>
+            </div>
+          </div>`;
+        document.body.appendChild(overlay);
+
+        const titleEl = overlay.querySelector('.ig-qcx-snip-title');
+        const folderSel = overlay.querySelector('.ig-qcx-snip-folder');
+        const folderNew = overlay.querySelector('.ig-qcx-snip-folder-new');
+        const textEl = overlay.querySelector('.ig-qcx-snip-text');
+        folderSel.onchange = () => { folderNew.style.display = folderSel.value === '__new__' ? '' : 'none'; if (folderSel.value === '__new__') folderNew.focus(); };
+
+        const close = () => { overlay.remove(); input.focus(); };
+        overlay.querySelector('.ig-qcx-snip-close').onclick = close;
+        overlay.querySelector('.ig-qcx-snip-cancel').onclick = close;
+
+        function save() {
+          const body = textEl.value.trim();
+          if (!body) { textEl.focus(); return; }
+          const fresh = getTextLibraryData();
+          fresh.items = fresh.items || [];
+          let parentId = folderSel.value;
+          if (parentId === '__new__') {
+            const name = folderNew.value.trim();
+            if (!name) { folderNew.focus(); return; }
+            const existing = fresh.items.find(i => i.type === 'folder' && (i.name || '').toLowerCase() === name.toLowerCase());
+            if (existing) parentId = existing.id;
+            else {
+              parentId = 'fld_' + Date.now();
+              fresh.items.push({ id: parentId, type: 'folder', parentId: 'root', name, collapsed: false, order: Date.now() });
+            }
+          }
+          const title = titleEl.value.trim() || (body.length > 25 ? body.substring(0, 25) + '...' : body);
+          const tagIds = Array.from(overlay.querySelectorAll('.ig-qcx-snip-tag:checked')).map(cb => cb.dataset.id);
+          const cmd = overlay.querySelector('.ig-qcx-snip-cmd').value.trim().replace(/^\/+/, '');
+          // Same record shape the Text Library itself creates
+          fresh.items.push({ id: 'snip_' + Date.now(), type: 'snippet', parentId, title, text: body, tags: tagIds, customCommand: cmd, order: Date.now() });
+          saveTextLibraryData(fresh);
+          core.emit('textlib:external-refresh');
+          overlay.remove();
+          input.value = ''; closeDropdown(); input.focus();
+          flashNote('✅ Snippet saved: ' + title);
+        }
+        overlay.querySelector('.ig-qcx-snip-save').onclick = save;
+        overlay.addEventListener('keydown', (ev) => {
+          ev.stopPropagation();
+          if (ev.key === 'Escape') { ev.preventDefault(); close(); return; }
+          if (ev.key === 'Enter' && (ev.target !== textEl || ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); save(); }
+        });
+        titleEl.focus(); titleEl.select();
+      }
+
+      // ================= IMAGE TRAY (drop / paste → reorder → save as set or paste) =================
+      const chatUI = wrapper.parentElement; // the Quick Chat block's own root (moves with the float)
+      let trayImages = [];
+      let dragThumbIdx = null;
+
+      const tray = document.createElement('div');
+      tray.className = 'ig-qcx-tray';
+      tray.innerHTML = `
+        <div class="ig-qcx-tray-strip"></div>
+        <div class="ig-qcx-tray-bar">
+          <span class="ig-qcx-tray-count"></span>
+          <button class="ig-qcx-tray-btn primary ig-qcx-tray-save" title="Save as an Image Set">💾 Save set</button>
+          <button class="ig-qcx-tray-btn go ig-qcx-tray-paste" title="Put these images in the Instagram chat box (you press Enter to send)">📥 Paste</button>
+          <button class="ig-qcx-tray-btn ig-qcx-tray-clear" title="Clear">🗑️</button>
+        </div>`;
+      chatUI.insertBefore(tray, wrapper);
+      const trayStrip = tray.querySelector('.ig-qcx-tray-strip');
+      const trayCount = tray.querySelector('.ig-qcx-tray-count');
+
+      function clearDropMarks() { trayStrip.querySelectorAll('.drop-before, .drop-after').forEach(el => el.classList.remove('drop-before', 'drop-after')); }
+
+      function renderTray() {
+        tray.classList.toggle('show', trayImages.length > 0);
+        trayCount.textContent = `🖼️ ${trayImages.length} image${trayImages.length === 1 ? '' : 's'} · drag to reorder`;
+        trayStrip.innerHTML = '';
+        trayImages.forEach((img, idx) => {
+          const th = document.createElement('div');
+          th.className = 'ig-qcx-tray-thumb';
+          th.draggable = true;
+          th.innerHTML = `<img src="${img.thumb}" alt=""><span class="ig-qcx-tray-num">${idx + 1}</span><button class="ig-qcx-tray-del" title="Remove">✕</button>`;
+          th.querySelector('.ig-qcx-tray-del').onclick = (ev) => { ev.stopPropagation(); trayImages.splice(idx, 1); renderTray(); };
+          th.addEventListener('dragstart', (ev) => { dragThumbIdx = idx; ev.dataTransfer.effectAllowed = 'move'; ev.dataTransfer.setData('text/plain', 'qcx-thumb'); setTimeout(() => th.classList.add('dragging'), 0); });
+          th.addEventListener('dragend', () => { dragThumbIdx = null; th.classList.remove('dragging'); clearDropMarks(); });
+          th.addEventListener('dragover', (ev) => {
+            if (dragThumbIdx === null) return;
+            ev.preventDefault(); ev.stopPropagation();
+            clearDropMarks();
+            if (dragThumbIdx === idx) return;
+            const r = th.getBoundingClientRect();
+            th.classList.add(ev.clientX < r.left + r.width / 2 ? 'drop-before' : 'drop-after');
+          });
+          th.addEventListener('drop', (ev) => {
+            if (dragThumbIdx === null) return;
+            ev.preventDefault(); ev.stopPropagation();
+            const r = th.getBoundingClientRect();
+            let to = ev.clientX < r.left + r.width / 2 ? idx : idx + 1;
+            const from = dragThumbIdx;
+            const [moved] = trayImages.splice(from, 1);
+            if (from < to) to--;
+            trayImages.splice(to, 0, moved);
+            dragThumbIdx = null; renderTray();
+          });
+          trayStrip.appendChild(th);
+        });
+      }
+
+      async function addTrayFiles(fileList) {
+        const files = Array.from(fileList || []).filter(f => f && f.type && f.type.startsWith('image/'));
+        if (!files.length) return;
+        trayCount.textContent = '⏳ Processing…'; tray.classList.add('show');
+        for (const file of files) {
+          const thumb = await compressThumbnail(file);
+          trayImages.push({ id: 'img_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5), type: file.type, blob: file, thumb });
+        }
+        renderTray();
+      }
+
+      function clearTray() { trayImages = []; renderTray(); }
+
+      tray.querySelector('.ig-qcx-tray-clear').onclick = clearTray;
+      tray.querySelector('.ig-qcx-tray-paste').onclick = () => {
+        if (!trayImages.length) return;
+        if (core.injectImageSetToChat(trayImages)) { clearTray(); flashNote('📥 Images in the chat box — press Enter there to send'); }
+      };
+      tray.querySelector('.ig-qcx-tray-save').onclick = () => openSaveImageSetModal();
+
+      function saveImageSetToDb(title, images) {
+        return new Promise((resolve, reject) => {
+          const req = indexedDB.open('IG_ImageSets_Core_DB', 1);
+          req.onupgradeneeded = e => {  // same schema as the Image Sets module, in case it never ran
+            const d = e.target.result;
+            if (!d.objectStoreNames.contains('sets')) d.createObjectStore('sets', { keyPath: 'id' }).createIndex('order', 'order', { unique: false });
+          };
+          req.onerror = () => reject(req.error);
+          req.onsuccess = e => {
+            const d = e.target.result;
+            const tx = d.transaction(['sets'], 'readwrite');
+            const store = tx.objectStore('sets');
+            const countReq = store.count();
+            countReq.onsuccess = () => store.add({ id: 'set_' + Date.now(), title, images, order: countReq.result });
+            tx.oncomplete = () => { d.close(); resolve(); };
+            tx.onerror = () => { d.close(); reject(tx.error); };
+          };
+        });
+      }
+
+      function openSaveImageSetModal() {
+        if (!trayImages.length || document.querySelector('.ig-qcx-modal-overlay')) return;
+        const overlay = document.createElement('div');
+        overlay.className = 'ig-qcx-modal-overlay';
+        overlay.innerHTML = `
+          <div class="ig-qcx-modal">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+              <h3>🖼️ Save Image Set (${trayImages.length})</h3>
+              <button class="ig-qcx-set-close" style="background:none; border:none; color:#94a3b8; cursor:pointer; font-size:14px;">✕</button>
+            </div>
+            <div class="ig-qcx-modal-label">Set title:</div>
+            <input type="text" class="ig-qcx-modal-input ig-qcx-set-title" placeholder="e.g. Fotos precios">
+            <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:4px;">
+              <button class="ig-qcx-set-cancel" style="background:transparent; color:#94a3b8; border:none; cursor:pointer; font-weight:bold;">Cancel</button>
+              <button class="ig-qcx-set-save" style="background:#6366f1; color:#fff; border:none; padding:7px 14px; border-radius:4px; font-weight:bold; cursor:pointer;">💾 Save</button>
+            </div>
+          </div>`;
+        document.body.appendChild(overlay);
+        const titleEl = overlay.querySelector('.ig-qcx-set-title');
+        const close = () => { overlay.remove(); input.focus(); };
+        overlay.querySelector('.ig-qcx-set-close').onclick = close;
+        overlay.querySelector('.ig-qcx-set-cancel').onclick = close;
+        const saveBtn = overlay.querySelector('.ig-qcx-set-save');
+        async function save() {
+          if (saveBtn.disabled) return;
+          const title = titleEl.value.trim() || 'Untitled Set';
+          saveBtn.disabled = true; saveBtn.innerText = '⏳';
+          try {
+            await saveImageSetToDb(title, trayImages.slice());
+            core.emit('images:external-refresh'); core.emit('images:updated');
+            clearTray(); close(); flashNote('✅ Image set saved: ' + title);
+          } catch (err) { alert('Could not save the image set: ' + (err && err.message || err)); saveBtn.disabled = false; saveBtn.innerText = '💾 Save'; }
+        }
+        saveBtn.onclick = save;
+        overlay.addEventListener('keydown', (ev) => {
+          ev.stopPropagation();
+          if (ev.key === 'Escape') { ev.preventDefault(); close(); }
+          else if (ev.key === 'Enter') { ev.preventDefault(); save(); }
+        });
+        titleEl.focus();
+      }
+
+      // File drops anywhere on the Quick Chat box (docked or floating) go to the tray — never to Instagram.
+      // Capture phase on window so Instagram's own drop handlers never see them.
+      function inDropZone(t) { return !!(t && t.closest && (chatUI.contains(t) || (floatShell && floatShell.contains(t)))); }
+      function hasFiles(e) { return !!(e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files')); }
+      let hoverEl = null;
+      function setHover(on) {
+        const el = floatShell && floatShell.isConnected ? floatShell : chatUI;
+        if (hoverEl && hoverEl !== el) hoverEl.classList.remove('ig-qcx-drop-hover');
+        hoverEl = el; el.classList.toggle('ig-qcx-drop-hover', on);
+      }
+      ['dragenter', 'dragover'].forEach(type => window.addEventListener(type, (e) => {
+        if (!hasFiles(e)) return;
+        if (!inDropZone(e.target)) { if (hoverEl) setHover(false); return; }
+        e.preventDefault(); e.stopImmediatePropagation();
+        e.dataTransfer.dropEffect = 'copy'; setHover(true);
+      }, true));
+      window.addEventListener('dragleave', (e) => { if (hoverEl && !e.relatedTarget) setHover(false); }, true);
+      window.addEventListener('drop', (e) => {
+        if (hoverEl) setHover(false);
+        if (!hasFiles(e) || !inDropZone(e.target)) return;
+        e.preventDefault(); e.stopImmediatePropagation();
+        addTrayFiles(e.dataTransfer.files);
+      }, true);
+
+      // Ctrl+V a screenshot into the box → tray
+      input.addEventListener('paste', (e) => {
+        const files = Array.from((e.clipboardData && e.clipboardData.files) || []).filter(f => f.type.startsWith('image/'));
+        if (!files.length) return;
+        e.preventDefault();
+        addTrayFiles(files);
+      });
+
+      // ================= FLOATING WINDOW (📌) =================
+      let floatShell = null;
+      const pinBtn = document.createElement('button');
+      pinBtn.className = 'ig-qcx-hdr-btn';
+      pinBtn.innerText = '📌';
+      pinBtn.title = 'Pop out as a floating window (always on top)';
+      header.insertBefore(pinBtn, gearBtn);
+
+      const stub = document.createElement('div');
+      stub.className = 'ig-qcx-float-stub';
+      stub.innerHTML = `<span>💬 Floating window</span><button type="button">Dock</button>`;
+      stub.querySelector('button').onclick = () => dock();
+
+      // Anything with max z-index added to <body> after us would paint on top (equal z → later wins).
+      // Slide such elements in *before* the float instead of moving the float (moving it would steal focus).
+      const ALLOW_ABOVE = /ig-qcx-|ig-seq-|modal-overlay/;
+      const topWatcher = new MutationObserver((muts) => {
+        if (!floatShell || !floatShell.isConnected) return;
+        for (const m of muts) for (const n of m.addedNodes) {
+          if (n.nodeType !== 1 || n === floatShell || n.parentNode !== document.body) continue;
+          if (ALLOW_ABOVE.test(n.getAttribute('class') || '')) continue;
+          const z = parseInt(getComputedStyle(n).zIndex, 10);
+          if (z >= 2147483647 && (floatShell.compareDocumentPosition(n) & Node.DOCUMENT_POSITION_FOLLOWING)) {
+            document.body.insertBefore(n, floatShell);
+          }
+        }
+      });
+
+      function clampShell(st) {
+        const w = floatShell.offsetWidth, h = floatShell.offsetHeight;
+        st.x = Math.max(0, Math.min(st.x, window.innerWidth - Math.min(w, 120)));
+        st.y = Math.max(0, Math.min(st.y, window.innerHeight - 36));
+        if (st.y + h > window.innerHeight && h < window.innerHeight) st.y = Math.max(0, window.innerHeight - h);
+        floatShell.style.left = st.x + 'px'; floatShell.style.top = st.y + 'px';
+      }
+
+      function buildShell() {
+        floatShell = document.createElement('div');
+        floatShell.className = 'ig-qcx-float';
+        floatShell.innerHTML = `<div class="ig-qcx-float-bar"><span class="ig-qcx-float-title">💬 Quick Chat</span></div><div class="ig-qcx-float-body"></div>`;
+        const bar = floatShell.querySelector('.ig-qcx-float-bar');
+
+        // Drag by the title bar
+        bar.addEventListener('pointerdown', (e) => {
+          if (e.button !== 0 || e.target.closest('button')) return;
+          e.preventDefault();
+          const st = getFloatState();
+          const startX = e.clientX, startY = e.clientY;
+          const baseX = floatShell.offsetLeft, baseY = floatShell.offsetTop;
+          bar.setPointerCapture(e.pointerId);
+          const move = (ev) => { st.x = baseX + ev.clientX - startX; st.y = baseY + ev.clientY - startY; clampShell(st); };
+          const up = () => { bar.removeEventListener('pointermove', move); bar.removeEventListener('pointerup', up); saveFloatState(st); };
+          bar.addEventListener('pointermove', move); bar.addEventListener('pointerup', up);
+        });
+
+        // Resize from the native corner handle; only remember size after a real user resize
+        floatShell.addEventListener('pointerdown', (e) => {
+          const r = floatShell.getBoundingClientRect();
+          if (e.clientX < r.right - 18 || e.clientY < r.bottom - 18) return;
+          const up = () => {
+            window.removeEventListener('pointerup', up, true);
+            const st = getFloatState(); st.w = floatShell.offsetWidth; st.h = floatShell.offsetHeight; saveFloatState(st);
+          };
+          window.addEventListener('pointerup', up, true);
+        });
+      }
+
+      function floatOut() {
+        if (!floatShell) buildShell();
+        const st = getFloatState();
+        const body = floatShell.querySelector('.ig-qcx-float-body');
+        const bar = floatShell.querySelector('.ig-qcx-float-bar');
+        const hadFocus = document.activeElement === input;
+        chatUI.parentNode.insertBefore(stub, chatUI);
+        body.appendChild(chatUI);
+        bar.appendChild(pinBtn); bar.appendChild(gearBtn);
+        pinBtn.innerText = '📥'; pinBtn.title = 'Dock back into the sidebar';
+        floatShell.style.width = (st.w || 360) + 'px';
+        floatShell.style.height = st.h ? st.h + 'px' : '';
+        document.body.appendChild(floatShell);   // last in <body> → above every equal-z element present now
+        if (st.x === null || st.y === null) { st.x = window.innerWidth - floatShell.offsetWidth - 24; st.y = window.innerHeight - floatShell.offsetHeight - 24; }
+        clampShell(st);
+        st.floating = true; saveFloatState(st);
+        topWatcher.observe(document.body, { childList: true });
+        if (dropdownOpen) positionDropdown();
+        if (hadFocus || !document.activeElement || document.activeElement === document.body) input.focus();
+      }
+
+      function dock() {
+        if (!floatShell) return;
+        topWatcher.disconnect();
+        const hadFocus = document.activeElement === input;
+        stub.replaceWith(chatUI);
+        header.appendChild(pinBtn); header.appendChild(gearBtn);
+        pinBtn.innerText = '📌'; pinBtn.title = 'Pop out as a floating window (always on top)';
+        floatShell.remove();
+        const st = getFloatState(); st.floating = false; saveFloatState(st);
+        closeDropdown();
+        if (hadFocus) input.focus();
+      }
+
+      pinBtn.onclick = (e) => { e.stopPropagation(); (floatShell && floatShell.isConnected) ? dock() : floatOut(); };
+      window.addEventListener('resize', () => { if (floatShell && floatShell.isConnected) clampShell(getFloatState()); });
+      if (getFloatState().floating) floatOut();
+
       input.addEventListener('input', () => { recomputeMatches(); });
       input.addEventListener('keydown', (e) => {
+        // SEQUENCE GATE: with the dropdown closed, Enter/Escape belong to the Sequence Manager.
+        const saveArmed = e.key === 'Enter' && parseSaveText(input.value) !== null;
+        if (sequenceIsActive() && !dropdownOpen && !saveArmed && (e.key === 'Enter' || e.key === 'Escape')) return;
+
         if (dropdownOpen) {
-          if (e.key === 'ArrowDown') { e.preventDefault(); selectedIndex = (selectedIndex + 1) % matches.length; updateSelection(); return; }
-          if (e.key === 'ArrowUp') { e.preventDefault(); selectedIndex = (selectedIndex - 1 + matches.length) % matches.length; updateSelection(); return; }
-          if (e.key === 'Enter' || e.key === 'Tab') { e.preventDefault(); e.stopPropagation(); pickSelected(); return; }
+          if (e.key === 'ArrowDown') { e.preventDefault(); if (matches.length) { selectedIndex = (selectedIndex + 1) % matches.length; updateSelection(); } return; }
+          if (e.key === 'ArrowUp') { e.preventDefault(); if (matches.length) { selectedIndex = (selectedIndex - 1 + matches.length) % matches.length; updateSelection(); } return; }
+          if ((e.key === 'Enter' || e.key === 'Tab') && matches.length) { e.preventDefault(); e.stopPropagation(); pickSelected(); return; }
           if (e.key === 'Escape') { e.preventDefault(); closeDropdown(); return; }
         }
         if (e.key === 'Enter' && !e.shiftKey) {
           e.preventDefault(); e.stopPropagation(); const val = input.value.trim();
           const saveMatch = val.match(/^\/save\s+audio\s+([^.]+)\.(.*)$/i);
-          if (saveMatch) { saveAudioToLibrary(saveMatch[1].trim(), saveMatch[2].trim()); return; }
+          // FIX: saveAudioToLibrary() no longer existed in v28.1 -> route to the Quick Save modal, prefilled
+          if (saveMatch) { input.value = ''; closeDropdown(); openSaveClipModal({ folder: saveMatch[1].trim(), name: saveMatch[2].trim() }); return; }
+          const saveText = parseSaveText(val);
+          if (saveText !== null) { closeDropdown(); openSaveSnippetModal(saveText); return; }
           const userMatch = val.match(/^\/user\s+(.+)$/i);
           if (userMatch) {
             const overrideUser = userMatch[1].trim().replace(/^@/, ''); input.value = ''; closeDropdown();
@@ -5515,15 +6267,20 @@ LegoCore.registerBlock({
             </div>
 
             <div class="ig-qcx-shortcut-row" style="display:flex; align-items:center; justify-content:space-between; background:rgba(255,255,255,0.03); border-radius:6px; padding:8px;">
-              <div style="font-size:11px; color:#94a3b8;">⌨️ Jump-to-box shortcut<br><span class="ig-qcx-shortcut-current" style="color:#c9a876; font-weight:bold; font-size:12px;">${formatCombo(getShortcutCombo())}</span></div>
+              <div style="font-size:11px; color:#94a3b8;">⌨️ Jump-to-box shortcut<br><span class="ig-qcx-shortcut-current" style="color:#c9a876; font-weight:bold; font-size:12px;">${esc(formatCombo(getShortcutCombo()))}</span></div>
               <button class="ig-qcx-shortcut-change" style="background:#1e293b; border:1px solid #475569; color:#fff; padding:5px 10px; border-radius:4px; font-size:10px; cursor:pointer;">Change</button>
             </div>
+            <label style="display:flex; align-items:center; justify-content:space-between; gap:8px; background:rgba(255,255,255,0.03); border-radius:6px; padding:8px; cursor:pointer; user-select:none;">
+              <div style="font-size:11px; color:#94a3b8;">⚡ Instant search<br><span style="font-size:10px; opacity:0.75;">Show the list as you type — no "/" needed</span></div>
+              <input type="checkbox" id="ig-qcx-instant-chk" ${instantSearch ? 'checked' : ''} style="width:16px; height:16px; cursor:pointer;">
+            </label>
             <input type="text" id="ig-qcx-mgr-search" class="ig-qcx-mgr-search" placeholder="🔍 Search items...">
             <div id="ig-qcx-mgr-list" class="ig-qcx-mgr-list"></div>
           </div>
         `;
         document.body.appendChild(overlay);
         overlay.querySelector('#ig-qcx-mgr-close').onclick = () => overlay.remove();
+        overlay.querySelector('#ig-qcx-instant-chk').onchange = (ev) => setInstantSearch(ev.target.checked);
 
         const shortcutCurrentEl = overlay.querySelector('.ig-qcx-shortcut-current');
         const shortcutChangeBtn = overlay.querySelector('.ig-qcx-shortcut-change');
@@ -5541,7 +6298,7 @@ LegoCore.registerBlock({
           document.addEventListener('keydown', captureKey, true);
         };
 
-        const { clips, textItems } = await getAllSearchableItems();
+        const { clips, textItems } = await core.getSearchableInventory();
         const listEl = overlay.querySelector('#ig-qcx-mgr-list');
         const searchEl = overlay.querySelector('#ig-qcx-mgr-search');
 
@@ -5558,15 +6315,15 @@ LegoCore.registerBlock({
             const name = x.kind === 'text' ? x.item.title : x.item.name;
             const icon = x.kind === 'text' ? '📝' : '🎵';
             row.innerHTML = `
-              <span>${icon}</span><span class="ig-qcx-mgr-name" title="${name}">${name}</span><span style="opacity:0.5;">/</span>
-              <input type="text" class="ig-qcx-mgr-cmd-input" placeholder="command" value="${x.item.customCommand || ''}">
+              <span>${icon}</span><span class="ig-qcx-mgr-name" title="${esc(name)}">${esc(name)}</span><span style="opacity:0.5;">/</span>
+              <input type="text" class="ig-qcx-mgr-cmd-input" placeholder="command" value="${esc(x.item.customCommand || '')}">
             `;
             const cmdInput = row.querySelector('.ig-qcx-mgr-cmd-input');
             cmdInput.onchange = () => {
               const val = cmdInput.value.trim().replace(/^\/+/, '');
               if (x.kind === 'text') {
                 const data = getTextLibraryData(); const found = data.items.find(i => i.id === x.item.id);
-                if (found) { found.customCommand = val; saveTextLibraryData(data); x.item.customCommand = val; }
+                if (found) { found.customCommand = val; saveTextLibraryData(data); x.item.customCommand = val; core.emit('textlib:external-refresh'); }
               } else {
                 withDb(db => {
                   const tx = db.transaction(['clips'], 'readwrite');
@@ -5758,941 +6515,6 @@ LegoCore.registerBlock({
 
     console.log('[MenuCardReorderModule] Drag-to-reorder enabled and stabilized.');
     core.emit('block:ready', { id: 'menuCardReorderModule' });
-  }
-});
-
-/* ============================================================
-   BLOCK: ManyChat Integration (v7)
-   ============================================================ */
-/* ============================================================
-   BLOCK: ManyChat Integration (v13 - Transcripts & Descriptions)
-   ============================================================ */
-LegoCore.registerBlock({
-  id: 'manychatModule',
-  init(core) {
-    const API_KEY_STORAGE = 'mc_api_key_v1';
-    const FLOWS_STORAGE = 'mc_flows_cache_v1';
-    const TARGET_ID_STORAGE = 'mc_target_subscriber_v1';
-    const FOLDERS_STORAGE = 'mc_folders_v1';
-    const COLLAPSED_FOLDERS_KEY = 'mc_folders_collapsed_v1';
-    const TARGET_COLLAPSE_KEY = 'mc_target_collapsed_v1';
-    const API_BASE = 'https://api.manychat.com';
-
-    let apiKey = localStorage.getItem(API_KEY_STORAGE) || '';
-    let flows = [];
-    try { flows = JSON.parse(localStorage.getItem(FLOWS_STORAGE)) || []; } catch (e) { flows = []; }
-    let targetSubscriberId = sessionStorage.getItem(TARGET_ID_STORAGE) || '';
-
-    let folders = [];
-    try { folders = JSON.parse(localStorage.getItem(FOLDERS_STORAGE)) || ['General']; } catch (e) { folders = ['General']; }
-    if (!folders.length) folders = ['General'];
-    if (!folders.includes('General')) folders.unshift('General');
-
-    let collapsedFolders = new Set();
-    try { collapsedFolders = new Set(JSON.parse(localStorage.getItem(COLLAPSED_FOLDERS_KEY)) || []); } catch (e) {}
-
-    let targetCollapsed = localStorage.getItem(TARGET_COLLAPSE_KEY) !== 'false';
-
-    function saveFlows() { localStorage.setItem(FLOWS_STORAGE, JSON.stringify(flows)); }
-    function saveTargetId(val) { targetSubscriberId = val; sessionStorage.setItem(TARGET_ID_STORAGE, val); }
-    function saveFolders() { localStorage.setItem(FOLDERS_STORAGE, JSON.stringify(folders)); }
-    function saveCollapsedFolders() { localStorage.setItem(COLLAPSED_FOLDERS_KEY, JSON.stringify(Array.from(collapsedFolders))); }
-
-    function gmRequest(url, options) {
-      return new Promise((resolve, reject) => {
-        const defaults = {
-          method: 'GET', headers: { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' }, url: url,
-          onload: function(response) {
-            try {
-              const data = JSON.parse(response.responseText);
-              if (response.status >= 200 && response.status < 300) resolve(data);
-              else reject(new Error('API error (' + response.status + '): ' + (data && (data.message || data.error || JSON.stringify(data)) || response.statusText)));
-            } catch (e) { reject(new Error('Failed to parse response: ' + e.message)); }
-          },
-          onerror: function(response) { reject(new Error('Network error: ' + (response.statusText || 'Unknown error'))); },
-          ontimeout: function() { reject(new Error('Request timed out')); }
-        };
-        const merged = Object.assign({}, defaults, options || {});
-        if (typeof GM_xmlhttpRequest !== 'undefined') GM_xmlhttpRequest(merged);
-        else reject(new Error('GM_xmlhttpRequest not available. Add @grant GM_xmlhttpRequest to your userscript header.'));
-      });
-    }
-
-    async function mcRequest(path, options) {
-      if (!apiKey) throw new Error('No API Key saved yet.');
-      const fixedOptions = Object.assign({}, options);
-      if (fixedOptions.body) { fixedOptions.data = fixedOptions.body; delete fixedOptions.body; }
-      return gmRequest(API_BASE + path, fixedOptions);
-    }
-
-    const style = document.createElement('style');
-    style.id = 'ig-mc-module-styles';
-    style.innerHTML = `
-      .ig-mc-wrap { display:flex; flex-direction:column; gap:10px; font-family:-apple-system,sans-serif; font-size:11px; color:#fff; }
-      .ig-mc-section { background:#18181b; padding:8px; border-radius:6px; border:1px solid #334155; display:flex; flex-direction:column; gap:6px; }
-      .ig-mc-label { color:#94a3b8; font-size:10px; font-weight:bold; text-transform:uppercase; letter-spacing:0.03em; }
-      .ig-mc-row { display:flex; gap:6px; align-items:center; }
-      .ig-mc-input { flex:1; background:#0f172a; color:#fff; border:1px solid #334155; border-radius:4px; padding:6px 8px; font-size:11px; outline:none; min-width:0; }
-      .ig-mc-input:focus { border-color:#6366f1; }
-      .ig-mc-textarea { width:100%; box-sizing:border-box; background:#0f172a; color:#fff; border:1px solid #334155; border-radius:4px; padding:6px 8px; font-size:11px; outline:none; min-height:55px; max-height:120px; resize:vertical; font-family:inherit; line-height:1.4; }
-      .ig-mc-textarea:focus { border-color:#6366f1; }
-      .ig-mc-btn { background:#334155; color:#fff; border:none; border-radius:4px; padding:6px 10px; font-size:10px; font-weight:bold; cursor:pointer; white-space:nowrap; transition:0.15s; }
-      .ig-mc-btn:hover { background:#475569; }
-      .ig-mc-btn:disabled { opacity:0.6; cursor:not-allowed; }
-      .ig-mc-btn-primary { background:#6366f1; }
-      .ig-mc-btn-primary:hover:not(:disabled) { background:#4f46e5; }
-      .ig-mc-btn-green { background:#10b981; }
-      .ig-mc-btn-green:hover:not(:disabled) { background:#059669; }
-      .ig-mc-btn-small { padding:4px 8px; font-size:9px; }
-      .ig-mc-status { font-size:10px; display:flex; align-items:center; gap:5px; }
-      .ig-mc-dot { width:7px; height:7px; border-radius:50%; background:#dc2626; flex-shrink:0; }
-      .ig-mc-dot.connected { background:#10b981; }
-      .ig-mc-msg { font-size:10px; color:#94a3b8; padding:4px 2px; line-height:1.4; min-height:12px; max-height:60px; overflow-y:auto; }
-      .ig-mc-msg.error { color:#f87171; }
-      .ig-mc-msg.success { color:#34d399; }
-      .ig-mc-flow-list { display:flex; flex-direction:column; gap:0; max-height:280px; overflow-y:auto; }
-      .ig-mc-flow-list::-webkit-scrollbar { width:4px; }
-      .ig-mc-flow-list::-webkit-scrollbar-thumb { background:#334155; border-radius:4px; }
-      .ig-mc-flow-row { display:flex; flex-direction:column; gap:4px; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.06); border-radius:5px; padding:6px 8px; margin:2px 0 2px 6px; }
-      .ig-mc-flow-header { display:flex; align-items:center; gap:6px; }
-      .ig-mc-flow-name { flex:1; min-width:0; font-size:11px; color:#f8fafc; font-weight:500; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-      .ig-mc-flow-transcript-badge { font-size:10px; opacity:0.75; flex-shrink:0; }
-      .ig-mc-flow-actions { display:flex; gap:4px; flex-shrink:0; }
-      .ig-mc-flow-del { background:transparent; border:none; color:#64748b; cursor:pointer; font-size:11px; padding:2px 4px; flex-shrink:0; transition:0.15s; }
-      .ig-mc-flow-del:hover { color:#f87171; }
-      .ig-mc-flow-edit { background:transparent; border:none; color:#64748b; cursor:pointer; font-size:11px; padding:2px 4px; flex-shrink:0; transition:0.15s; }
-      .ig-mc-flow-edit:hover { color:var(--igls-accent, #c9a876); }
-      .ig-mc-empty { padding:14px; text-align:center; font-size:10.5px; color:#64748b; }
-      .ig-mc-gear-btn { background: transparent; border: none; color: var(--igls-text-dim, #96949c); cursor: pointer; font-size: 12px; padding: 2px 5px; border-radius: 4px; transition: 0.15s; }
-      .ig-mc-gear-btn:hover { color: var(--igls-accent, #c9a876); background: rgba(255,255,255,0.08); }
-      .ig-mc-modal-overlay { position: fixed; top:0; left:0; right:0; bottom:0; background: rgba(0,0,0,0.6); z-index: 2147483647; display: flex; justify-content: center; align-items: center; }
-      .ig-mc-modal { background: #0f172a; border: 1px solid #334155; border-radius: 8px; width: 340px; padding: 16px; display: flex; flex-direction: column; gap: 10px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); }
-      .ig-mc-modal h3 { margin: 0; font-size: 14px; color: #fff; }
-      .ig-mc-target-toggle { display:flex; align-items:center; gap:7px; cursor:pointer; padding:2px; user-select:none; }
-      .ig-mc-target-dot { width:8px; height:8px; border-radius:50%; background:#475569; flex-shrink:0; transition:0.15s; }
-      .ig-mc-target-dot.on { background:#10b981; box-shadow:0 0 6px rgba(16,185,129,0.6); }
-      .ig-mc-target-status-text { flex:1; font-size:11px; font-weight:600; color:#e2e8f0; }
-      .ig-mc-target-caret { font-size:9px; color:#64748b; transition:transform 0.2s; }
-      .ig-mc-target-caret.open { transform: rotate(90deg); }
-      .ig-mc-target-detail { flex-direction:column; gap:6px; margin-top:4px; }
-      .ig-mc-automations-header { margin-bottom: -2px; }
-      .ig-mc-folder-head { display:flex; align-items:center; gap:6px; font-weight:bold; font-size:10.5px; color:#94a3b8; padding:5px 4px; background:rgba(0,0,0,0.2); border-bottom:1px solid rgba(255,255,255,0.05); cursor:pointer; user-select:none; border-radius:4px; }
-      .ig-mc-caret { font-size:9px; padding:2px; width:12px; text-align:center; transition: transform .2s; flex-shrink:0; }
-      .ig-mc-caret.collapsed { transform: rotate(-90deg); }
-      .ig-mc-folder-content { display:flex; flex-direction:column; }
-      .ig-mc-folder-content.collapsed { display:none; }
-      .ig-mc-folder-del { background:transparent; border:none; color:#64748b; cursor:pointer; font-size:10px; padding:2px 4px; margin-left:4px; }
-      .ig-mc-folder-del:hover { color:#f87171; }
-      .ig-mc-flow-folder-select { font-size:9px !important; padding:3px 4px !important; }
-      .ig-mc-edit-flow-id-box { background:rgba(0,0,0,0.3); border:1px solid #334155; border-radius:4px; padding:6px 8px; font-size:10px; color:#94a3b8; font-family:monospace; word-break:break-all; line-height:1.4; max-height:80px; overflow-y:auto; }
-    `;
-    document.head.appendChild(style);
-
-    const wrap = document.createElement('div');
-    wrap.className = 'ig-mc-wrap';
-    wrap.innerHTML = `
-      <div class="ig-mc-section">
-        <div class="ig-mc-target-toggle" id="ig-mc-target-toggle">
-          <span class="ig-mc-target-dot" id="ig-mc-target-dot"></span>
-          <span class="ig-mc-target-status-text" id="ig-mc-target-status-text">User not detected</span>
-          <span class="ig-mc-target-caret" id="ig-mc-target-caret">▸</span>
-        </div>
-        <div class="ig-mc-row ig-mc-target-detail" id="ig-mc-target-detail" style="display:none;">
-          <input type="text" id="ig-mc-target-input" class="ig-mc-input" placeholder="Subscriber ID..." value="${targetSubscriberId ? targetSubscriberId.replace(/"/g, '&quot;') : ''}">
-        </div>
-      </div>
-      <div class="ig-mc-section">
-        <div class="ig-mc-row ig-mc-automations-header" style="justify-content:space-between; flex-wrap:wrap; gap:4px;">
-          <span class="ig-mc-label">Automations</span>
-          <div class="ig-mc-row" style="gap:4px;">
-            <button id="ig-mc-fetch-btn" class="ig-mc-btn ig-mc-btn-small">🔄 Fetch</button>
-            <button id="ig-mc-new-folder-btn" class="ig-mc-btn ig-mc-btn-small">📁 Folder</button>
-            <button id="ig-mc-add-btn" class="ig-mc-btn ig-mc-btn-small">➕ Add</button>
-          </div>
-        </div>
-        <div id="ig-mc-msg-box" class="ig-mc-msg"></div>
-        <div id="ig-mc-flow-list" class="ig-mc-flow-list"></div>
-      </div>
-    `;
-
-    function mountCard() {
-      if (typeof core.registerMenu === 'function') {
-        core.registerMenu('right', '🤖 ManyChat', wrap, '⠿', 'manychat-module');
-      } else {
-        setTimeout(mountCard, 200);
-      }
-    }
-    mountCard();
-
-    function attachHeaderGear(attempts = 20) {
-      const card = document.querySelector('.ig-draggable-menu[data-key="manychat-module"]');
-      const header = card && card.querySelector('.ig-menu-header');
-      if (!header) {
-        if (attempts > 0) setTimeout(() => attachHeaderGear(attempts - 1), 200);
-        return;
-      }
-      if (header.querySelector('.ig-mc-gear-btn')) return;
-
-      const gearBtn = document.createElement('button');
-      gearBtn.className = 'ig-mc-gear-btn';
-      gearBtn.title = 'ManyChat Settings (API Key)';
-      gearBtn.innerText = '⚙️';
-      header.appendChild(gearBtn);
-    }
-    attachHeaderGear();
-
-    document.addEventListener('mousedown', (e) => {
-      if (e.target.closest('.ig-mc-gear-btn')) {
-        e.stopPropagation();
-      }
-    }, true);
-
-    document.addEventListener('click', (e) => {
-      if (e.target.closest('.ig-mc-gear-btn')) {
-        e.stopPropagation();
-        openSettingsModal();
-      }
-    });
-
-    function openSettingsModal() {
-      if (document.getElementById('ig-mc-settings-modal')) return;
-      const overlay = document.createElement('div');
-      overlay.className = 'ig-mc-modal-overlay';
-      overlay.id = 'ig-mc-settings-modal';
-      overlay.innerHTML = `
-        <div class="ig-mc-modal">
-          <div style="display:flex; justify-content:space-between; align-items:center;">
-            <h3>⚙️ ManyChat Settings</h3>
-            <button id="ig-mc-settings-close" style="background:none; border:none; color:#94a3b8; cursor:pointer; font-size:14px;">✕</button>
-          </div>
-          <span class="ig-mc-label">API Key</span>
-          <div class="ig-mc-row">
-            <input type="password" id="ig-mc-settings-key-input" class="ig-mc-input" placeholder="Paste your ManyChat API Key..." value="${apiKey ? apiKey.replace(/"/g, '&quot;') : ''}">
-            <button id="ig-mc-settings-save-btn" class="ig-mc-btn ig-mc-btn-primary">Save</button>
-          </div>
-          <div class="ig-mc-status">
-            <span class="ig-mc-dot" id="ig-mc-settings-status-dot"></span>
-            <span id="ig-mc-settings-status-text">Not connected</span>
-          </div>
-        </div>
-      `;
-      document.body.appendChild(overlay);
-
-      const dot = overlay.querySelector('#ig-mc-settings-status-dot');
-      const text = overlay.querySelector('#ig-mc-settings-status-text');
-      function updateModalStatus() {
-        dot.classList.toggle('connected', !!apiKey);
-        text.textContent = apiKey ? 'Key saved' : 'Not connected';
-      }
-      updateModalStatus();
-
-      overlay.querySelector('#ig-mc-settings-close').onclick = () => overlay.remove();
-      overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
-
-      overlay.querySelector('#ig-mc-settings-save-btn').onclick = () => {
-        apiKey = overlay.querySelector('#ig-mc-settings-key-input').value.trim();
-        localStorage.setItem(API_KEY_STORAGE, apiKey);
-        updateModalStatus();
-      };
-    }
-
-    const targetToggle = wrap.querySelector('#ig-mc-target-toggle');
-    const targetDetail = wrap.querySelector('#ig-mc-target-detail');
-    const targetDot = wrap.querySelector('#ig-mc-target-dot');
-    const targetStatusText = wrap.querySelector('#ig-mc-target-status-text');
-    const targetCaret = wrap.querySelector('#ig-mc-target-caret');
-    const targetInput = wrap.querySelector('#ig-mc-target-input');
-    const msgBox = wrap.querySelector('#ig-mc-msg-box');
-    const flowListEl = wrap.querySelector('#ig-mc-flow-list');
-
-    function applyTargetCollapse() { targetDetail.style.display = targetCollapsed ? 'none' : 'flex'; targetCaret.classList.toggle('open', !targetCollapsed); }
-    applyTargetCollapse();
-    targetToggle.onclick = () => { targetCollapsed = !targetCollapsed; localStorage.setItem(TARGET_COLLAPSE_KEY, String(targetCollapsed)); applyTargetCollapse(); };
-
-    function updateTargetStatus() {
-      const has = !!targetInput.value.trim();
-      targetDot.classList.toggle('on', has);
-      let displayTxt = has ? 'User detected' : 'User not detected';
-
-      if (has) {
-        const bridgeDetected = document.getElementById('ig-ub-detected');
-        if (bridgeDetected && bridgeDetected.textContent && bridgeDetected.textContent.startsWith('@')) {
-          displayTxt = `Detected: ${bridgeDetected.textContent}`;
-        }
-      }
-      targetStatusText.textContent = displayTxt;
-    }
-    updateTargetStatus();
-    targetInput.addEventListener('input', () => { saveTargetId(targetInput.value.trim()); updateTargetStatus(); });
-
-    function showMessage(text, type) { msgBox.textContent = text; msgBox.className = 'ig-mc-msg' + (type ? ' ' + type : ''); }
-
-    function mergeFlows(newFlows) {
-      newFlows.forEach(nf => {
-        const existingIdx = flows.findIndex(f => f.flow_ns === nf.flow_ns);
-        if (existingIdx === -1) {
-          flows.push(Object.assign({ folder: 'General', transcript: '' }, nf));
-        } else {
-          flows[existingIdx] = Object.assign({}, nf, {
-            folder: flows[existingIdx].folder || 'General',
-            transcript: flows[existingIdx].transcript || ''
-          });
-        }
-      });
-      saveFlows(); renderFlows();
-    }
-
-    wrap.querySelector('#ig-mc-fetch-btn').onclick = async () => {
-      const btn = wrap.querySelector('#ig-mc-fetch-btn'); const original = btn.innerText; btn.innerText = '⏳ Fetching...'; btn.disabled = true;
-      showMessage('Fetching automations from ManyChat...', null);
-      try {
-        const data = await mcRequest('/fb/page/getFlows', { method: 'GET' });
-        const rawList = (data && data.data) || [];
-        if (!Array.isArray(rawList) || !rawList.length) showMessage('Fetched successfully, but no automations came back. Use "Add" instead.', 'error');
-        else {
-          const mapped = rawList.map(f => ({ name: f.name || f.caption || ('Flow ' + (f.ns || f.id)), flow_ns: f.ns || f.flow_ns || f.id })).filter(f => f.flow_ns);
-          mergeFlows(mapped); showMessage('Fetched ' + mapped.length + ' automation(s).', 'success');
-        }
-      } catch (e) { showMessage((e.message || 'Fetch failed.') + ' -- Use "Add" instead.', 'error'); }
-      finally { btn.innerText = original; btn.disabled = false; }
-    };
-
-    wrap.querySelector('#ig-mc-add-btn').onclick = () => {
-      const name = prompt('Automation Name (e.g. Welcome Message):'); if (!name || !name.trim()) return;
-      const flowNs = prompt('Flow ID (e.g. content20260822180954_359487):'); if (!flowNs || !flowNs.trim()) return;
-      mergeFlows([{ name: name.trim(), flow_ns: flowNs.trim(), transcript: '' }]);
-      showMessage('✅ Added "' + name + '". Add transcript or notes via ✏️!', 'success');
-    };
-
-    wrap.querySelector('#ig-mc-new-folder-btn').onclick = () => {
-      const name = prompt('New folder name:'); if (!name || !name.trim()) return;
-      const trimmed = name.trim(); if (!folders.includes(trimmed)) { folders.push(trimmed); saveFolders(); }
-      renderFlows();
-    };
-
-    function openEditFlowModal(flow) {
-      if (document.getElementById('ig-mc-edit-flow-modal')) return;
-      const overlay = document.createElement('div');
-      overlay.className = 'ig-mc-modal-overlay';
-      overlay.id = 'ig-mc-edit-flow-modal';
-      overlay.innerHTML = `
-        <div class="ig-mc-modal">
-          <div style="display:flex; justify-content:space-between; align-items:center;">
-            <h3>✏️ Edit Automation</h3>
-            <button id="ig-mc-edit-close" style="background:none; border:none; color:#94a3b8; cursor:pointer; font-size:14px;">✕</button>
-          </div>
-          <span class="ig-mc-label">Name</span>
-          <input type="text" id="ig-mc-edit-name-input" class="ig-mc-input" value="${flow.name.replace(/"/g, '&quot;')}">
-          <span class="ig-mc-label">Flow ID</span>
-          <div class="ig-mc-edit-flow-id-box" id="ig-mc-edit-flow-id-preview">${flow.flow_ns}</div>
-          <input type="text" id="ig-mc-edit-id-input" class="ig-mc-input" value="${flow.flow_ns.replace(/"/g, '&quot;')}" style="font-family:monospace;">
-          <span class="ig-mc-label">Transcript / Spoken Notes (Searchable by Quick Command):</span>
-          <textarea id="ig-mc-edit-transcript-input" class="ig-mc-textarea" placeholder="Paste automation text, audio transcript, or trigger words...">${(flow.transcript || '').replace(/</g, '&lt;')}</textarea>
-          <div style="display:flex; justify-content:space-between; margin-top:6px;">
-            <button id="ig-mc-edit-copy" class="ig-mc-btn ig-mc-btn-small">📋 Copy ID</button>
-            <button id="ig-mc-edit-save" class="ig-mc-btn ig-mc-btn-primary">💾 Save</button>
-          </div>
-        </div>
-      `;
-      document.body.appendChild(overlay);
-      overlay.querySelector('#ig-mc-edit-close').onclick = () => overlay.remove();
-      overlay.addEventListener('click', (e) => { if (e.target === overlay) overlay.remove(); });
-      const idInput = overlay.querySelector('#ig-mc-edit-id-input');
-      const idPreview = overlay.querySelector('#ig-mc-edit-flow-id-preview');
-      const transcriptInput = overlay.querySelector('#ig-mc-edit-transcript-input');
-      idInput.addEventListener('input', () => { idPreview.textContent = idInput.value || '(empty)'; });
-      overlay.querySelector('#ig-mc-edit-copy').onclick = () => { navigator.clipboard.writeText(idInput.value).then(() => { showMessage('Flow ID copied to clipboard.', 'success'); }).catch(() => {}); };
-      overlay.querySelector('#ig-mc-edit-save').onclick = () => {
-        const newName = overlay.querySelector('#ig-mc-edit-name-input').value.trim();
-        const newId = idInput.value.trim();
-        const newTx = transcriptInput.value.trim();
-        if (!newName || !newId) { alert('Name and Flow ID cannot be empty.'); return; }
-        flow.name = newName;
-        flow.flow_ns = newId;
-        flow.transcript = newTx;
-        saveFlows();
-        renderFlows();
-        overlay.remove();
-      };
-    }
-
-    async function sendFlow(flow) {
-      const liveInput = document.getElementById('ig-mc-target-input');
-      const subscriberId = liveInput ? liveInput.value.trim() : '';
-
-      if (!subscriberId) { showMessage('Set a Target Subscriber ID first.', 'error'); return; }
-      const numericId = parseInt(subscriberId, 10);
-      if (isNaN(numericId)) { showMessage('Invalid Subscriber ID. Must be a number.', 'error'); return; }
-
-      const payload = { subscriber_id: numericId, flow_ns: flow.flow_ns };
-      showMessage('Sending "' + flow.name + '"...', null);
-      try {
-        await mcRequest('/fb/sending/sendFlow', { method: 'POST', body: JSON.stringify(payload) });
-        showMessage('✅ Sent "' + flow.name + '" to subscriber ' + subscriberId + '.', 'success');
-      } catch (e) { showMessage('❌ ' + (e.message || 'Send failed.'), 'error'); }
-    }
-
-    function renderFlows() {
-      flowListEl.innerHTML = '';
-      if (!flows.length) { flowListEl.innerHTML = '<div class="ig-mc-empty">No automations yet. Fetch from ManyChat or add one manually.</div>'; return; }
-      const grouped = {};
-      flows.forEach(f => { const fld = f.folder || 'General'; if (!grouped[fld]) grouped[fld] = []; grouped[fld].push(f); });
-      const orderedFolderNames = folders.slice();
-      Object.keys(grouped).forEach(fld => { if (!orderedFolderNames.includes(fld)) orderedFolderNames.push(fld); });
-
-      orderedFolderNames.forEach(folderName => {
-        const items = grouped[folderName]; if (!items || !items.length) return;
-
-        const isCollapsed = collapsedFolders.has(folderName);
-        const folderHead = document.createElement('div');
-        folderHead.className = 'ig-mc-folder-head';
-        folderHead.innerHTML = `
-          <span class="ig-mc-caret ${isCollapsed ? 'collapsed' : ''}">▼</span>
-          <span>📁 ${folderName}</span>
-          <span style="margin-left:auto; font-size:9px; opacity:0.6;">${items.length}</span>
-          ${folderName !== 'General' ? '<button class="ig-mc-folder-del" title="Delete folder (moves items to General)">🗑️</button>' : ''}
-        `;
-        folderHead.querySelector('.ig-mc-caret').onclick = (e) => {
-          e.stopPropagation();
-          if (collapsedFolders.has(folderName)) collapsedFolders.delete(folderName); else collapsedFolders.add(folderName);
-          saveCollapsedFolders(); renderFlows();
-        };
-        folderHead.onclick = () => {
-          if (collapsedFolders.has(folderName)) collapsedFolders.delete(folderName); else collapsedFolders.add(folderName);
-          saveCollapsedFolders(); renderFlows();
-        };
-        const delBtn = folderHead.querySelector('.ig-mc-folder-del');
-        if (delBtn) {
-          delBtn.onclick = (e) => {
-            e.stopPropagation();
-            if (!confirm('Delete folder "' + folderName + '"? Its automations will move to General.')) return;
-            flows.forEach(f => { if ((f.folder || 'General') === folderName) f.folder = 'General'; });
-            folders = folders.filter(f => f !== folderName); saveFlows(); saveFolders(); renderFlows();
-          };
-        }
-        flowListEl.appendChild(folderHead);
-
-        const folderContent = document.createElement('div');
-        folderContent.className = 'ig-mc-folder-content' + (isCollapsed ? ' collapsed' : '');
-
-        items.forEach(flow => {
-          const row = document.createElement('div');
-          row.className = 'ig-mc-flow-row';
-          const folderOptions = folders.map(f => `<option value="${f}" ${f === (flow.folder || 'General') ? 'selected' : ''}>${f}</option>`).join('');
-          const hasTx = !!(flow.transcript && flow.transcript.trim());
-          const txBadgeHtml = hasTx ? `<span class="ig-mc-flow-transcript-badge" title="Has transcript/notes">📄</span>` : '';
-
-          row.innerHTML = `
-            <div class="ig-mc-flow-header">
-              <span class="ig-mc-flow-name" title="${flow.name}">${flow.name}</span>
-              ${txBadgeHtml}
-              <div class="ig-mc-flow-actions">
-                <button class="ig-mc-btn ig-mc-btn-green ig-mc-btn-small ig-mc-send-btn">📤 Send</button>
-                <button class="ig-mc-flow-edit" title="Preview / Edit">✏️</button>
-                <button class="ig-mc-flow-del" title="Remove">🗑️</button>
-              </div>
-            </div>
-            <div class="ig-mc-row">
-              <span style="font-size:9px; color:#64748b;">Folder:</span>
-              <select class="ig-mc-input ig-mc-flow-folder-select">${folderOptions}</select>
-            </div>
-          `;
-          row.querySelector('.ig-mc-send-btn').onclick = () => sendFlow(flow);
-          row.querySelector('.ig-mc-flow-edit').onclick = () => openEditFlowModal(flow);
-          row.querySelector('.ig-mc-flow-del').onclick = () => { flows = flows.filter(f => f.flow_ns !== flow.flow_ns); saveFlows(); renderFlows(); };
-          row.querySelector('.ig-mc-flow-folder-select').onchange = (e) => { flow.folder = e.target.value; saveFlows(); renderFlows(); };
-          folderContent.appendChild(row);
-        });
-        flowListEl.appendChild(folderContent);
-      });
-    }
-
-    renderFlows();
-    core.emit('block:ready', { id: 'manychatModule' });
-  }
-});
-
-/* ============================================================
-   BLOCK: ManyChat Username Detector (v5)
-   ============================================================ */
-/* ============================================================
-   BLOCK: ManyChat Username Detector (v5.3 - Stale State Fix)
-   ============================================================ */
-LegoCore.registerBlock({
-  id: 'igUsernameManyChatBridge',
-  init(core) {
-    const API_KEY_STORAGE = 'mc_api_key_v1';
-    const FIELD_NAME_STORAGE = 'ig_ub_field_name_v1';
-    const FIELD_ID_CACHE_STORAGE = 'ig_ub_field_id_cache_v1';
-    const MANUAL_USERNAME_STORAGE = 'ig_username_manual_v1';
-    const ENGINE_PREF_STORAGE = 'ig_ub_engine_pref_v1';
-    const API_BASE = 'https://api.manychat.com';
-
-    let fieldName = localStorage.getItem(FIELD_NAME_STORAGE) || 'Save IG username';
-    let activeEngine = localStorage.getItem(ENGINE_PREF_STORAGE) || '1';
-    let lastDetected = '';
-    let lastMatchedId = null;
-    let lookupInFlight = false;
-    let lastHighlightedEl = null;
-
-    // --- MANUAL LOCK FLAGS ---
-    let manualOverrideLock = false;
-    let currentUrl = location.href;
-    let hasClearedEmptyState = false; // Prevents the input from resetting infinitely while empty
-
-    function gmRequest(url, options) {
-      return new Promise((resolve, reject) => {
-        const apiKey = localStorage.getItem(API_KEY_STORAGE) || '';
-        const defaults = {
-          method: 'GET', headers: { 'Authorization': 'Bearer ' + apiKey, 'Content-Type': 'application/json' },
-          url: url,
-          onload: function (response) {
-            try {
-              const data = JSON.parse(response.responseText);
-              if (response.status >= 200 && response.status < 300) resolve(data);
-              else reject(new Error('API error (' + response.status + '): ' + (data && (data.message || data.error || JSON.stringify(data)) || response.statusText)));
-            } catch (e) { reject(new Error('Failed to parse response: ' + e.message)); }
-          },
-          onerror: function (response) { reject(new Error('Network error: ' + (response.statusText || 'Unknown error'))); },
-          ontimeout: function () { reject(new Error('Request timed out')); }
-        };
-        const merged = Object.assign({}, defaults, options || {});
-        if (merged.body) { merged.data = merged.body; delete merged.body; }
-        if (typeof GM_xmlhttpRequest !== 'undefined') GM_xmlhttpRequest(merged);
-        else reject(new Error('GM_xmlhttpRequest not available.'));
-      });
-    }
-
-    const style = document.createElement('style');
-    style.id = 'ig-username-bridge-styles';
-    style.innerHTML = `
-      .ig-ub-wrap { display:flex; flex-direction:column; gap:10px; font-family:-apple-system,sans-serif; font-size:11px; color:#fff; }
-      .ig-ub-section { background:#18181b; padding:8px; border-radius:6px; border:1px solid #334155; display:flex; flex-direction:column; gap:6px; }
-      .ig-ub-label { color:#94a3b8; font-size:10px; font-weight:bold; text-transform:uppercase; letter-spacing:0.03em; }
-      .ig-ub-row { display:flex; gap:6px; align-items:center; }
-      .ig-ub-input { flex:1; background:#0f172a; color:#fff; border:1px solid #334155; border-radius:4px; padding:6px 8px; font-size:11px; outline:none; min-width:0; }
-      .ig-ub-input:focus { border-color:#6366f1; }
-      .ig-ub-detected { flex:1; background:#0f172a; color:#34d399; border:1px solid #334155; border-radius:4px; padding:6px 8px; font-size:12px; font-weight:bold; font-family:monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-      .ig-ub-detected.empty { color:#f87171; font-weight:normal; font-family:inherit; font-size:10px; white-space:normal; overflow:visible; line-height:1.3; }
-      .ig-ub-id-display { flex:1; background:#0f172a; color:#c9a876; border:1px solid #334155; border-radius:4px; padding:6px 8px; font-size:13px; font-weight:bold; font-family:monospace; }
-      .ig-ub-id-display.empty { color:#64748b; font-weight:normal; font-family:inherit; font-style:italic; }
-      .ig-ub-btn { background:#334155; color:#fff; border:none; border-radius:4px; padding:6px 10px; font-size:10px; font-weight:bold; cursor:pointer; white-space:nowrap; transition:0.15s; }
-      .ig-ub-btn:hover { background:#475569; }
-      .ig-ub-btn:disabled { opacity:0.6; cursor:not-allowed; }
-      .ig-ub-btn-primary { background:#6366f1; }
-      .ig-ub-btn-primary:hover:not(:disabled) { background:#4f46e5; }
-      .ig-ub-btn-small { padding:4px 8px; font-size:9px; }
-      .ig-ub-msg { font-size:10px; color:#94a3b8; padding:4px 2px; line-height:1.4; min-height:12px; max-height:60px; overflow-y:auto; }
-      .ig-ub-msg.error { color:#f87171; }
-      .ig-ub-msg.success { color:#34d399; }
-      .ig-ub-engine-select { background:#1e293b; color:#fff; border:1px solid #475569; border-radius:4px; padding:4px; font-size:10px; outline:none; cursor:pointer; width:100%; }
-    `;
-    document.head.appendChild(style);
-
-    const wrap = document.createElement('div');
-    wrap.className = 'ig-ub-wrap';
-    wrap.innerHTML = `
-      <div class="ig-ub-section">
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-            <span class="ig-ub-label">Detected Username</span>
-            <select id="ig-ub-engine" class="ig-ub-engine-select" style="width:110px;">
-                <option value="1">Engine 1 (Center)</option>
-                <option value="2">Engine 2 (Highest)</option>
-                <option value="3">Engine 3 (Rightmost)</option>
-                <option value="4">Engine 4 (Link Scan)</option>
-                <option value="5">Engine 5 (2nd Line)</option>
-            </select>
-        </div>
-        <div class="ig-ub-row" style="margin-top:4px;">
-          <div id="ig-ub-detected" class="ig-ub-detected empty">Not detected</div>
-          <button id="ig-ub-refresh-btn" class="ig-ub-btn ig-ub-btn-small">🔎 Refresh</button>
-        </div>
-        <div class="ig-ub-row" style="margin-top:4px;">
-          <input type="text" id="ig-ub-manual-input" class="ig-ub-input" placeholder="Manual override @username...">
-          <button id="ig-ub-use-manual-btn" class="ig-ub-btn ig-ub-btn-small">Use This</button>
-        </div>
-      </div>
-      <div class="ig-ub-section">
-        <span class="ig-ub-label">Matched Subscriber ID</span>
-        <div class="ig-ub-row">
-            <div id="ig-ub-id-display" class="ig-ub-id-display empty">No match yet</div>
-            <button id="ig-ub-copy-btn" class="ig-ub-btn ig-ub-btn-small">📋 Copy</button>
-        </div>
-      </div>
-      <div class="ig-ub-section">
-        <span class="ig-ub-label">ManyChat Custom Field Name</span>
-        <div class="ig-ub-row">
-          <input type="text" id="ig-ub-field-name-input" class="ig-ub-input" placeholder="e.g. Save IG username" value="${fieldName.replace(/"/g, '&quot;')}">
-          <button id="ig-ub-save-field-btn" class="ig-ub-btn ig-ub-btn-small">Save</button>
-        </div>
-        <span id="ig-ub-resolved" class="ig-ub-msg" style="margin-top:2px;">Not resolved yet.</span>
-      </div>
-      <div class="ig-ub-section">
-        <button id="ig-ub-find-btn" class="ig-ub-btn ig-ub-btn-primary" style="width:100%;">🔗 Search ManyChat Now</button>
-        <div id="ig-ub-msg-box" class="ig-ub-msg"></div>
-      </div>
-    `;
-
-    function mountCard() {
-      if (typeof core.registerMenu === 'function') core.registerMenu('right', '👤 Chat Username', wrap, '⠿', 'ig-username-bridge');
-      else setTimeout(mountCard, 200);
-    }
-    mountCard();
-
-    const detectedEl = wrap.querySelector('#ig-ub-detected');
-    const manualInput = wrap.querySelector('#ig-ub-manual-input');
-    const idDisplayEl = wrap.querySelector('#ig-ub-id-display');
-    const fieldNameInput = wrap.querySelector('#ig-ub-field-name-input');
-    const resolvedEl = wrap.querySelector('#ig-ub-resolved');
-    const msgBox = wrap.querySelector('#ig-ub-msg-box');
-    const engineSelect = wrap.querySelector('#ig-ub-engine');
-
-    engineSelect.value = activeEngine;
-    engineSelect.onchange = (e) => {
-        activeEngine = e.target.value;
-        localStorage.setItem(ENGINE_PREF_STORAGE, activeEngine);
-        manualOverrideLock = false;
-        hasClearedEmptyState = false;
-        runDetection();
-    };
-
-    function showMessage(text, type) { msgBox.textContent = text; msgBox.className = 'ig-ub-msg' + (type ? ' ' + type : ''); }
-
-    function setDetected(matchObj) {
-      if (matchObj && matchObj.user) {
-        lastDetected = matchObj.user;
-        detectedEl.textContent = '@' + matchObj.user;
-        detectedEl.classList.remove('empty');
-        manualInput.value = matchObj.user;
-      } else {
-        lastDetected = '';
-        let debugText = matchObj && matchObj.raw ? matchObj.raw : 'Nothing found.';
-        if (debugText.length > 80) debugText = debugText.substring(0, 80) + '...';
-        detectedEl.textContent = 'Not detected. Reads: ' + debugText;
-        detectedEl.classList.add('empty');
-      }
-    }
-
-    function setIdDisplay(id) {
-      lastMatchedId = id;
-      if (id) { idDisplayEl.textContent = id; idDisplayEl.classList.remove('empty'); }
-      else { idDisplayEl.textContent = 'No match yet'; idDisplayEl.classList.add('empty'); }
-    }
-
-    function fillManyChatTarget(subscriberId) {
-      // Isolate memory strictly to THIS specific tab
-      sessionStorage.setItem('mc_target_subscriber_v1', String(subscriberId));
-
-      // Update ALL ghosted and active inputs to ensure complete synchronization
-      const allInputs = document.querySelectorAll('#ig-mc-target-input');
-      if (!allInputs.length) return false;
-
-      allInputs.forEach(input => {
-          input.value = String(subscriberId);
-          input.dispatchEvent(new Event('input', { bubbles: true }));
-      });
-      return true;
-    }
-
-    function clearManyChatTarget() {
-      sessionStorage.removeItem('mc_target_subscriber_v1');
-      const allInputs = document.querySelectorAll('#ig-mc-target-input');
-      allInputs.forEach(input => {
-          input.value = '';
-          input.dispatchEvent(new Event('input', { bubbles: true }));
-      });
-    }
-
-    wrap.querySelector('#ig-ub-copy-btn').onclick = () => {
-      if (!lastMatchedId) return;
-      navigator.clipboard.writeText(String(lastMatchedId)).then(() => showMessage('Copied ID.', 'success')).catch(()=>{});
-    };
-
-    // --- MANUAL OVERRIDES ---
-
-    // 1. Triggered via the "Use This" button on the UI
-    wrap.querySelector('#ig-ub-use-manual-btn').onclick = () => {
-      const val = manualInput.value.trim().replace(/^@/, '');
-      if (!val) return;
-      manualOverrideLock = true;
-      setDetected({ user: val, el: null, raw: 'Manual Override' });
-      localStorage.setItem(MANUAL_USERNAME_STORAGE, val);
-      clearManyChatTarget();
-      performLookup(val);
-      showMessage('Using manual override: @' + val, 'success');
-      highlightElement(null);
-    };
-
-    // 2. Triggered via the /user invisible bridge from Quick Chat
-    core.on('mc:manual-override', (username) => {
-      manualOverrideLock = true;
-      setDetected({ user: username, el: null, raw: 'Manual Override via Quick Chat' });
-      localStorage.setItem(MANUAL_USERNAME_STORAGE, username);
-      clearManyChatTarget();
-      performLookup(username);
-      showMessage('Using manual override: @' + username, 'success');
-      highlightElement(null);
-    });
-
-    wrap.querySelector('#ig-ub-save-field-btn').onclick = () => {
-      fieldName = fieldNameInput.value.trim(); localStorage.setItem(FIELD_NAME_STORAGE, fieldName);
-      resolvedEl.textContent = 'Field saved.'; resolvedEl.className = 'ig-ub-msg success';
-    };
-
-    async function resolveFieldId(name) {
-      let cache = {}; try { cache = JSON.parse(localStorage.getItem(FIELD_ID_CACHE_STORAGE)) || {}; } catch (e) {}
-      const key = name.trim().toLowerCase();
-      if (cache[key]) { resolvedEl.textContent = 'Field ID: ' + cache[key]; return cache[key]; }
-      const data = await gmRequest(API_BASE + '/fb/page/getCustomFields', { method: 'GET' });
-      const fields = (data && data.data) || [];
-      const match = fields.find(f => (f.name || '').trim().toLowerCase() === key);
-      if (!match) throw new Error('No Custom Field named "' + name + '" found in ManyChat.');
-      cache[key] = match.id; localStorage.setItem(FIELD_ID_CACHE_STORAGE, JSON.stringify(cache));
-      resolvedEl.textContent = 'Field ID: ' + match.id;
-      return match.id;
-    }
-
-    async function findSubscriberByCustomField(fieldId, username) {
-      const query = 'field_id=' + encodeURIComponent(fieldId) + '&field_value=' + encodeURIComponent(username);
-      const data = await gmRequest(API_BASE + '/fb/subscriber/findByCustomField?' + query, { method: 'GET' });
-      const result = data && data.data;
-      if (!result) return null;
-
-      if (Array.isArray(result)) {
-        if (!result.length) return null;
-
-        // 1. Filter for EXACT matches to prevent substring errors
-        let exactMatches = result.filter(sub => {
-          if (!sub.custom_fields) return false;
-          const field = sub.custom_fields.find(f => String(f.id) === String(fieldId));
-          return field && field.value && field.value.toLowerCase() === username.toLowerCase();
-        });
-
-        // Fallback to raw results if strict filtering yields empty (safeguard)
-        if (!exactMatches.length) exactMatches = result;
-
-        // 2. Sort by ID descending so index 0 is always the NEWEST, active profile
-        exactMatches.sort((a, b) => b.id - a.id);
-
-        return exactMatches[0].id;
-      }
-
-      return result.id || null;
-    }
-
-    async function performLookup(username) {
-      if (!username) return;
-      if (!(localStorage.getItem(API_KEY_STORAGE) || '')) return showMessage('No ManyChat API Key found.', 'error');
-      if (!fieldName) return showMessage('Set a Custom Field Name first.', 'error');
-      if (lookupInFlight) return;
-      lookupInFlight = true;
-      const btn = wrap.querySelector('#ig-ub-find-btn'); const original = btn.innerText; btn.innerText = '⏳ Searching...'; btn.disabled = true;
-      showMessage('Searching ManyChat for @' + username + '...', null);
-      try {
-        const fieldId = await resolveFieldId(fieldName);
-        const subscriberId = await findSubscriberByCustomField(fieldId, username);
-        if (subscriberId) {
-          setIdDisplay(subscriberId); fillManyChatTarget(subscriberId);
-          showMessage('✅ Found subscriber ' + subscriberId, 'success');
-        } else {
-          setIdDisplay(null); clearManyChatTarget();
-          showMessage('No subscriber found with that username.', 'error');
-        }
-      } catch (e) { showMessage(e.message || 'Lookup failed.', 'error'); }
-      finally { btn.innerText = original; btn.disabled = false; lookupInFlight = false; }
-    }
-
-    wrap.querySelector('#ig-ub-find-btn').onclick = () => {
-      const username = (manualInput.value.trim() || lastDetected).replace(/^@/, '');
-      if (!username) return showMessage('No username detected.', 'error');
-      clearManyChatTarget(); performLookup(username);
-    };
-
-    function highlightElement(el) {
-      if (lastHighlightedEl && lastHighlightedEl !== el) {
-        lastHighlightedEl.style.outline = lastHighlightedEl.dataset.oldOutline || '';
-        lastHighlightedEl.style.backgroundColor = lastHighlightedEl.dataset.oldBg || '';
-        lastHighlightedEl.classList.remove('ig-ub-highlighted');
-      }
-      if (el && !el.classList.contains('ig-ub-highlighted')) {
-        el.dataset.oldOutline = el.style.outline || '';
-        el.dataset.oldBg = el.style.backgroundColor || '';
-        el.style.outline = '3px solid #10b981';
-        el.style.backgroundColor = 'rgba(16, 185, 129, 0.4)';
-        el.style.borderRadius = '4px';
-        el.classList.add('ig-ub-highlighted');
-        lastHighlightedEl = el;
-      } else if (!el && lastHighlightedEl) {
-        lastHighlightedEl.style.outline = lastHighlightedEl.dataset.oldOutline || '';
-        lastHighlightedEl.style.backgroundColor = lastHighlightedEl.dataset.oldBg || '';
-        lastHighlightedEl.classList.remove('ig-ub-highlighted');
-        lastHighlightedEl = null;
-      }
-    }
-
-    function getChatHeaderData() {
-        const EXCLUDED = new Set(['instagram', 'general', 'requests', 'message', 'messages', 'home', 'search', 'notifications', 'create', 'profile', 'more', 'reels', 'dashboard', 'view', 'next', 'prev', 'contact', 'active', 'online', 'seen', 'typing', 'today', 'yesterday', 'now', 'sent', 'details', 'explore', 'direct', 'inbox', 'reply', 'new', 'admin', 'moderator', 'you']);
-
-        const isStrictUsername = (text) => text.length >= 2 && text.length <= 30 && /^[a-z0-9_.]+$/.test(text) && /[a-z]/.test(text) && !EXCLUDED.has(text) && !/^\d+[smhdwy]?$/.test(text);
-
-        const candidates = [];
-        const debugReads = [];
-
-        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
-        let node;
-        while ((node = walker.nextNode())) {
-            const el = node.parentElement;
-            if (!el) continue;
-
-            const rect = el.getBoundingClientRect();
-            if (rect.width === 0 || rect.height === 0 || rect.top < 0 || rect.top > 200 || rect.left < 300) continue;
-
-            const rawText = (node.nodeValue || '').trim();
-            if (!rawText) continue;
-
-            const text = rawText.replace(/[\u200B-\u200D\uFEFF]/g, '').split('·')[0].trim();
-            if (!text) continue;
-
-            debugReads.push(text);
-
-            if (isStrictUsername(text)) {
-                candidates.push({ user: text, top: rect.top, left: rect.left, el: el, raw: text });
-            }
-        }
-
-        const engine = activeEngine;
-        let chosen = null;
-
-        if (engine === '1') {
-            if (candidates.length > 0) {
-                const targetCenterX = window.innerWidth / 2 + 150;
-                candidates.sort((a, b) => Math.abs(a.left - targetCenterX) - Math.abs(b.left - targetCenterX));
-                chosen = candidates[0];
-            }
-        }
-        else if (engine === '2') {
-            if (candidates.length > 0) {
-                candidates.sort((a, b) => a.top - b.top);
-                chosen = candidates[0];
-            }
-        }
-        else if (engine === '3') {
-            if (candidates.length > 0) {
-                candidates.sort((a, b) => b.left - a.left);
-                chosen = candidates[0];
-            }
-        }
-        else if (engine === '4') {
-            const linkCandidates = [];
-            document.querySelectorAll('a[href]').forEach(a => {
-                const rect = a.getBoundingClientRect();
-                if (rect.width === 0 || rect.height === 0 || rect.top < 0 || rect.top > 200 || rect.left < 300) return;
-                const m = a.getAttribute('href').match(/^\/([a-z0-9_.]+)\/?$/i);
-                if (m) {
-                    const uname = m[1].toLowerCase();
-                    debugReads.push('Link:' + uname);
-                    if (isStrictUsername(uname)) linkCandidates.push({ user: uname, top: rect.top, left: rect.left, el: a, raw: uname });
-                }
-            });
-            if (linkCandidates.length > 0) {
-                linkCandidates.sort((a, b) => a.top - b.top);
-                chosen = linkCandidates[0];
-            }
-        }
-        else if (engine === '5') {
-            const blockCandidates = [];
-            const blocks = document.querySelectorAll('h1, h2, h3, h4, span, div[dir="auto"], div[role="button"]');
-            for (let el of blocks) {
-                const rect = el.getBoundingClientRect();
-                if (rect.width === 0 || rect.height === 0 || rect.top < 0 || rect.top > 180 || rect.left < 300) continue;
-
-                const lines = (el.innerText || '').split(/\r?\n/).map(l => l.trim()).filter(Boolean);
-                if (lines.length > 1) {
-                    const secondLine = lines[1].split('·')[0].trim().toLowerCase();
-                    debugReads.push('Line2:' + secondLine);
-                    if (isStrictUsername(secondLine)) {
-                        blockCandidates.push({ user: secondLine, top: rect.top, left: rect.left, el: el, raw: secondLine });
-                    }
-                }
-            }
-            if (blockCandidates.length > 0) {
-                blockCandidates.sort((a, b) => (b.el.offsetWidth * b.el.offsetHeight) - (a.el.offsetWidth * a.el.offsetHeight));
-                chosen = blockCandidates[0];
-            }
-        }
-
-        if (!chosen) {
-            const cleanDebug = [...new Set(debugReads)].filter(t => t.length > 1).slice(0, 5).join(' | ');
-            return { user: null, el: null, raw: cleanDebug || "No text matching criteria found" };
-        }
-
-        return chosen;
-    }
-
-    function runDetection() {
-      // OVERRIDE LOCK: Skip automatic scanning if a manual lookup is active
-      if (manualOverrideLock) return;
-
-      const match = getChatHeaderData();
-      const username = match ? match.user : null;
-      const el = match ? match.el : null;
-
-      if (username && username !== lastDetected) {
-        setDetected(match);
-        setIdDisplay(null);
-        clearManyChatTarget();
-        performLookup(username);
-        highlightElement(el);
-        hasClearedEmptyState = false; // Reset lock when user is found
-      } else if (!username && lastDetected) {
-        setDetected(match);
-        setIdDisplay(null);
-        clearManyChatTarget();
-        highlightElement(null);
-        hasClearedEmptyState = false; // Reset lock as we just lost a user
-      } else if (username && username === lastDetected) {
-        highlightElement(el);
-        hasClearedEmptyState = false; // Keep unlocked while a user exists
-      } else if (!username && !lastDetected) {
-        setDetected(match);
-        highlightElement(null);
-
-        // Stale State Fix: Only clear the target once when idling in an empty state
-        if (!hasClearedEmptyState) {
-          setIdDisplay(null);
-          clearManyChatTarget();
-          hasClearedEmptyState = true;
-        }
-      }
-    }
-
-    // BREAK LOCK ON CHAT CHANGE
-    setInterval(() => {
-        if (location.href !== currentUrl) {
-            currentUrl = location.href;
-            manualOverrideLock = false; // Release the lock
-            lastDetected = ''; // Force a fresh visual scan
-            hasClearedEmptyState = false; // Reset the idle clear lock
-
-            clearManyChatTarget(); // Proactively clear ID
-            setIdDisplay(null);
-
-            runDetection();
-        }
-    }, 500);
-
-    setInterval(runDetection, 1500);
-
-    // BREAK LOCK ON REFRESH
-    wrap.querySelector('#ig-ub-refresh-btn').onclick = () => {
-        manualOverrideLock = false;
-        hasClearedEmptyState = false;
-        runDetection();
-    };
-
-    setTimeout(runDetection, 1000);
-
-    core.emit('block:ready', { id: 'igUsernameManyChatBridge' });
   }
 });
 
@@ -7430,7 +7252,7 @@ LegoCore.registerBlock({
    BLOCK: Master Config Bunny Sync (v5)
    ============================================================ */
 /* ============================================================
-   BLOCK: Central Cloud Sync Center (v5 - Wipe & Clone)
+   BLOCK: Central Cloud Sync Center (v3 - Folder Path Fix + Sequences in Master Config)
    ============================================================ */
 LegoCore.registerBlock({
   id: 'cloudSyncCenterModule',
@@ -7446,7 +7268,11 @@ LegoCore.registerBlock({
         'ig_quick_effects_enabled_v1', 'sb_quick_autotrim_start', 'sb_quick_autotrim_end',
         'sb_quick_autosend', 'sb_quick_silence_threshold', 'sb_quick_trailing_lag',
         'ig_ub_engine_pref_v1', 'ig_ub_field_name_v1', 'ig_text_highlighter_rules_v1',
-        'ig_text_highlighter_master_v1'
+        'ig_text_highlighter_master_v1', 'ig_qcx_instant_search_v1', 'ig_qcx_float_v1',
+        // Sequence Manager (JSON — rides the master config)
+        'ig_sequences_v1', 'ig_seq_col_widths_v1', 'ig_seq_hud_pos_v1',
+        // Tag Colors (number + course badge colors)
+        'ig_tag_colors_v1'
     ];
 
     let prefs = JSON.parse(localStorage.getItem(BUNNY_PREFS_KEY)) || { zoneName: '', apiKey: '', region: 'default' };
@@ -7567,6 +7393,7 @@ LegoCore.registerBlock({
     async function getCloudInventory(folderPath, ext) {
         let inventory = [];
         try {
+            // FIX: Added the trailing slash so Bunny.net returns folder contents, not the folder itself!
             const rootItems = await bunnyRequest('GET', folderPath + '/');
             if (!Array.isArray(rootItems)) return inventory;
 
@@ -7606,7 +7433,6 @@ LegoCore.registerBlock({
       .ig-csc-btn-green { background:#10b981; color:#fff; } .ig-csc-btn-green:hover:not(:disabled){ background:#059669; }
       .ig-csc-btn-blue { background:#0284c7; color:#fff; }  .ig-csc-btn-blue:hover:not(:disabled){ background:#0369a1; }
       .ig-csc-btn-red { background:#dc2626; color:#fff; }   .ig-csc-btn-red:hover:not(:disabled){ background:#b91c1c; }
-      .ig-csc-btn-purple { background:#9333ea; color:#fff; } .ig-csc-btn-purple:hover:not(:disabled){ background:#7e22ce; }
       .ig-csc-status { font-size:10px; text-align:center; margin-top:4px; color:#c9a876; min-height:14px; font-weight:bold; }
     `;
     document.head.appendChild(style);
@@ -7629,7 +7455,7 @@ LegoCore.registerBlock({
       </div>
 
       <div class="ig-csc-box">
-        <div class="ig-csc-title" title="Syncs all text snippets, emojis, and layouts">📝 Text & Settings Master</div>
+        <div class="ig-csc-title" title="Syncs all text snippets, sequences, emojis, and layouts">📝 Text & Settings Master</div>
         <div class="ig-csc-row">
             <button class="ig-csc-btn ig-csc-btn-green" id="ig-csc-push-master" title="Push your local config up to the cloud">☁️ Push</button>
             <button class="ig-csc-btn ig-csc-btn-blue" id="ig-csc-pull-master" title="Pull config from cloud and overwrite local">📥 Pull</button>
@@ -7640,14 +7466,8 @@ LegoCore.registerBlock({
         <div class="ig-csc-title">🔴 Audio Library</div>
         <div class="ig-csc-row">
             <button class="ig-csc-btn ig-csc-btn-green" id="ig-csc-push-audio" title="Upload new clips & remove deleted ones">☁️ Smart Backup</button>
-            <button class="ig-csc-btn ig-csc-btn-blue" id="ig-csc-pull-audio" title="Download missing clips">📥 Pull Additions</button>
-        </div>
-        <div class="ig-csc-row" style="margin-top:2px;">
-            <button class="ig-csc-btn ig-csc-btn-purple" id="ig-csc-push-transcripts" title="Instantly backup only text/transcripts without scanning files">📄 Quick Push Transcripts</button>
-        </div>
-        <div class="ig-csc-row" style="margin-top:2px;">
-            <button class="ig-csc-btn ig-csc-btn-red" id="ig-csc-clone-audio" title="Wipe local database and rebuild exactly from cloud">📥 Clone Cloud</button>
-            <button class="ig-csc-btn ig-csc-btn-red" id="ig-csc-force-audio" title="Wipe cloud storage and rewrite exactly from local">☁️ Force Push</button>
+            <button class="ig-csc-btn ig-csc-btn-blue" id="ig-csc-pull-audio" title="Download missing clips">📥 Pull</button>
+            <button class="ig-csc-btn ig-csc-btn-red" id="ig-csc-force-audio" title="Wipe cloud storage and rewrite from local">♻️ Force</button>
         </div>
       </div>
 
@@ -7655,11 +7475,8 @@ LegoCore.registerBlock({
         <div class="ig-csc-title">🖼️ Image Sets</div>
         <div class="ig-csc-row">
             <button class="ig-csc-btn ig-csc-btn-green" id="ig-csc-push-img" title="Upload new images & remove deleted ones">☁️ Smart Backup</button>
-            <button class="ig-csc-btn ig-csc-btn-blue" id="ig-csc-pull-img" title="Download missing images">📥 Pull Additions</button>
-        </div>
-        <div class="ig-csc-row" style="margin-top:2px;">
-            <button class="ig-csc-btn ig-csc-btn-red" id="ig-csc-clone-img" title="Wipe local storage and clone from cloud">📥 Clone Cloud</button>
-            <button class="ig-csc-btn ig-csc-btn-red" id="ig-csc-force-img" title="Wipe cloud storage and rewrite exactly from local">☁️ Force Push</button>
+            <button class="ig-csc-btn ig-csc-btn-blue" id="ig-csc-pull-img" title="Download missing images">📥 Pull</button>
+            <button class="ig-csc-btn ig-csc-btn-red" id="ig-csc-force-img" title="Wipe cloud storage and rewrite from local">♻️ Force</button>
         </div>
       </div>
       <div id="ig-csc-status-bar" class="ig-csc-status">Ready.</div>
@@ -7713,7 +7530,7 @@ LegoCore.registerBlock({
 
     wrap.querySelector('#ig-csc-pull-master').onclick = async () => {
         if (!setCreds()) return unlockUI('❌ Missing credentials.', true);
-        if (!confirm("⚠️ Overwrite local text, emojis, and layouts with cloud config?")) return;
+        if (!confirm("⚠️ Overwrite local text, sequences, emojis, and layouts with cloud config?")) return;
         lockUI('📥 Pulling Master Config...');
         try {
             const data = await bunnyRequest('GET', 'ig_master_config/master_config.json');
@@ -7738,17 +7555,7 @@ LegoCore.registerBlock({
             const toUpload = localClips.filter(c => !cloudKeys.has(compareKey(c.folder, c.name)));
             const toDelete = cloudInv.filter(c => !localKeys.has(compareKey(c.folder, c.name)));
 
-            // Extract transcripts and metadata into a sidecar file
-            const metaPayload = localClips.map(c => ({
-                name: c.name, folder: c.folder, color: c.color,
-                customCommand: c.customCommand || '', transcript: c.transcript || ''
-            }));
-
-            if (!toUpload.length && !toDelete.length) {
-                lockUI('☁️ Syncing metadata updates...');
-                await bunnyRequest('PUT', 'ig_audio_backup/audio_metadata.json', JSON.stringify(metaPayload));
-                return unlockUI('✅ Audio and Transcripts are fully up to date.');
-            }
+            if (!toUpload.length && !toDelete.length) return unlockUI('✅ Audio is up to date.');
 
             for (let i=0; i<toDelete.length; i++) { lockUI(`🗑️ Audio: Deleting ${i+1}/${toDelete.length}...`); await bunnyRequest('DELETE', toDelete[i].path); }
             for (let i=0; i<toUpload.length; i++) {
@@ -7757,73 +7564,35 @@ LegoCore.registerBlock({
                 await bunnyRequest('PUT', `ig_audio_backup/${encodeURIComponent(safeString(c.folder))}/${encodeURIComponent(safeString(c.name))}.m4a`, await blobToArrayBuffer(c.blob));
                 await new Promise(r => setTimeout(r, 100));
             }
-
-            lockUI('☁️ Saving Transcripts & Metadata...');
-            await bunnyRequest('PUT', 'ig_audio_backup/audio_metadata.json', JSON.stringify(metaPayload));
-
-            unlockUI(`✅ Audio Backup: Uploaded ${toUpload.length}, Deleted ${toDelete.length}. Transcripts saved.`);
+            unlockUI(`✅ Audio Backup: Uploaded ${toUpload.length}, Deleted ${toDelete.length}.`);
         } catch (e) { unlockUI(`❌ ${e.message}`, true); }
     };
 
     wrap.querySelector('#ig-csc-pull-audio').onclick = async () => {
         if (!setCreds()) return unlockUI('❌ Missing credentials.', true);
-        lockUI('📥 Fetching Audio Inventory & Transcripts...');
+        lockUI('📥 Fetching Audio Inventory...');
         try {
             const localClips = await getLocalClips();
             const cloudInv = await getCloudInventory('ig_audio_backup', /\.m4a$/i);
             const localKeys = new Set(localClips.map(c => compareKey(c.folder, c.name)));
             const toDownload = cloudInv.filter(c => !localKeys.has(compareKey(c.folder, c.name)));
 
-            let cloudMeta = [];
-            try {
-                cloudMeta = await bunnyRequest('GET', 'ig_audio_backup/audio_metadata.json');
-            } catch(e) { console.warn("No audio metadata sidecar found."); }
-
-            if (!toDownload.length) {
-                let updatedCount = 0;
-                if (Array.isArray(cloudMeta) && cloudMeta.length > 0) {
-                    const db = core.getDb();
-                    const tx = db.transaction(['clips'], 'readwrite');
-                    const store = tx.objectStore('clips');
-                    for (let c of localClips) {
-                        const m = cloudMeta.find(meta => compareKey(meta.folder, meta.name) === compareKey(c.folder, c.name));
-                        if (m && (c.transcript !== m.transcript || c.customCommand !== m.customCommand || c.color !== m.color)) {
-                            c.transcript = m.transcript || '';
-                            c.customCommand = m.customCommand || '';
-                            c.color = m.color || '#0095f6';
-                            store.put(c);
-                            updatedCount++;
-                        }
-                    }
-                    if (updatedCount > 0) {
-                        return unlockUI(`✅ Local audio files matched, updated ${updatedCount} transcripts.`);
-                    }
-                }
-                return unlockUI('✅ Local audio is fully synced.');
-            }
+            if (!toDownload.length) return unlockUI('✅ Local audio is fully synced.');
 
             for (let i=0; i<toDownload.length; i++) {
                 lockUI(`📥 Audio: Pulling ${i+1}/${toDownload.length}...`);
                 const c = toDownload[i];
                 const blob = await bunnyRequest('GET', c.path, null, 'blob');
-
-                const meta = (Array.isArray(cloudMeta) ? cloudMeta : []).find(m => compareKey(m.folder, m.name) === compareKey(c.folder, c.name)) || {};
-
-                await saveClipToLocalDB({
-                    name: c.name, folder: c.folder, blob: blob,
-                    color: meta.color || '#0095f6',
-                    customCommand: meta.customCommand || '',
-                    transcript: meta.transcript || ''
-                });
+                await saveClipToLocalDB({ name: c.name, folder: c.folder, blob: blob, color: '#0095f6', customCommand: '' });
                 await new Promise(r => setTimeout(r, 100));
             }
-            unlockUI(`✅ Audio Pulled: ${toDownload.length} clips with transcripts.`);
+            unlockUI(`✅ Audio Pulled: ${toDownload.length} clips.`);
         } catch (e) { unlockUI(`❌ ${e.message}`, true); }
     };
 
     wrap.querySelector('#ig-csc-force-audio').onclick = async () => {
         if (!setCreds()) return unlockUI('❌ Missing credentials.', true);
-        if (!confirm("⚠️ Wipe cloud audio and rewrite exactly from local database?")) return;
+        if (!confirm("⚠️ Wipe cloud audio and rewrite from local database?")) return;
         lockUI('♻️ Wiping Cloud Audio...');
         try {
             const cloudInv = await getCloudInventory('ig_audio_backup', /\.m4a$/i);
@@ -7836,96 +7605,8 @@ LegoCore.registerBlock({
                 await bunnyRequest('PUT', `ig_audio_backup/${encodeURIComponent(safeString(c.folder))}/${encodeURIComponent(safeString(c.name))}.m4a`, await blobToArrayBuffer(c.blob));
                 await new Promise(r => setTimeout(r, 100));
             }
-
-            lockUI('☁️ Pushing Audio Metadata...');
-            const metaPayload = localClips.map(c => ({
-                name: c.name, folder: c.folder, color: c.color,
-                customCommand: c.customCommand || '', transcript: c.transcript || ''
-            }));
-            await bunnyRequest('PUT', 'ig_audio_backup/audio_metadata.json', JSON.stringify(metaPayload));
-
-            unlockUI(`✅ Force Push Complete! Rebuilt cloud with ${localClips.length} clips.`);
+            unlockUI(`✅ Force Mirror Complete! Pushed ${localClips.length} clips.`);
         } catch (e) { unlockUI(`❌ ${e.message}`, true); }
-    };
-
-    wrap.querySelector('#ig-csc-clone-audio').onclick = async () => {
-        if (!setCreds()) return unlockUI('❌ Missing credentials.', true);
-        if (!confirm("⚠️ WIPE LOCAL AUDIO? This will delete all audio clips on this PC and replace them exactly with the cloud backup. Proceed?")) return;
-
-        lockUI('🗑️ Wiping local database...');
-        try {
-            // 1. Wipe local DB completely
-            await new Promise((resolve, reject) => {
-                const db = core.getDb();
-                const tx = db.transaction(['clips', 'folders'], 'readwrite');
-                tx.objectStore('clips').clear();
-                tx.objectStore('folders').clear();
-                tx.oncomplete = resolve;
-                tx.onerror = reject;
-            });
-
-            // 2. Fetch inventory and metadata
-            lockUI('📥 Fetching Audio Inventory & Transcripts...');
-            const cloudInv = await getCloudInventory('ig_audio_backup', /\.m4a$/i);
-            let cloudMeta = [];
-            try { cloudMeta = await bunnyRequest('GET', 'ig_audio_backup/audio_metadata.json'); } catch(e) {}
-
-            if (!cloudInv.length) return unlockUI('✅ Local wiped. Cloud is empty.');
-
-            // 3. Rebuild local DB from cloud
-            for (let i=0; i<cloudInv.length; i++) {
-                lockUI(`📥 Audio: Cloning ${i+1}/${cloudInv.length}...`);
-                const c = cloudInv[i];
-                const blob = await bunnyRequest('GET', c.path, null, 'blob');
-                const meta = (Array.isArray(cloudMeta) ? cloudMeta : []).find(m => compareKey(m.folder, m.name) === compareKey(c.folder, c.name)) || {};
-
-                await saveClipToLocalDB({
-                    name: c.name, folder: c.folder, blob: blob,
-                    color: meta.color || '#0095f6',
-                    customCommand: meta.customCommand || '',
-                    transcript: meta.transcript || ''
-                });
-                await new Promise(r => setTimeout(r, 100));
-            }
-            unlockUI(`✅ Local Audio Cloned: ${cloudInv.length} clips restored.`);
-        } catch (e) { unlockUI(`❌ ${e.message}`, true); }
-    };
-
-    // --- QUICK PUSH TRANSCRIPTS (BYPASS) ---
-    wrap.querySelector('#ig-csc-push-transcripts').onclick = async () => {
-        if (!setCreds()) return unlockUI('❌ Missing credentials.', true);
-
-        const btn = wrap.querySelector('#ig-csc-push-transcripts');
-        const originalText = btn.innerText;
-        btn.innerText = '⏳ Saving...';
-        btn.disabled = true;
-
-        try {
-            const localClips = await getLocalClips();
-            const metaPayload = localClips.map(c => ({
-                name: c.name, folder: c.folder, color: c.color,
-                customCommand: c.customCommand || '', transcript: c.transcript || ''
-            }));
-
-            await bunnyRequest('PUT', 'ig_audio_backup/audio_metadata.json', JSON.stringify(metaPayload));
-
-            btn.innerText = '✅ Saved!';
-            btn.style.background = '#10b981'; // Success green
-            setTimeout(() => {
-                btn.innerText = originalText;
-                btn.style.background = ''; // Reverts to purple class default
-                btn.disabled = false;
-            }, 1500);
-
-            unlockUI(`✅ Transcripts and Metadata quickly synced (${localClips.length} items).`);
-        } catch (e) {
-            btn.innerText = '❌ Failed';
-            setTimeout(() => {
-                btn.innerText = originalText;
-                btn.disabled = false;
-            }, 1500);
-            unlockUI(`❌ ${e.message}`, true);
-        }
     };
 
     // --- IMAGE LOGIC ---
@@ -8028,53 +7709,1420 @@ LegoCore.registerBlock({
         } catch (e) { unlockUI(`❌ ${e.message}`, true); }
     };
 
-    wrap.querySelector('#ig-csc-clone-img').onclick = async () => {
-        if (!setCreds()) return unlockUI('❌ Missing credentials.', true);
-        if (!confirm("⚠️ WIPE LOCAL IMAGES? This will delete all image sets on this PC and replace them exactly with the cloud backup. Proceed?")) return;
-
-        lockUI('🗑️ Wiping local images...');
-        try {
-            // 1. Wipe local Image DB
-            const imgDb = await getImageDb();
-            if (!imgDb) throw new Error("Image DB not initialized.");
-            await new Promise((resolve, reject) => {
-                const tx = imgDb.transaction(['sets'], 'readwrite');
-                tx.objectStore('sets').clear();
-                tx.oncomplete = resolve;
-                tx.onerror = reject;
-            });
-
-            // 2. Fetch inventory
-            lockUI('📥 Fetching Image Inventory...');
-            const cloudInv = await getCloudInventory('ig_image_backup', /\.(jpg|png|jpeg)$/i);
-            if (!cloudInv.length) return unlockUI('✅ Local wiped. Cloud is empty.');
-
-            // 3. Rebuild Image DB from Cloud
-            const tx = imgDb.transaction(['sets'], 'readwrite');
-            const store = tx.objectStore('sets');
-            const setGroups = {};
-            cloudInv.forEach(c => { if (!setGroups[c.folder]) setGroups[c.folder] = []; setGroups[c.folder].push(c); });
-
-            let dCount = 0;
-            let order = 0;
-            for (let setName of Object.keys(setGroups)) {
-                order++;
-                let newSet = { id: 'set_' + Date.now() + Math.random(), title: setName, images: [], order: order };
-                for (let file of setGroups[setName]) {
-                    dCount++; lockUI(`📥 Img: Cloning ${dCount}/${cloudInv.length}...`);
-                    const blob = await bunnyRequest('GET', file.path, null, 'blob');
-                    const thumb = await compressThumbnail(blob);
-                    newSet.images.push({ id: file.name, type: blob.type || 'image/jpeg', blob: blob, thumb: thumb });
-                    await new Promise(r => setTimeout(r, 100));
-                }
-                store.put(newSet);
-            }
-            tx.oncomplete = () => unlockUI(`✅ Local Images Cloned: ${cloudInv.length} files restored.`);
-        } catch (e) { unlockUI(`❌ ${e.message}`, true); }
-    };
-
     console.log('[CloudSyncCenterModule] Unified Sync UI active.');
     core.emit('block:ready', { id: 'cloudSyncCenterModule' });
+  }
+});
+
+/* ============================================================
+   BLOCK: native emoji picker (v1)
+   ============================================================ */
+/* ============================================================
+   BLOCK: Native Emoji Picker (v1)
+   - Type ":keyword" in the real Instagram DM compose box to
+     trigger an emoji autocomplete dropdown, synced live with
+     the Emoji Settings Module's saved dictionary.
+   - Arrow Up/Down to navigate, Enter (or Tab) to insert,
+     Escape or an outside click to dismiss.
+   ============================================================ */
+LegoCore.registerBlock({
+  id: 'nativeEmojiPicker',
+  init(core) {
+    const STORAGE_KEY = 'ig_emoji_dict_v1';
+
+    let emojiDict = [];
+    try {
+      const saved = localStorage.getItem(STORAGE_KEY);
+      emojiDict = saved ? JSON.parse(saved) : [];
+    } catch (e) { emojiDict = []; }
+
+    // Stay in sync with the Emoji Settings Module (live add/edit/delete)
+    core.on('emoji:updated', (newDict) => { emojiDict = newDict || []; });
+
+    const style = document.createElement('style');
+    style.id = 'ig-nep-styles';
+    style.innerHTML = `
+      .ig-nep-dropdown { position: fixed; max-height: 220px; overflow-y: auto; background: #0f172a; border: 1px solid #334155; border-radius: 8px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); z-index: 2147483647 !important; display: none; flex-direction: column; padding: 4px; gap: 2px; }
+      .ig-nep-dropdown::-webkit-scrollbar { width: 4px; }
+      .ig-nep-dropdown::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+      .ig-nep-row { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 5px; cursor: pointer; transition: background 0.1s; }
+      .ig-nep-row:hover { background: rgba(255,255,255,0.06); }
+      .ig-nep-row.selected { background: #6366f1; }
+      .ig-nep-symbol { font-size: 16px; flex-shrink: 0; }
+      .ig-nep-keyword { font-family: monospace; font-size: 11px; color: #f8fafc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .ig-nep-empty { padding: 10px; text-align: center; color: #94a3b8; font-size: 10px; }
+    `;
+    document.head.appendChild(style);
+
+    const dropdownEl = document.createElement('div');
+    dropdownEl.className = 'ig-nep-dropdown';
+    document.body.appendChild(dropdownEl);
+
+    let isOpen = false;
+    let matches = [];
+    let selectedIndex = 0;
+    let triggerRange = null;
+    let activeZone = null;
+
+    function closeDropdown() {
+      isOpen = false;
+      dropdownEl.style.display = 'none';
+      matches = [];
+      selectedIndex = 0;
+      triggerRange = null;
+      window.removeEventListener('scroll', positionDropdown, true);
+      window.removeEventListener('resize', positionDropdown);
+    }
+
+    function openDropdown() {
+      isOpen = true;
+      dropdownEl.style.display = 'flex';
+      renderDropdown();
+      positionDropdown();
+      window.addEventListener('scroll', positionDropdown, true);
+      window.addEventListener('resize', positionDropdown);
+    }
+
+    function positionDropdown() {
+      if (!activeZone || !activeZone.isConnected) { closeDropdown(); return; }
+      const rect = activeZone.getBoundingClientRect();
+      const gap = 6;
+      const spaceAbove = Math.max(100, rect.top - gap - 12);
+      dropdownEl.style.left = rect.left + 'px';
+      dropdownEl.style.width = Math.min(240, Math.max(140, rect.width)) + 'px';
+      dropdownEl.style.top = 'auto';
+      dropdownEl.style.bottom = (window.innerHeight - rect.top + gap) + 'px';
+      dropdownEl.style.maxHeight = Math.min(220, spaceAbove) + 'px';
+    }
+
+    function renderDropdown() {
+      dropdownEl.innerHTML = '';
+      if (!matches.length) {
+        dropdownEl.innerHTML = '<div class="ig-nep-empty">No matches</div>';
+        return;
+      }
+      matches.forEach((item, idx) => {
+        const row = document.createElement('div');
+        row.className = 'ig-nep-row' + (idx === selectedIndex ? ' selected' : '');
+        row.innerHTML = `<span class="ig-nep-symbol">${item.e}</span><span class="ig-nep-keyword">:${item.k}</span>`;
+        row.onmouseenter = () => { if (selectedIndex !== idx) { selectedIndex = idx; updateSelection(); } };
+        row.onclick = () => { selectedIndex = idx; commitSelection(); };
+        dropdownEl.appendChild(row);
+      });
+    }
+
+    function updateSelection() {
+      dropdownEl.querySelectorAll('.ig-nep-row').forEach((r, i) => {
+        r.classList.toggle('selected', i === selectedIndex);
+      });
+    }
+
+    // Looks at the text immediately before the caret in the current text
+    // node and detects a trailing ":keyword" pattern (same rule the Quick
+    // Command bar uses for its own emoji trigger). NOTE: this only sees the
+    // single text node the caret is currently in - if the caret ends up
+    // split across multiple DOM text nodes (e.g. right after a previously
+    // inserted emoji or pasted content) the trigger may not be detected
+    // until you keep typing into fresh text.
+    function detectTrigger(zone) {
+      const sel = window.getSelection();
+      if (!sel || sel.rangeCount === 0 || !sel.isCollapsed) return null;
+      const range = sel.getRangeAt(0);
+      const node = range.startContainer;
+      if (node.nodeType !== Node.TEXT_NODE) return null;
+      if (!zone.contains(node)) return null;
+
+      const textBefore = node.textContent.slice(0, range.startOffset);
+      const emojiMatch = textBefore.match(/(?:^|\s):([a-zA-Z0-9_]*)$/);
+      if (!emojiMatch) return null;
+
+      const keyword = emojiMatch[1].toLowerCase();
+      const triggerStart = range.startOffset - emojiMatch[1].length - 1;
+      if (triggerStart < 0) return null;
+
+      const tRange = document.createRange();
+      tRange.setStart(node, triggerStart);
+      tRange.setEnd(node, range.startOffset);
+
+      return { keyword, range: tRange };
+    }
+
+    function handleInput(e) {
+      const zone = core.getActiveChatZone && core.getActiveChatZone();
+      if (!zone || !(e.target === zone || zone.contains(e.target))) {
+        if (isOpen) closeDropdown();
+        return;
+      }
+
+      const trigger = detectTrigger(zone);
+      if (!trigger) { if (isOpen) closeDropdown(); return; }
+
+      activeZone = zone;
+      triggerRange = trigger.range;
+      matches = emojiDict.filter(item => item.k.includes(trigger.keyword));
+      selectedIndex = 0;
+
+      if (matches.length > 0) openDropdown();
+      else closeDropdown();
+    }
+
+    // Capture phase so we reliably see typing even if Instagram's own
+    // handlers stop propagation somewhere in the bubble phase.
+    document.addEventListener('input', handleInput, true);
+
+    function commitSelection() {
+      if (!matches.length || !triggerRange || !activeZone) return;
+      const chosen = matches[selectedIndex];
+
+      activeZone.focus();
+      const sel = window.getSelection();
+      sel.removeAllRanges();
+      sel.addRange(triggerRange);
+
+      document.execCommand('insertText', false, chosen.e + ' ');
+      activeZone.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+
+      closeDropdown();
+    }
+
+    // Capture phase so this runs before Instagram's own Enter-to-send handler
+    document.addEventListener('keydown', (e) => {
+      if (!isOpen) return;
+
+      if (e.key === 'ArrowDown') {
+        e.preventDefault(); e.stopPropagation();
+        selectedIndex = (selectedIndex + 1) % matches.length;
+        updateSelection();
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault(); e.stopPropagation();
+        selectedIndex = (selectedIndex - 1 + matches.length) % matches.length;
+        updateSelection();
+        return;
+      }
+      if (e.key === 'Enter' || e.key === 'Tab') {
+        e.preventDefault(); e.stopPropagation();
+        commitSelection();
+        return;
+      }
+      if (e.key === 'Escape') {
+        e.preventDefault(); e.stopPropagation();
+        closeDropdown();
+        return;
+      }
+    }, true);
+
+    document.addEventListener('click', (e) => {
+      if (isOpen && !dropdownEl.contains(e.target)) closeDropdown();
+    });
+
+    core.emit('block:ready', { id: 'nativeEmojiPicker' });
+  }
+});
+
+/* ============================================================
+   BLOCK: Sequence Manager (v3)
+   ============================================================ */
+/* ============================================================
+   BLOCK: Sequence Manager (v2 - Keyboard Builder + Enter-Paced Playback)
+   Built for: LegoCore v2 + Commands v29 (from v28.1) + Quick Chat Box v2
+   - Builder: Commands v28.1-style dropdown + side preview panel
+              (badges, token highlights, smooth hover — duplicated, own classes)
+   - Search: core.searchInventory (same accent-insensitive engine as /commands)
+   - Saved list: Text-Library-style rows (duplicated styles, own classes)
+   - HUD: Enter = next step, Esc = cancel, 1s double-tap lock,
+          missing items auto-skipped
+   Storage: localStorage 'ig_sequences_v1' (synced via Bunny master config)
+   ============================================================ */
+LegoCore.registerBlock({
+  id: 'sequenceManagerModule',
+  init(core) {
+    const COL_PREF_KEY = 'ig_seq_col_widths_v1';
+    const HUD_POS_KEY = 'ig_seq_hud_pos_v1';
+    // Debounce only — NOT a "wait for Instagram" delay. The async-fetch race is already covered
+    // by run.sending; this just absorbs OS key-repeat (holding Enter) and stray duplicate
+    // keydowns. It must stay short: the user's normal rhythm is load‑Enter, send‑Enter, back to
+    // back, and a long lock here would eat the deliberate second tap.
+    const LOCK_MS = 280;
+    const COMPLETE_MS = 1500;
+    const FLASH_MS = 1400;
+    const HUD_POLL_MS = 400;
+    const STEP_KINDS = ['audio', 'set', 'text'];
+    const KIND_ICON = { audio: '🎵', set: '🖼️', text: '📝' };
+    const EXEMPT_SELECTOR = '[data-seq-exempt], .ig-seq-modal-overlay, .ig-qcx-modal-overlay, .ig-tlp-modal-overlay';
+
+    function readJson(key, fallback) {
+      try { const raw = localStorage.getItem(key); if (raw === null) return fallback; const v = JSON.parse(raw); return v == null ? fallback : v; }
+      catch (e) { return fallback; }
+    }
+    function el(tag, className, text) {
+      const node = document.createElement(tag);
+      if (className) node.className = className;
+      if (text !== undefined) node.textContent = text;
+      return node;
+    }
+    function iconFor(kind) { return KIND_ICON[kind] || '•'; }
+    function stepLabel(step) { return `${iconFor(step.kind)} ${step.title || '(untitled)'}`; }
+
+    /* ---- Duplicated render helpers (from Commands v28.1) — kept local so this block can diverge ---- */
+    function tokenToAccentRegex(token) {
+      const map = { a: '[aáàäâã]', e: '[eéèëê]', i: '[iíìïî]', o: '[oóòöôõ]', u: '[uúùüû]', n: '[nñ]', c: '[cç]' };
+      const escaped = String(token || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      let pattern = '';
+      for (const ch of escaped.toLowerCase()) pattern += map[ch] || ch;
+      return pattern;
+    }
+    // Always HTML-escapes first, then adds <mark> / **bold** markup -> safe for innerHTML
+    function highlightTokens(text, tokens) {
+      const raw = String(text || '');
+      if (!raw) return '';
+      let html = raw.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+      if (tokens && tokens.length) {
+        const patterns = tokens.map(tokenToAccentRegex).filter(Boolean);
+        if (patterns.length) html = html.replace(new RegExp(`(${patterns.join('|')})`, 'gi'), '<mark class="ig-seq-mark">$1</mark>');
+      }
+      return html.replace(/\*\*(.*?)\*\*/gs, '<strong class="ig-seq-bold">$1</strong>');
+    }
+    function getHashColor(str) {
+      let hash = 0;
+      for (let i = 0; i < str.length; i++) hash = str.charCodeAt(i) + ((hash << 5) - hash);
+      return `hsl(${Math.abs(hash % 360)}, 65%, 45%)`;
+    }
+    function formatTitleWithTags(rawName, tokens) {
+      const raw = String(rawName || '');
+      const match = raw.match(/^(\d+)([\s\-\.]*)(?:\(([^)]+)\))?([\s\-\.]*)(.*)$/);
+      if (!match) return highlightTokens(raw, tokens);
+      const numStr = match[1], num = parseInt(numStr, 10), sep1 = match[2] || '', courseName = match[3], sep2 = match[4] || '', rest = match[5] || '';
+
+      // 🎨 Colors come from the Tag Colors block (falls back to the old colors if it's missing)
+      const tc = core.tagColors;
+      const bg = tc ? tc.getNumberColor(numStr)
+        : num === 1 ? '#10b981' : num === 2 ? '#ef4444' : num === 3 ? '#f59e0b' : num === 4 ? '#8b5cf6' : num >= 5 ? '#3b82f6' : '#64748b';
+      const fg = tc ? tc.getTextColor(bg) : '#fff';
+
+      let html = `<span class="ig-seq-pipeline-badge" style="background:${bg}; color:${fg};">${numStr}</span>`;
+      if (courseName) {
+        const tagColor = tc ? tc.getCourseColor(courseName) : getHashColor(courseName.toLowerCase().trim());
+        const tagFg = tc ? tc.getTextColor(tagColor) : '#fff';
+        html += `<span class="ig-seq-course-badge" style="background:${tagColor}; color:${tagFg};">(${highlightTokens(courseName.trim(), tokens)})</span>`;
+        html += `<span>${highlightTokens(sep2 + rest, tokens)}</span>`;
+      } else {
+        html += `<span>${highlightTokens(sep1 + rest, tokens)}</span>`;
+      }
+      return html;
+    }
+
+    let colWidths = readJson(COL_PREF_KEY, { titleWidth: 45 });
+
+    /* ---------------------------------------------------------
+       STYLES (self-contained copies — no dependency on other blocks)
+       --------------------------------------------------------- */
+    const style = document.createElement('style');
+    style.id = 'ig-seq-styles';
+    style.innerHTML = `
+      /* ---- Container / header (copied from Text Library) ---- */
+      .ig-seq-container { display: flex; flex-direction: column; gap: 8px; font-family: -apple-system, sans-serif; }
+      .ig-seq-header-btns { display: flex; gap: 4px; }
+      .ig-seq-hbtn { flex: 1; background: var(--igls-surface-2, #1c1c23); color: #e2e8f0; border: 1px solid #334155; border-radius: 4px; padding: 6px 4px; font-size: 10px; font-weight: bold; cursor: pointer; transition: 0.2s; }
+      .ig-seq-hbtn:hover { background: #334155; color: #fff; }
+      .ig-seq-hbtn.active-filter { background: #6366f1; color: white; border-color: #8b5cf6; }
+      .ig-seq-find-input { width: 100%; background: #1e293b; border: 1px solid #475569; color: #fff; padding: 6px 8px; border-radius: 4px; font-size: 11px; box-sizing: border-box; outline: none; }
+      .ig-seq-find-input:focus { border-color: #6366f1; }
+
+      /* ---- Builder ---- */
+      .ig-seq-builder { display: flex; flex-direction: column; gap: 6px; background: rgba(0,0,0,0.2); border: 1px solid #334155; border-radius: 6px; padding: 8px; }
+      .ig-seq-builder.is-editing { border-color: #c9a876; }
+      .ig-seq-builder-head { display: flex; align-items: center; gap: 6px; }
+      .ig-seq-mode-label { flex: 1; font-size: 11px; font-weight: bold; color: #94a3b8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .ig-seq-builder.is-editing .ig-seq-mode-label { color: #c9a876; }
+      .ig-seq-draft-zone { display: flex; flex-wrap: wrap; gap: 4px; min-height: 26px; max-height: 120px; overflow-y: auto; padding: 2px; }
+      .ig-seq-draft-zone::-webkit-scrollbar { width: 4px; }
+      .ig-seq-draft-zone::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+      .ig-seq-draft-empty { font-size: 10px; color: #64748b; font-style: italic; padding: 5px 2px; }
+      .ig-seq-pill { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; background: #1e293b; border: 1px solid #475569; border-radius: 12px; padding: 2px 4px 2px 6px; font-size: 10px; color: #f8fafc; cursor: grab; user-select: none; }
+      .ig-seq-pill:active { cursor: grabbing; }
+      .ig-seq-pill.is-dragging { opacity: 0.35; }
+      .ig-seq-pill.drop-left { box-shadow: -2px 0 0 #10b981; }
+      .ig-seq-pill.drop-right { box-shadow: 2px 0 0 #10b981; }
+      .ig-seq-pill-num { font-size: 9px; font-weight: bold; color: #c9a876; }
+      .ig-seq-pill-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 120px; }
+      .ig-seq-pill-x { background: transparent; border: none; color: #64748b; cursor: pointer; font-size: 9px; padding: 1px 3px; border-radius: 8px; line-height: 1; }
+      .ig-seq-pill-x:hover { color: #fff; background: rgba(220,38,38,0.6); }
+      .ig-seq-cmd-input { width: 100%; background: #0f172a; color: #fff; border: 1px solid #334155; border-radius: 6px; padding: 7px 8px; font-size: 12px; outline: none; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; transition: border 0.2s; }
+      .ig-seq-cmd-input:focus { border-color: #6366f1; }
+      .ig-seq-builder-status { font-size: 10px; color: #64748b; min-height: 13px; line-height: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .ig-seq-builder-status.ok { color: #10b981; font-weight: bold; }
+      .ig-seq-builder-status.warn { color: #f59e0b; font-weight: bold; }
+      .ig-seq-builder-status.info { color: #c9a876; font-weight: bold; }
+
+      /* ---- Dropdown + side panel (copied from Commands v28.1) ---- */
+      .ig-seq-dropdown { position: fixed; max-height: 320px; overflow-y: auto; background: #0f172a; border: 1px solid #334155; border-radius: 8px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); z-index: 2147483647 !important; display: none; flex-direction: column; padding: 4px; gap: 2px; font-family: -apple-system, sans-serif; }
+      .ig-seq-dropdown::-webkit-scrollbar { width: 4px; }
+      .ig-seq-dropdown::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+      .ig-seq-dd-row { padding: 6px 8px; border-radius: 5px; cursor: pointer; transition: background 0.1s; }
+      .ig-seq-dd-row:hover { background: rgba(255,255,255,0.06); }
+      .ig-seq-dd-row.selected { background: #6366f1; }
+      .ig-seq-dd-row-top { display: flex; align-items: center; gap: 6px; }
+      .ig-seq-dd-title { flex: 1; font-weight: bold; color: #f8fafc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 11px; }
+      .ig-seq-dd-cmd { font-size: 9px; background: rgba(255,255,255,0.12); color: #c9a876; padding: 1px 6px; border-radius: 8px; font-weight: bold; flex-shrink: 0; }
+      .ig-seq-dd-empty { padding: 10px; text-align: center; color: #94a3b8; font-size: 10px; }
+      .ig-seq-pipeline-badge { display: inline-block; padding: 1px 5px; border-radius: 4px; font-weight: bold; color: #fff; margin-right: 4px; font-size: 10px; box-shadow: 0 1px 2px rgba(0,0,0,0.3); }
+      .ig-seq-course-badge { display: inline-block; padding: 1px 5px; border-radius: 4px; font-weight: bold; color: #fff; margin-right: 4px; font-size: 9px; text-transform: uppercase; box-shadow: 0 1px 2px rgba(0,0,0,0.3); }
+      .ig-seq-mark { background: rgba(201, 168, 118, 0.45); color: #fff; border-radius: 3px; padding: 0 3px; font-weight: bold; }
+      .ig-seq-bold { color: #38bdf8; background: rgba(56, 189, 248, 0.15); padding: 0 3px; border-radius: 3px; }
+      .ig-seq-side-panel { position: fixed; overflow-y: auto; background: #0f172a; border: 1px solid #334155; border-radius: 8px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); z-index: 2147483647 !important; display: none; flex-direction: column; padding: 10px; gap: 6px; font-family: -apple-system, sans-serif; }
+      .ig-seq-side-panel::-webkit-scrollbar { width: 4px; }
+      .ig-seq-side-panel::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+      .ig-seq-side-title { font-size: 11px; font-weight: bold; color: #f8fafc; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-bottom: 4px; border-bottom: 1px solid rgba(255,255,255,0.08); }
+      .ig-seq-side-body { font-size: 11px; color: #cbd5e1; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+      .ig-seq-side-empty { font-size: 10px; color: #64748b; font-style: italic; }
+
+      /* ---- Saved list (copied from Text Library) ---- */
+      .ig-seq-tree { max-height: 350px; overflow-y: auto; padding-right: 4px; display: flex; flex-direction: column; }
+      .ig-seq-tree::-webkit-scrollbar { width: 4px; }
+      .ig-seq-tree::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
+      .ig-seq-list-empty { font-size: 10px; color: #64748b; font-style: italic; padding: 8px 6px; text-align: center; }
+      .ig-seq-drop-top { border-top: 2px solid #10b981 !important; }
+      .ig-seq-drop-bottom { border-bottom: 2px solid #10b981 !important; }
+
+      .ig-seq-row-item { display: flex; flex-direction: column; border-bottom: 1px solid rgba(255,255,255,0.05); cursor: pointer; transition: background 0.2s; }
+      .ig-seq-row-item.alt-bg { background: rgba(255,255,255,0.02); }
+      .ig-seq-row-item:hover { background: rgba(255,255,255,0.06); }
+      .ig-seq-row-item.is-active { background: rgba(99,102,241,0.18); box-shadow: inset 2px 0 0 #6366f1; }
+      .ig-seq-row-item.is-editing { box-shadow: inset 2px 0 0 #c9a876; }
+
+      .ig-seq-row { display: flex; align-items: center; padding: 4px 6px; }
+      .ig-seq-drag-grip { color: #475569; font-size: 10px; cursor: grab; margin-right: 6px; }
+      .ig-seq-drag-grip:active { cursor: grabbing; }
+      .ig-seq-title-col { display: flex; align-items: center; font-size: 11px; color: #f8fafc; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; gap: 4px; }
+      .ig-seq-title-text { overflow: hidden; text-overflow: ellipsis; }
+      .ig-seq-col-resizer { width: 6px; height: 18px; cursor: col-resize; background: rgba(255,255,255,0.05); border-radius: 3px; margin: 0 4px; transition: background 0.1s; flex-shrink: 0; }
+      .ig-seq-col-resizer:hover, .ig-seq-col-resizer.active { background: #6366f1; }
+      .ig-seq-meta { flex: 1; display: flex; gap: 4px; overflow: hidden; pointer-events: none; align-items: center; }
+      .ig-seq-count-pill { font-size: 9px; padding: 2px 6px; border-radius: 4px; font-weight: 700; white-space: nowrap; background: rgba(255,255,255,0.1); color: #c9a876; flex-shrink: 0; }
+      .ig-seq-warn-pill { font-size: 9px; padding: 2px 6px; border-radius: 4px; font-weight: 700; white-space: nowrap; background: rgba(245,158,11,0.15); color: #f59e0b; flex-shrink: 0; }
+      .ig-seq-kind-icons { font-size: 10px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; opacity: 0.8; }
+
+      .ig-seq-actions { display: flex; gap: 2px; align-items: center; margin-left: auto; }
+      .ig-seq-btn { background: transparent; border: none; color: #64748b; cursor: pointer; font-size: 11px; padding: 4px; border-radius: 4px; transition: 0.2s; }
+      .ig-seq-btn:hover { background: rgba(255,255,255,0.1); color: #fff; }
+
+      .ig-seq-preview { font-size: 10px; color: #94a3b8; padding: 0 8px 8px 30px; line-height: 1.5; display: none; white-space: pre-wrap; word-wrap: break-word; background: rgba(0,0,0,0.2); }
+      .ig-seq-preview.visible { display: block; }
+      .ig-seq-preview-line.missing { color: #f59e0b; }
+
+      /* ---- HUD ---- */
+      .ig-seq-hud { position: fixed; z-index: 2147483646; width: 340px; max-width: calc(100vw - 16px); box-sizing: border-box; background: rgba(15, 23, 42, 0.96); backdrop-filter: blur(8px); border: 1px solid #6366f1; border-radius: 10px; padding: 10px 12px; display: none; flex-direction: column; gap: 6px; box-shadow: 0 10px 30px rgba(0,0,0,0.55); font-family: -apple-system, sans-serif; color: #fff; }
+      .ig-seq-hud.is-waiting { border-color: #f59e0b; }
+      .ig-seq-hud.is-complete { border-color: #10b981; }
+      .ig-seq-hud-head { display: flex; align-items: center; gap: 8px; }
+      .ig-seq-hud-name { flex: 1; font-size: 11px; font-weight: bold; color: #c9a876; cursor: grab; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; user-select: none; }
+      .ig-seq-hud-cancel { background: #1e293b; border: 1px solid #475569; color: #e2e8f0; border-radius: 4px; padding: 3px 8px; font-size: 10px; font-weight: bold; cursor: pointer; }
+      .ig-seq-hud-cancel:hover { background: #dc2626; border-color: #dc2626; color: #fff; }
+      .ig-seq-hud-track { height: 4px; background: #1e293b; border-radius: 4px; overflow: hidden; }
+      .ig-seq-hud-fill { height: 100%; width: 0%; background: #6366f1; transition: width 0.25s; }
+      .ig-seq-hud.is-complete .ig-seq-hud-fill { background: #10b981; }
+      .ig-seq-hud-status { font-size: 12px; font-weight: bold; color: #f8fafc; line-height: 1.4; word-break: break-word; }
+      .ig-seq-hud-sub { font-size: 10px; color: #94a3b8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .ig-seq-hud.is-locked .ig-seq-hud-status { opacity: 0.7; }
+    `;
+    document.head.appendChild(style);
+
+    /* ---------------------------------------------------------
+       SIDEBAR CARD SKELETON (static markup only — no user data)
+       --------------------------------------------------------- */
+    const ui = el('div', 'ig-seq-container');
+    ui.innerHTML = `
+      <div class="ig-seq-header-btns">
+        <button type="button" class="ig-seq-hbtn" data-act="new" title="Start a new empty sequence">➕ New</button>
+        <button type="button" class="ig-seq-hbtn" data-act="find" title="Filter saved sequences">🔍 Find</button>
+      </div>
+      <input type="text" class="ig-seq-find-input" data-seq-exempt="1" placeholder="Filter sequences by name..." style="display:none;">
+      <div class="ig-seq-builder">
+        <div class="ig-seq-builder-head">
+          <span class="ig-seq-mode-label">✨ New sequence</span>
+          <button type="button" class="ig-seq-btn ig-seq-cancel-edit" title="Stop editing (discard changes)" style="display:none;">✕</button>
+        </div>
+        <div class="ig-seq-draft-zone"></div>
+        <input type="text" class="ig-seq-cmd-input" data-seq-exempt="1" autocomplete="off" spellcheck="false" placeholder="Type to add step, or /save Name...">
+        <div class="ig-seq-builder-status"></div>
+      </div>
+      <div class="ig-seq-tree"></div>
+    `;
+
+    const newBtn = ui.querySelector('[data-act="new"]');
+    const findBtn = ui.querySelector('[data-act="find"]');
+    const findInput = ui.querySelector('.ig-seq-find-input');
+    const builderEl = ui.querySelector('.ig-seq-builder');
+    const modeLabel = ui.querySelector('.ig-seq-mode-label');
+    const cancelEditBtn = ui.querySelector('.ig-seq-cancel-edit');
+    const draftZone = ui.querySelector('.ig-seq-draft-zone');
+    const cmdInput = ui.querySelector('.ig-seq-cmd-input');
+    const builderStatus = ui.querySelector('.ig-seq-builder-status');
+    const tree = ui.querySelector('.ig-seq-tree');
+
+    const dropdownEl = el('div', 'ig-seq-dropdown');
+    dropdownEl.setAttribute('data-seq-exempt', '1');
+    document.body.appendChild(dropdownEl);
+    const sidePanelEl = el('div', 'ig-seq-side-panel');
+    sidePanelEl.setAttribute('data-seq-exempt', '1');
+    document.body.appendChild(sidePanelEl);
+
+    /* ---------------------------------------------------------
+       DRAFT STATE
+       --------------------------------------------------------- */
+    let draft = { editingId: null, name: '', steps: [] };
+    const DEFAULT_HINT = '↑↓ pick · Enter add · ⌫ on empty removes last · /save Name';
+
+    let statusTimer = null;
+    function setBuilderStatus(msg, tone, ms) {
+      clearTimeout(statusTimer);
+      builderStatus.textContent = msg || DEFAULT_HINT;
+      builderStatus.className = 'ig-seq-builder-status' + (tone ? ' ' + tone : '');
+      if (ms) statusTimer = setTimeout(() => setBuilderStatus(DEFAULT_HINT), ms);
+    }
+
+    function resetDraft() {
+      draft = { editingId: null, name: '', steps: [] };
+      cmdInput.value = '';
+      closeDropdown();
+      renderDraft();
+      highlightRows();
+      setBuilderStatus(DEFAULT_HINT);
+    }
+
+    function startEditing(seq) {
+      draft = { editingId: seq.id, name: seq.name || '', steps: (seq.steps || []).map(s => Object.assign({}, s)) };
+      cmdInput.value = '';
+      closeDropdown();
+      renderDraft();
+      highlightRows();
+      setBuilderStatus('✏️ Edit steps, then /save (keeps name) or /save New Name', 'info', 3500);
+      builderEl.scrollIntoView({ block: 'nearest' });
+      cmdInput.focus();
+    }
+
+    let draggedPillIdx = null;
+    function clearPillDropMarks() {
+      draftZone.querySelectorAll('.drop-left, .drop-right').forEach(p => p.classList.remove('drop-left', 'drop-right'));
+    }
+
+    function renderDraft() {
+      draftZone.innerHTML = '';
+      if (!draft.steps.length) {
+        draftZone.appendChild(el('div', 'ig-seq-draft-empty', 'Draft is empty — type below to add steps.'));
+      }
+      draft.steps.forEach((step, idx) => {
+        const pill = el('div', 'ig-seq-pill');
+        pill.draggable = true;
+        pill.title = `${step.title || '(untitled)'} — drag to reorder`;
+        const rm = el('button', 'ig-seq-pill-x', '✕');
+        rm.type = 'button'; rm.title = 'Remove step';
+        rm.onclick = (e) => { e.stopPropagation(); draft.steps.splice(idx, 1); renderDraft(); cmdInput.focus(); };
+        pill.append(el('span', 'ig-seq-pill-num', String(idx + 1)), el('span', null, iconFor(step.kind)), el('span', 'ig-seq-pill-title', step.title || '(untitled)'), rm);
+
+        pill.addEventListener('dragstart', (e) => {
+          draggedPillIdx = idx;
+          e.dataTransfer.effectAllowed = 'move';
+          try { e.dataTransfer.setData('text/plain', 'ig-seq-pill'); } catch (_) { /* noop */ }
+          setTimeout(() => pill.classList.add('is-dragging'), 0);
+        });
+        pill.addEventListener('dragend', () => { pill.classList.remove('is-dragging'); draggedPillIdx = null; clearPillDropMarks(); });
+        pill.addEventListener('dragover', (e) => {
+          if (draggedPillIdx === null) return;
+          e.preventDefault(); e.stopPropagation();
+          clearPillDropMarks();
+          if (draggedPillIdx === idx) return;
+          const r = pill.getBoundingClientRect();
+          pill.classList.add(e.clientX < r.left + r.width / 2 ? 'drop-left' : 'drop-right');
+        });
+        pill.addEventListener('drop', (e) => {
+          if (draggedPillIdx === null) return;
+          e.preventDefault(); e.stopPropagation();
+          const r = pill.getBoundingClientRect();
+          const before = e.clientX < r.left + r.width / 2;
+          const moved = draft.steps.splice(draggedPillIdx, 1)[0];
+          let target = idx > draggedPillIdx ? idx - 1 : idx;
+          if (!before) target += 1;
+          draft.steps.splice(target, 0, moved);
+          draggedPillIdx = null;
+          renderDraft();
+        });
+        draftZone.appendChild(pill);
+      });
+
+      const editing = !!draft.editingId;
+      builderEl.classList.toggle('is-editing', editing);
+      modeLabel.textContent = editing ? `✏️ Editing: ${draft.name || 'Untitled'}` : '✨ New sequence';
+      cancelEditBtn.style.display = editing ? '' : 'none';
+      draftZone.scrollTop = draftZone.scrollHeight;
+    }
+
+    function addStepFromMatch(m) {
+      let step = null;
+      if (m.kind === 'audio') step = { kind: 'audio', refId: m.item.id, title: m.item.name || 'Audio clip', folder: m.item.folder || 'General' };
+      else if (m.kind === 'set') step = { kind: 'set', refId: m.item.id, title: m.item.title || 'Image set' };
+      else if (m.kind === 'text') step = { kind: 'text', refId: m.item.id, title: m.item.title || (m.item.text || '').slice(0, 25) || 'Text' };
+      if (!step) return;
+      draft.steps.push(step);
+      cmdInput.value = '';
+      closeDropdown();
+      renderDraft();
+      setBuilderStatus(`➕ Added ${stepLabel(step)}`, 'ok', 1500);
+      cmdInput.focus();
+    }
+
+    function saveDraft(nameArg) {
+      const name = (nameArg || '').trim() || draft.name;
+      if (!draft.steps.length) { setBuilderStatus('⚠️ Add at least one step before saving.', 'warn', 2500); return; }
+      if (!name) { setBuilderStatus('⚠️ Name it: /save My Sequence', 'warn', 2500); return; }
+
+      const sequences = core.getSequences();
+      const steps = draft.steps.map(s => Object.assign({}, s));
+      const now = Date.now();
+      let savedName = name;
+
+      const existing = draft.editingId ? sequences.find(s => s.id === draft.editingId) : null;
+      if (existing) {
+        existing.name = name; existing.steps = steps; existing.updatedAt = now;
+      } else {
+        sequences.push({ id: draft.editingId || ('seq_' + now), name, steps, createdAt: now, updatedAt: now });
+      }
+      core.saveSequences(sequences); // emits 'sequences:updated' -> renderList()
+      const wasEditing = !!existing;
+      resetDraft();
+      setBuilderStatus(wasEditing ? `✅ Updated "${savedName}"` : `✅ Saved "${savedName}"`, 'ok', 2200);
+    }
+
+    /* ---------------------------------------------------------
+       BUILDER DROPDOWN (Quick-Command behavior, own classes)
+       --------------------------------------------------------- */
+    let dropdownOpen = false;
+    let matches = [];
+    let currentSearchTokens = [];
+    let selectedIndex = 0;
+    let searchToken = 0;
+
+    function positionDropdown() {
+      const rect = cmdInput.getBoundingClientRect();
+      const gap = 8;
+      const spaceAbove = rect.top - gap - 12;
+      const spaceBelow = window.innerHeight - rect.bottom - gap - 12;
+      dropdownEl.style.left = rect.left + 'px';
+      dropdownEl.style.width = Math.max(220, rect.width) + 'px';
+      // Sidebar card may sit near the top of the screen: open upward like /commands when there's room, else downward
+      if (spaceAbove >= 160 || spaceAbove >= spaceBelow) {
+        dropdownEl.style.top = 'auto';
+        dropdownEl.style.bottom = (window.innerHeight - rect.top + gap) + 'px';
+        dropdownEl.style.maxHeight = Math.max(120, Math.min(320, spaceAbove)) + 'px';
+      } else {
+        dropdownEl.style.bottom = 'auto';
+        dropdownEl.style.top = (rect.bottom + gap) + 'px';
+        dropdownEl.style.maxHeight = Math.max(120, Math.min(320, spaceBelow)) + 'px';
+      }
+    }
+
+    function positionSidePanel() {
+      const dd = dropdownEl.getBoundingClientRect();
+      const gap = 8, panelWidth = 240;
+      let left = dd.right + gap;
+      if (left + panelWidth > window.innerWidth - 8) {
+        left = dd.left - panelWidth - gap;
+        if (left < 8) left = Math.max(8, window.innerWidth - panelWidth - 8);
+      }
+      sidePanelEl.style.left = left + 'px';
+      sidePanelEl.style.width = panelWidth + 'px';
+      sidePanelEl.style.top = dropdownEl.style.top;
+      sidePanelEl.style.bottom = dropdownEl.style.bottom;
+      sidePanelEl.style.maxHeight = dropdownEl.style.maxHeight;
+    }
+
+    function onViewportChange() { if (dropdownOpen) { positionDropdown(); positionSidePanel(); } }
+
+    function openDropdown() {
+      if (!dropdownOpen) {
+        window.addEventListener('scroll', onViewportChange, true);
+        window.addEventListener('resize', onViewportChange);
+      }
+      dropdownOpen = true;
+      document.body.appendChild(dropdownEl);
+      document.body.appendChild(sidePanelEl);
+      positionDropdown();
+      dropdownEl.style.display = 'flex';
+      renderDropdown();
+    }
+    function closeDropdown() {
+      searchToken++;
+      dropdownOpen = false; matches = []; currentSearchTokens = []; selectedIndex = 0;
+      dropdownEl.style.display = 'none';
+      sidePanelEl.style.display = 'none';
+      window.removeEventListener('scroll', onViewportChange, true);
+      window.removeEventListener('resize', onViewportChange);
+    }
+
+    function updateSidePanel() {
+      if (!dropdownOpen || !matches.length) { sidePanelEl.style.display = 'none'; return; }
+      const m = matches[selectedIndex];
+      const tokens = currentSearchTokens;
+      let title = '', body = '', emptyMsg = '';
+      if (m.kind === 'audio') { title = m.item.name; body = m.item.transcript; emptyMsg = 'No transcript yet.'; }
+      else if (m.kind === 'text') { title = m.item.title; body = m.item.text; emptyMsg = 'No text saved.'; }
+      else if (m.kind === 'set') { title = m.item.title; body = ''; emptyMsg = `${(m.item.images || []).length} image(s) — sent together as one album.`; }
+      sidePanelEl.innerHTML = '';
+      sidePanelEl.appendChild(el('div', 'ig-seq-side-title', `${iconFor(m.kind)} ${title || '(untitled)'}`));
+      const bodyEl = el('div', 'ig-seq-side-body');
+      const trimmed = String(body || '').trim();
+      if (trimmed) bodyEl.innerHTML = highlightTokens(trimmed, tokens); // escaped inside highlightTokens
+      else bodyEl.appendChild(el('span', 'ig-seq-side-empty', emptyMsg));
+      sidePanelEl.appendChild(bodyEl);
+      sidePanelEl.style.display = 'flex';
+      positionSidePanel();
+      const firstMark = sidePanelEl.querySelector('mark');
+      if (firstMark) firstMark.scrollIntoView({ block: 'nearest' });
+    }
+
+    // Smooth hover: only toggle classes, never rebuild rows (same fix as Commands v28.1)
+    function updateSelection() {
+      dropdownEl.querySelectorAll('.ig-seq-dd-row').forEach((r, i) => r.classList.toggle('selected', i === selectedIndex));
+      const selectedRow = dropdownEl.children[selectedIndex];
+      if (selectedRow && selectedRow.scrollIntoView) selectedRow.scrollIntoView({ block: 'nearest' });
+      updateSidePanel();
+    }
+
+    function renderDropdown() {
+      dropdownEl.innerHTML = '';
+      if (!matches.length) { dropdownEl.appendChild(el('div', 'ig-seq-dd-empty', 'No matches')); updateSidePanel(); return; }
+      const tokens = currentSearchTokens;
+      matches.forEach((m, idx) => {
+        const row = el('div', 'ig-seq-dd-row' + (idx === selectedIndex ? ' selected' : ''));
+        const top = el('div', 'ig-seq-dd-row-top');
+        const titleEl = el('span', 'ig-seq-dd-title');
+        titleEl.innerHTML = formatTitleWithTags(m.kind === 'audio' ? m.item.name : m.item.title, tokens); // escaped inside
+        top.append(el('span', null, iconFor(m.kind)), titleEl);
+        if (m.item.customCommand) top.appendChild(el('span', 'ig-seq-dd-cmd', '/' + m.item.customCommand));
+        if (m.kind === 'set') top.appendChild(el('span', 'ig-seq-dd-cmd', `${(m.item.images || []).length} img`));
+        row.appendChild(top);
+        row.onmouseenter = () => { if (selectedIndex !== idx) { selectedIndex = idx; updateSelection(); } };
+        row.onmousedown = (e) => e.preventDefault(); // keep focus in the builder input
+        row.onclick = () => { selectedIndex = idx; addStepFromMatch(matches[idx]); };
+        dropdownEl.appendChild(row);
+      });
+      updateSidePanel();
+    }
+
+    function saveCommandMatch(val) { return val.trim().match(/^\/save(?:\s+(.*))?$/i); }
+
+    async function recomputeMatches(forceAll) {
+      const val = cmdInput.value;
+      const saveMatch = saveCommandMatch(val);
+      if (saveMatch) {
+        closeDropdown();
+        const name = (saveMatch[1] || '').trim() || draft.name;
+        if (!name) setBuilderStatus('💾 Type a name, then Enter: /save My Sequence', 'info');
+        else setBuilderStatus(draft.editingId ? `💾 Enter to update as "${name}"` : `💾 Enter to save as "${name}"`, 'info');
+        return;
+      }
+      if (!val.trim() && !forceAll) { closeDropdown(); setBuilderStatus(DEFAULT_HINT); return; }
+
+      const raw = val.startsWith('/') ? val.slice(1) : val;
+      const parsed = core.parseSearchPrefix(raw);
+      const mode = STEP_KINDS.includes(parsed.mode) ? parsed.mode : 'all';
+      const q = parsed.mode === 'all' || STEP_KINDS.includes(parsed.mode) ? parsed.q : raw;
+
+      const token = ++searchToken;
+      const results = await core.searchInventory(q, mode, { kinds: STEP_KINDS, limit: 8 });
+      if (token !== searchToken) return; // stale
+      currentSearchTokens = core.getSearchTokens(q);
+      matches = results;
+      selectedIndex = 0;
+      openDropdown();
+    }
+
+    cmdInput.addEventListener('input', () => recomputeMatches(false));
+    cmdInput.addEventListener('keydown', (e) => {
+      if (e.isComposing) return;
+      if (dropdownOpen) {
+        if (e.key === 'ArrowDown') { e.preventDefault(); if (matches.length) { selectedIndex = (selectedIndex + 1) % matches.length; updateSelection(); } return; }
+        if (e.key === 'ArrowUp') { e.preventDefault(); if (matches.length) { selectedIndex = (selectedIndex - 1 + matches.length) % matches.length; updateSelection(); } return; }
+        if ((e.key === 'Enter' || e.key === 'Tab') && matches.length) { e.preventDefault(); e.stopPropagation(); addStepFromMatch(matches[selectedIndex]); return; }
+        if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeDropdown(); return; }
+      }
+      if (e.key === 'ArrowDown' && !dropdownOpen) { e.preventDefault(); recomputeMatches(true); return; }
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault(); e.stopPropagation();
+        const saveMatch = saveCommandMatch(cmdInput.value);
+        if (saveMatch) { saveDraft(saveMatch[1] || ''); return; }
+        if (cmdInput.value.trim()) recomputeMatches(false);
+        return;
+      }
+      if (e.key === 'Backspace' && cmdInput.value === '' && draft.steps.length) {
+        e.preventDefault();
+        const removed = draft.steps.pop();
+        renderDraft();
+        setBuilderStatus(`⌫ Removed ${stepLabel(removed)}`, 'warn', 1500);
+      }
+    });
+    cmdInput.addEventListener('blur', () => setTimeout(() => {
+      if (document.activeElement !== cmdInput && !dropdownEl.matches(':hover') && !sidePanelEl.matches(':hover')) closeDropdown();
+    }, 120));
+    document.addEventListener('click', (e) => {
+      if (dropdownOpen && e.target !== cmdInput && !dropdownEl.contains(e.target) && !sidePanelEl.contains(e.target)) closeDropdown();
+    });
+
+    newBtn.onclick = () => { resetDraft(); cmdInput.focus(); };
+    cancelEditBtn.onclick = () => { resetDraft(); setBuilderStatus('Edit discarded.', 'warn', 1500); };
+    findBtn.onclick = () => {
+      const show = findInput.style.display === 'none';
+      findInput.style.display = show ? '' : 'none';
+      findBtn.classList.toggle('active-filter', show);
+      if (show) findInput.focus(); else { findInput.value = ''; renderList(); }
+    };
+    findInput.addEventListener('input', () => renderList());
+
+    /* ---------------------------------------------------------
+       SAVED LIST (Text-Library rows, own classes)
+       --------------------------------------------------------- */
+    let listToken = 0;
+    let draggedSeqId = null;
+    let activeColResizer = null;
+
+    function clearRowDropMarks() {
+      tree.querySelectorAll('.ig-seq-drop-top, .ig-seq-drop-bottom').forEach(r => r.classList.remove('ig-seq-drop-top', 'ig-seq-drop-bottom'));
+    }
+
+    function highlightRows() {
+      const active = core.getActiveSequence();
+      tree.querySelectorAll('.ig-seq-row-item').forEach(row => {
+        row.classList.toggle('is-active', !!active && active.id === row.dataset.id);
+        row.classList.toggle('is-editing', !!draft.editingId && draft.editingId === row.dataset.id);
+      });
+    }
+
+    function loadSequence(seq) {
+      if (!seq.steps || !seq.steps.length) { setBuilderStatus('⚠️ That sequence has no steps.', 'warn', 2000); return; }
+      core.setActiveSequence(seq);
+    }
+
+    function deleteSequence(seq) {
+      if (!confirm(`Delete sequence "${seq.name || 'Untitled'}"?`)) return;
+      const active = core.getActiveSequence();
+      if (active && active.id === seq.id) core.cancelSequence('deleted');
+      if (draft.editingId === seq.id) resetDraft();
+      core.saveSequences(core.getSequences().filter(s => s.id !== seq.id));
+    }
+
+    function reorderSequences(dragId, targetId, before) {
+      const list = core.getSequences();
+      const from = list.findIndex(s => s.id === dragId);
+      if (from < 0) return;
+      const moved = list.splice(from, 1)[0];
+      let to = list.findIndex(s => s.id === targetId);
+      if (to < 0) return;
+      if (!before) to += 1;
+      list.splice(to, 0, moved);
+      core.saveSequences(list);
+    }
+
+    function buildRow(seq, index, inventory) {
+      const steps = Array.isArray(seq.steps) ? seq.steps : [];
+      const missingFlags = inventory ? steps.map(s => !core.resolveStep(s, inventory)) : steps.map(() => false);
+      const missingCount = missingFlags.filter(Boolean).length;
+
+      const item = el('div', 'ig-seq-row-item' + (index % 2 === 1 ? ' alt-bg' : ''));
+      item.dataset.id = seq.id;
+
+      const row = el('div', 'ig-seq-row');
+      const grip = el('span', 'ig-seq-drag-grip', '⠿');
+      grip.draggable = true; grip.title = 'Drag to reorder';
+
+      const titleCol = el('div', 'ig-seq-title-col');
+      titleCol.style.width = colWidths.titleWidth + '%';
+      const titleText = el('span', 'ig-seq-title-text');
+      titleText.innerHTML = formatTitleWithTags(seq.name || 'Untitled', []); // escaped inside
+      titleCol.append(el('span', null, '📋'), titleText);
+
+      const resizer = el('div', 'ig-seq-col-resizer');
+      resizer.title = 'Drag to resize columns';
+
+      const meta = el('div', 'ig-seq-meta');
+      meta.appendChild(el('span', 'ig-seq-count-pill', `${steps.length} step${steps.length === 1 ? '' : 's'}`));
+      if (missingCount) {
+        const warn = el('span', 'ig-seq-warn-pill', `⚠️ ${missingCount}`);
+        warn.title = `${missingCount} step(s) reference deleted items and will be skipped`;
+        meta.appendChild(warn);
+      }
+      meta.appendChild(el('span', 'ig-seq-kind-icons', steps.map(s => iconFor(s.kind)).join('')));
+
+      const actions = el('div', 'ig-seq-actions');
+      const playBtn = el('button', 'ig-seq-btn', '▶️'); playBtn.type = 'button'; playBtn.title = 'Load sequence (Enter sends each step)';
+      const previewBtn = el('button', 'ig-seq-btn', '👁️'); previewBtn.type = 'button'; previewBtn.title = 'Toggle step list';
+      const editBtn = el('button', 'ig-seq-btn', '✏️'); editBtn.type = 'button'; editBtn.title = 'Edit sequence';
+      const delBtn = el('button', 'ig-seq-btn', '🗑️'); delBtn.type = 'button'; delBtn.title = 'Delete sequence';
+      actions.append(playBtn, previewBtn, editBtn, delBtn);
+
+      row.append(grip, titleCol, resizer, meta, actions);
+
+      const preview = el('div', 'ig-seq-preview');
+      if (!steps.length) preview.textContent = 'Empty sequence.';
+      steps.forEach((s, i) => {
+        const line = el('div', 'ig-seq-preview-line' + (missingFlags[i] ? ' missing' : ''), `${i + 1}. ${stepLabel(s)}${missingFlags[i] ? '  ⚠️ missing' : ''}`);
+        preview.appendChild(line);
+      });
+
+      item.append(row, preview);
+
+      playBtn.onclick = (e) => { e.stopPropagation(); loadSequence(seq); };
+      previewBtn.onclick = (e) => { e.stopPropagation(); preview.classList.toggle('visible'); };
+      editBtn.onclick = (e) => { e.stopPropagation(); startEditing(seq); };
+      delBtn.onclick = (e) => { e.stopPropagation(); deleteSequence(seq); };
+      item.onclick = (e) => {
+        if (e.target.closest('button') || e.target.classList.contains('ig-seq-drag-grip') || e.target.classList.contains('ig-seq-col-resizer')) return;
+        preview.classList.toggle('visible');
+      };
+
+      grip.addEventListener('dragstart', (e) => {
+        draggedSeqId = seq.id;
+        e.dataTransfer.effectAllowed = 'move';
+        try { e.dataTransfer.setData('text/plain', 'ig-seq-row'); } catch (_) { /* noop */ }
+        setTimeout(() => { item.style.opacity = '0.3'; }, 0);
+      });
+      grip.addEventListener('dragend', () => { item.style.opacity = '1'; draggedSeqId = null; clearRowDropMarks(); });
+      item.addEventListener('dragover', (e) => {
+        if (!draggedSeqId) return;
+        e.preventDefault(); e.stopPropagation();
+        clearRowDropMarks();
+        if (draggedSeqId === seq.id) return;
+        const r = item.getBoundingClientRect();
+        item.classList.add(e.clientY - r.top < r.height / 2 ? 'ig-seq-drop-top' : 'ig-seq-drop-bottom');
+      });
+      item.addEventListener('dragleave', () => item.classList.remove('ig-seq-drop-top', 'ig-seq-drop-bottom'));
+      item.addEventListener('drop', (e) => {
+        if (!draggedSeqId) return;
+        e.preventDefault(); e.stopPropagation();
+        const r = item.getBoundingClientRect();
+        const before = e.clientY - r.top < r.height / 2;
+        const dragId = draggedSeqId;
+        draggedSeqId = null;
+        clearRowDropMarks();
+        if (dragId !== seq.id) reorderSequences(dragId, seq.id, before);
+      });
+
+      resizer.addEventListener('mousedown', (e) => {
+        e.stopPropagation(); e.preventDefault();
+        resizer.classList.add('active');
+        activeColResizer = { el: resizer, container: row };
+      });
+
+      return item;
+    }
+
+    async function renderList() {
+      const token = ++listToken;
+      const sequences = core.getSequences();
+      let inventory = null;
+      try { inventory = await core.getSearchableInventory(); } catch (e) { inventory = null; }
+      if (token !== listToken) return;
+
+      // keep open previews open across re-renders
+      const openIds = new Set(Array.from(tree.querySelectorAll('.ig-seq-row-item')).filter(r => r.querySelector('.ig-seq-preview.visible')).map(r => r.dataset.id));
+
+      tree.innerHTML = '';
+      const filter = findInput.value.trim().toLowerCase();
+      const visible = sequences.filter(s => !filter || (s.name || '').toLowerCase().includes(filter));
+      if (!visible.length) {
+        tree.appendChild(el('div', 'ig-seq-list-empty', sequences.length ? 'No sequences match that filter.' : 'No saved sequences yet. Build one above and type /save Name.'));
+        return;
+      }
+      visible.forEach((seq, i) => {
+        const row = buildRow(seq, i, inventory);
+        if (openIds.has(seq.id)) row.querySelector('.ig-seq-preview').classList.add('visible');
+        tree.appendChild(row);
+      });
+      highlightRows();
+    }
+
+    window.addEventListener('mousemove', (e) => {
+      if (!activeColResizer) return;
+      const rect = activeColResizer.container.getBoundingClientRect();
+      const pct = ((e.clientX - rect.left) / rect.width) * 100;
+      colWidths.titleWidth = Math.min(80, Math.max(20, pct));
+      tree.querySelectorAll('.ig-seq-title-col').forEach(c => { c.style.width = colWidths.titleWidth + '%'; });
+    });
+    window.addEventListener('mouseup', () => {
+      if (!activeColResizer) return;
+      activeColResizer.el.classList.remove('active');
+      activeColResizer = null;
+      localStorage.setItem(COL_PREF_KEY, JSON.stringify(colWidths));
+    });
+
+    /* ---------------------------------------------------------
+       HUD
+       --------------------------------------------------------- */
+    const hud = el('div', 'ig-seq-hud');
+    hud.innerHTML = `
+      <div class="ig-seq-hud-head">
+        <span class="ig-seq-hud-name" title="Drag to move · double-click to re-dock above the chat box"></span>
+        <button type="button" class="ig-seq-hud-cancel" title="Cancel sequence (Esc)">✕ Cancel</button>
+      </div>
+      <div class="ig-seq-hud-track"><div class="ig-seq-hud-fill"></div></div>
+      <div class="ig-seq-hud-status"></div>
+      <div class="ig-seq-hud-sub"></div>
+    `;
+    document.body.appendChild(hud);
+    const hudName = hud.querySelector('.ig-seq-hud-name');
+    const hudCancel = hud.querySelector('.ig-seq-hud-cancel');
+    const hudFill = hud.querySelector('.ig-seq-hud-fill');
+    const hudStatus = hud.querySelector('.ig-seq-hud-status');
+    const hudSub = hud.querySelector('.ig-seq-hud-sub');
+
+    core.makeIsolatedDraggable(hud, hudName, HUD_POS_KEY);
+    hudName.addEventListener('dblclick', () => { localStorage.removeItem(HUD_POS_KEY); positionHud(); });
+    hudCancel.onclick = (e) => { e.stopPropagation(); core.cancelSequence('user'); };
+
+    // run.stage is the module's own record of where we are — 'idle' (nothing loaded, next
+    // Enter loads a step) or 'armed' (a step was just injected into Instagram's composer,
+    // next Enter is the send keystroke). This replaces inferring it from the page's DOM.
+    const run = { stage: 'idle', locked: false, lockTimer: null, sending: false, complete: false, completeTimer: null, flashText: '', flashUntil: 0, token: 0, poll: null };
+
+    function resetRun() {
+      clearTimeout(run.lockTimer); clearTimeout(run.completeTimer);
+      if (run.poll) clearInterval(run.poll);
+      run.stage = 'idle';
+      run.locked = false; run.sending = false; run.complete = false;
+      run.flashText = ''; run.flashUntil = 0; run.poll = null;
+      run.token++;
+    }
+
+    function positionHud() {
+      const saved = readJson(HUD_POS_KEY, null);
+      const w = hud.offsetWidth || 340;
+      const h = hud.offsetHeight || 90;
+      if (saved && saved.left && saved.top) {
+        const left = Math.min(Math.max(8, parseFloat(saved.left)), window.innerWidth - w - 8);
+        const top = Math.min(Math.max(8, parseFloat(saved.top)), window.innerHeight - h - 8);
+        hud.style.left = left + 'px'; hud.style.top = top + 'px'; hud.style.bottom = 'auto';
+        return;
+      }
+      const zone = core.getActiveChatZone();
+      let left, bottom;
+      if (zone) {
+        const r = zone.getBoundingClientRect();
+        left = r.left + r.width / 2 - w / 2;
+        bottom = window.innerHeight - r.top + 14;
+      } else {
+        left = window.innerWidth / 2 - w / 2;
+        bottom = 96;
+      }
+      left = Math.min(Math.max(8, left), window.innerWidth - w - 8);
+      bottom = Math.min(Math.max(8, bottom), window.innerHeight - h - 8);
+      hud.style.left = left + 'px'; hud.style.top = 'auto'; hud.style.bottom = bottom + 'px';
+    }
+
+    function focusIsInComposer(zone) {
+      const a = document.activeElement;
+      return !!(zone && a && (zone === a || zone.contains(a)));
+    }
+
+    function focusComposer(zone) {
+      if (!zone) return;
+      zone.focus();
+      if (zone.isContentEditable) {
+        try {
+          const range = document.createRange();
+          range.selectNodeContents(zone);
+          range.collapse(false);
+          const sel = window.getSelection();
+          sel.removeAllRanges(); sel.addRange(range);
+        } catch (_) { /* noop */ }
+      }
+    }
+
+    function flash(text) { run.flashText = text; run.flashUntil = Date.now() + FLASH_MS; renderHud(); }
+
+    function renderHud() {
+      const seq = core.getActiveSequence();
+      if (!seq) { hud.style.display = 'none'; return; }
+      const total = seq.steps.length;
+      const idx = core.getSequenceStepIndex();
+      const next = seq.steps[idx];
+      const armed = !run.complete && run.stage === 'armed';
+
+      hudName.textContent = '📋 ' + (seq.name || 'Sequence');
+      hudFill.style.width = (total ? Math.round((Math.min(idx, total) / total) * 100) : 100) + '%';
+
+      let status;
+      let sub = 'Enter = load next · Enter again = send · Esc = cancel';
+      if (Date.now() < run.flashUntil) status = run.flashText;
+      else if (run.complete) { status = '✅ Complete!'; sub = 'Press ENTER in the chat to send the last item.'; }
+      else if (run.sending) status = '⏳ Loading…';
+      else if (armed) status = '📤 In the chat box — press ENTER to send it.';
+      else if (next) status = `[${idx + 1}/${total}] Up Next: ${stepLabel(next)}. Press ENTER to load it.`;
+      else status = '✅ Complete!';
+
+      if (!run.complete && armed && next) sub = `Then: [${idx + 1}/${total}] ${stepLabel(next)}`;
+
+      hudStatus.textContent = status;
+      hudSub.textContent = sub;
+      hud.classList.toggle('is-waiting', armed);
+      hud.classList.toggle('is-complete', run.complete);
+      hud.classList.toggle('is-locked', run.locked);
+    }
+
+    function lockTrigger() {
+      run.locked = true;
+      clearTimeout(run.lockTimer);
+      run.lockTimer = setTimeout(() => { run.locked = false; renderHud(); }, LOCK_MS);
+    }
+
+    function finishSequence() {
+      run.complete = true;
+      renderHud();
+      clearTimeout(run.completeTimer);
+      const myToken = run.token;
+      run.completeTimer = setTimeout(() => { if (myToken === run.token) core.cancelSequence('complete'); }, COMPLETE_MS);
+    }
+
+    function injectPayload(kind, payload) {
+      let ok = false;
+      if (kind === 'audio') ok = core.injectClipToChat(payload.blob, payload.name, { silent: true });
+      else if (kind === 'set') ok = core.injectImageSetToChat(payload.images, { silent: true });
+      else if (kind === 'text') ok = core.injectTextToChat(payload.text, { silent: true });
+      if (ok && kind !== 'text') {
+        // leave the caret in Instagram's composer so the next real Enter sends the attachment
+        setTimeout(() => focusComposer(core.getActiveChatZone()), 60);
+      }
+      return ok;
+    }
+
+    async function fireNextStep() {
+      const seq = core.getActiveSequence();
+      if (!seq) return;
+      if (!core.getActiveChatZone()) { flash('⚠️ Open an Instagram chat first.'); return; }
+
+      const myToken = run.token;
+      run.sending = true;
+      lockTrigger();
+      renderHud();
+
+      let idx = core.getSequenceStepIndex();
+      let payload = null, step = null, skipped = 0;
+      while (idx < seq.steps.length) {
+        step = seq.steps[idx];
+        try { payload = await core.fetchItemData(step.kind, step.refId, step); } catch (e) { payload = null; }
+        if (myToken !== run.token) return; // cancelled/replaced while fetching
+        if (payload) break;
+        skipped++; idx++;
+        core.setSequenceStepIndex(idx);
+      }
+      run.sending = false;
+
+      if (!payload) { flash('⚠️ Item missing, skipping...'); finishSequence(); return; }
+
+      if (!injectPayload(step.kind, payload)) { flash('⚠️ Chat box not found — step not loaded.'); return; }
+      // Loaded into the composer but NOT sent yet — arm the state so the next Enter reads as "send",
+      // not "load the next step". core.setSequenceStepIndex already points past this step, but
+      // finishSequence() (which tears down the HUD) waits until the send Enter actually fires.
+      run.stage = 'armed';
+      if (skipped) flash(`⚠️ Item missing, skipping... (${skipped} skipped)`);
+
+      core.setSequenceStepIndex(idx + 1);
+      renderHud();
+    }
+
+    function swallow(e) { e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation(); }
+
+    // Global capture-phase listener: runs before Instagram's and the other blocks' handlers.
+    function onGlobalKeydown(e) {
+      if (!core.getActiveSequence()) return;
+      if (e.isComposing || e.keyCode === 229) return;
+      if (e.target && e.target.closest && e.target.closest(EXEMPT_SELECTOR)) return;
+
+      if (e.key === 'Escape') { swallow(e); core.cancelSequence('escape'); return; }
+      if (e.key !== 'Enter' || e.shiftKey || e.ctrlKey || e.altKey || e.metaKey) return;
+
+      // Double-tap lock (also covers the async fetch window)
+      if (run.locked || run.sending) { swallow(e); return; }
+
+      if (run.stage === 'armed') {
+        // A step is already loaded in Instagram's composer — this Enter is the SEND keystroke.
+        // We trust our own state for *what this Enter means*, not the page's DOM: the only thing
+        // still worth checking is that focus is actually where Instagram will receive the key.
+        const zone = core.getActiveChatZone();
+        if (!focusIsInComposer(zone)) {
+          swallow(e);
+          focusComposer(zone);
+          flash('📤 Chat box focused — press ENTER again to send.');
+          return; // stay 'armed' — this tap only refocused, it didn't send
+        }
+        // Let this real keypress reach Instagram natively; we never simulate the send ourselves.
+        const seq = core.getActiveSequence();
+        const isLastStep = seq && core.getSequenceStepIndex() >= seq.steps.length;
+        run.stage = 'idle';
+        lockTrigger(); // brief cooldown so Instagram has time to actually send + clear the composer
+        if (isLastStep) finishSequence();
+        else setTimeout(renderHud, 200);
+        return;
+      }
+
+      // stage === 'idle': nothing loaded yet — this Enter loads the next step.
+      swallow(e);
+      if (run.complete) return;
+      fireNextStep();
+    }
+    window.addEventListener('keydown', onGlobalKeydown, true);
+
+    /* ---------------------------------------------------------
+       CORE EVENTS
+       --------------------------------------------------------- */
+    core.on('sequence:started', () => {
+      resetRun();
+      hud.style.display = 'flex';
+      positionHud();
+      renderHud();
+      run.poll = setInterval(() => { positionHud(); renderHud(); }, HUD_POLL_MS);
+      highlightRows();
+    });
+    core.on('sequence:ended', () => {
+      resetRun();
+      hud.style.display = 'none';
+      highlightRows();
+    });
+    core.on('sequence:step', () => renderHud());
+    core.on('sequences:updated', () => renderList());
+    core.on('tagcolors:updated', () => { renderList(); if (dropdownOpen) renderDropdown(); }); // 🎨 re-color tags live
+    // ✏️ on a sequence row in the /commands dropdown -> open it here in the builder
+    core.on('sequence:edit-request', (payload) => {
+      const id = payload && payload.id;
+      const seq = core.getSequences().find(sq => sq.id === id);
+      if (!seq) return;
+      const card = ui.closest('.ig-draggable-menu');
+      if (card) card.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+      startEditing(seq);
+    });
+    ['library:refresh', 'folders:refresh', 'images:external-refresh'].forEach(evt => core.on(evt, () => renderList()));
+
+    /* ---------------------------------------------------------
+       MOUNT
+       --------------------------------------------------------- */
+    function mountCard(attemptsLeft = 10) {
+      if (typeof core.registerMenu === 'function') {
+        core.registerMenu('left', '📋 Sequences', ui, '⠿', 'sequence-manager');
+        renderDraft();
+        setBuilderStatus(DEFAULT_HINT);
+        renderList();
+      } else if (attemptsLeft > 0) {
+        setTimeout(() => mountCard(attemptsLeft - 1), 200);
+      }
+    }
+    mountCard();
+
+    core.emit('block:ready', { id: 'sequenceManagerModule' });
+  }
+});
+
+/* ============================================================
+   BLOCK: Tag Colors (v1)
+   ============================================================ */
+/* ============================================================
+   BLOCK: Tag Color Settings (v1)
+   ------------------------------------------------------------
+   One place to configure the colors of the title tags used by
+   Audio Library, Commands (/ dropdown) and Sequence Manager:
+
+       "1 (Anatomía) Intro clase"
+        │  └ course badge  -> color by the FIRST LETTER of the course
+        └ number badge     -> color per number (0–10, plus "11+")
+
+   - Accents are ignored for the letter (Á -> a, ñ -> n).
+   - If a course starts with a digit/symbol, the first letter found
+     inside it is used; if there is none, the "Other" color.
+   - Badge text switches to dark automatically on light colors
+     (so yellow stays readable).
+
+   Exposes:  core.tagColors = { getNumberColor, getCourseColor,
+                                getTextColor, get }
+   Emits:    'tagcolors:updated'  (other blocks re-render on it)
+   Storage:  localStorage 'ig_tag_colors_v1'  (add it to the Sync
+             Center MASTER_KEYS to sync across devices)
+   ============================================================ */
+LegoCore.registerBlock({
+  id: 'tagColorSettingsModule',
+  init(core) {
+    const STORAGE_KEY = 'ig_tag_colors_v1';
+    const NUMBER_SLOTS = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10'];
+    const LETTERS = 'abcdefghijklmnopqrstuvwxyz'.split('');
+    const isHex = v => typeof v === 'string' && /^#[0-9a-f]{6}$/i.test(v);
+    const esc = core.escapeHtml;
+
+    function hslToHex(h, s, l) {
+      s /= 100; l /= 100;
+      const k = n => (n + h / 30) % 12;
+      const a = s * Math.min(l, 1 - l);
+      const f = n => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+      const toHex = x => Math.round(x * 255).toString(16).padStart(2, '0');
+      return '#' + toHex(f(0)) + toHex(f(8)) + toHex(f(4));
+    }
+
+    // Numbers keep your current look (1 green, 2 red, 3 orange, 4 purple, 5+ blue).
+    // Letters get distinct starting colors (golden-angle hue spread so A and B don't look alike).
+    function buildDefaults() {
+      const numbers = { '0': '#64748b', '1': '#10b981', '2': '#ef4444', '3': '#f59e0b', '4': '#8b5cf6' };
+      NUMBER_SLOTS.forEach(n => { if (!numbers[n]) numbers[n] = '#3b82f6'; });
+      const letters = {};
+      LETTERS.forEach((ch, i) => { letters[ch] = hslToHex(Math.round((i * 137.508) % 360), 65, 45); });
+      return { numbers, numberOther: '#3b82f6', letters, letterOther: '#64748b' };
+    }
+
+    function load() {
+      const cfg = buildDefaults();
+      try {
+        const saved = JSON.parse(localStorage.getItem(STORAGE_KEY)) || {};
+        if (saved.numbers) Object.keys(saved.numbers).forEach(k => { if (isHex(saved.numbers[k])) cfg.numbers[k] = saved.numbers[k]; });
+        if (saved.letters) Object.keys(saved.letters).forEach(k => { if (isHex(saved.letters[k])) cfg.letters[k] = saved.letters[k]; });
+        if (isHex(saved.numberOther)) cfg.numberOther = saved.numberOther;
+        if (isHex(saved.letterOther)) cfg.letterOther = saved.letterOther;
+      } catch (e) { /* keep defaults */ }
+      return cfg;
+    }
+
+    let cfg = load();
+
+    function save() {
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(cfg)); } catch (e) { /* quota */ }
+      core.emit('tagcolors:updated', cfg);
+    }
+
+    /* ---------------- Public API ---------------- */
+    function getNumberColor(numStr) {
+      const n = parseInt(numStr, 10);
+      if (isNaN(n)) return cfg.numberOther;
+      return cfg.numbers[String(n)] || cfg.numberOther;
+    }
+    function firstLetter(name) {
+      const m = String(name || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().match(/[a-z]/);
+      return m ? m[0] : null;
+    }
+    function getCourseColor(name) {
+      const ch = firstLetter(name);
+      return (ch && cfg.letters[ch]) || cfg.letterOther;
+    }
+    function getTextColor(bg) {
+      const m = /^#?([0-9a-f]{6})$/i.exec(bg || '');
+      if (!m) return '#ffffff';
+      const v = parseInt(m[1], 16);
+      const lum = (0.299 * ((v >> 16) & 255) + 0.587 * ((v >> 8) & 255) + 0.114 * (v & 255)) / 255;
+      return lum > 0.62 ? '#111827' : '#ffffff';
+    }
+
+    core.tagColors = { getNumberColor, getCourseColor, getTextColor, get: () => cfg };
+
+    /* ---------------- Styles ---------------- */
+    const style = document.createElement('style');
+    style.id = 'ig-tcs-styles';
+    style.innerHTML = `
+      .ig-tcs-wrap { display:flex; flex-direction:column; gap:8px; font-family:-apple-system,sans-serif; font-size:11px; color:#fff; }
+      .ig-tcs-section { background:#18181b; border:1px solid #334155; border-radius:6px; padding:8px; display:flex; flex-direction:column; gap:6px; }
+      .ig-tcs-label { color:#94a3b8; font-size:10px; font-weight:bold; text-transform:uppercase; letter-spacing:0.03em; }
+      .ig-tcs-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(50px, 1fr)); gap:4px; }
+      .ig-tcs-cell { display:flex; align-items:center; justify-content:space-between; gap:3px; background:rgba(255,255,255,0.03); border:1px solid rgba(255,255,255,0.05); border-radius:4px; padding:3px 4px; cursor:pointer; }
+      .ig-tcs-cell span { font-size:10px; font-weight:bold; color:#cbd5e1; }
+      .ig-tcs-cell input[type=color] { width:22px; height:18px; border:none; padding:0; background:transparent; cursor:pointer; flex-shrink:0; }
+      .ig-tcs-preview-input { width:100%; box-sizing:border-box; background:#0f172a; color:#fff; border:1px solid #334155; border-radius:4px; padding:6px 8px; font-size:11px; outline:none; }
+      .ig-tcs-preview-input:focus { border-color:#6366f1; }
+      .ig-tcs-preview { background:#0f172a; border:1px solid #334155; border-radius:4px; padding:6px 8px; font-size:11px; color:#f8fafc; min-height:16px; }
+      .ig-tcs-badge-num { display:inline-block; padding:1px 5px; border-radius:4px; font-weight:bold; margin-right:4px; font-size:10px; box-shadow:0 1px 2px rgba(0,0,0,0.3); }
+      .ig-tcs-badge-course { display:inline-block; padding:1px 5px; border-radius:4px; font-weight:bold; margin-right:4px; font-size:9px; text-transform:uppercase; box-shadow:0 1px 2px rgba(0,0,0,0.3); }
+      .ig-tcs-reset { background:#334155; color:#fff; border:none; border-radius:4px; padding:6px; font-size:10px; font-weight:bold; cursor:pointer; }
+      .ig-tcs-reset:hover { background:#dc2626; }
+    `;
+    document.head.appendChild(style);
+
+    /* ---------------- UI ---------------- */
+    const wrap = document.createElement('div');
+    wrap.className = 'ig-tcs-wrap';
+    wrap.innerHTML = `
+      <div class="ig-tcs-section">
+        <span class="ig-tcs-label">Preview</span>
+        <input type="text" class="ig-tcs-preview-input" value="1 (Anatomía) Intro clase" placeholder="Type a title to preview...">
+        <div class="ig-tcs-preview"></div>
+      </div>
+      <div class="ig-tcs-section">
+        <span class="ig-tcs-label">Number badges</span>
+        <div class="ig-tcs-grid ig-tcs-num-grid"></div>
+      </div>
+      <div class="ig-tcs-section">
+        <span class="ig-tcs-label">(Course) badges — by first letter</span>
+        <div class="ig-tcs-grid ig-tcs-letter-grid"></div>
+      </div>
+      <button type="button" class="ig-tcs-reset">↺ Reset to defaults</button>
+    `;
+
+    const previewInput = wrap.querySelector('.ig-tcs-preview-input');
+    const previewEl = wrap.querySelector('.ig-tcs-preview');
+    const numGrid = wrap.querySelector('.ig-tcs-num-grid');
+    const letterGrid = wrap.querySelector('.ig-tcs-letter-grid');
+
+    function renderPreview() {
+      const raw = previewInput.value;
+      const match = raw.match(/^(\d+)([\s\-\.]*)(?:\(([^)]+)\))?([\s\-\.]*)(.*)$/);
+      if (!match) { previewEl.textContent = raw || '—'; return; }
+      const numStr = match[1], courseName = match[3];
+      const bg = getNumberColor(numStr);
+      let html = `<span class="ig-tcs-badge-num" style="background:${bg}; color:${getTextColor(bg)};">${esc(numStr)}</span>`;
+      if (courseName) {
+        const cbg = getCourseColor(courseName);
+        html += `<span class="ig-tcs-badge-course" style="background:${cbg}; color:${getTextColor(cbg)};">(${esc(courseName.trim())})</span>`;
+        html += `<span>${esc((match[4] || '') + (match[5] || ''))}</span>`;
+      } else {
+        html += `<span>${esc((match[2] || '') + (match[5] || ''))}</span>`;
+      }
+      previewEl.innerHTML = html;
+    }
+
+    // input = live preview while dragging the picker; change = save + tell other blocks
+    function makeCell(label, getVal, setVal) {
+      const cell = document.createElement('label');
+      cell.className = 'ig-tcs-cell';
+      const tag = document.createElement('span');
+      tag.textContent = label;
+      const inp = document.createElement('input');
+      inp.type = 'color';
+      inp.value = getVal();
+      inp.addEventListener('input', () => { setVal(inp.value); renderPreview(); });
+      inp.addEventListener('change', () => { setVal(inp.value); save(); });
+      cell.append(tag, inp);
+      return cell;
+    }
+
+    function renderGrids() {
+      numGrid.innerHTML = '';
+      NUMBER_SLOTS.forEach(n => numGrid.appendChild(makeCell(n, () => cfg.numbers[n], v => { cfg.numbers[n] = v; })));
+      numGrid.appendChild(makeCell('11+', () => cfg.numberOther, v => { cfg.numberOther = v; }));
+
+      letterGrid.innerHTML = '';
+      LETTERS.forEach(ch => letterGrid.appendChild(makeCell(ch.toUpperCase(), () => cfg.letters[ch], v => { cfg.letters[ch] = v; })));
+      letterGrid.appendChild(makeCell('Other', () => cfg.letterOther, v => { cfg.letterOther = v; }));
+      renderPreview();
+    }
+
+    previewInput.addEventListener('input', renderPreview);
+    wrap.querySelector('.ig-tcs-reset').onclick = () => {
+      if (!confirm('Reset all tag colors to defaults?')) return;
+      cfg = buildDefaults();
+      save();
+      renderGrids();
+    };
+
+    renderGrids();
+
+    function mountCard(attemptsLeft = 10) {
+      if (typeof core.registerMenu === 'function') core.registerMenu('left', '🎨 Tag Colors', wrap, '⠿', 'tag-color-settings');
+      else if (attemptsLeft > 0) setTimeout(() => mountCard(attemptsLeft - 1), 200);
+    }
+    mountCard();
+
+    core.emit('block:ready', { id: 'tagColorSettingsModule' });
   }
 });
 
