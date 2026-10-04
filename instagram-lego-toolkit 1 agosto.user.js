@@ -4696,10 +4696,12 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Commands (v5)
+   BLOCK: Commands (v6)
    ============================================================ */
 /* ============================================================
-   BLOCK: Commands (v30 - 📌 Floating always-on-top window + "/save" text snippets
+   BLOCK: Commands (v30.1 - 🎙️ Enter while recording = stop → preview (never restarts/discards)
+                        + Record/preview buttons no longer steal focus from the input
+                    v30 - 📌 Floating always-on-top window + "/save" text snippets
                       + Image drop/paste tray (reorder, save as set, paste)
                       + Instant search setting
                     v29 - Core Shared Search + Sequences (/seq)
@@ -5119,6 +5121,13 @@ LegoCore.registerBlock({
       const previewSaveBtn = previewBar.querySelector('.ig-qcx-preview-save');
       const previewDiscardBtn = previewBar.querySelector('.ig-qcx-preview-discard');
 
+      // 🎙️ FOCUS GUARD: clicking these must not move keyboard focus onto the button.
+      // Otherwise Enter "re-clicks" the focused 🔴 (stop → restart = lost clip).
+      [recordBtn, sendBtn, previewPlayBtn, previewSaveBtn, previewDiscardBtn].forEach(b => {
+        b.tabIndex = -1;
+        b.addEventListener('mousedown', ev => ev.preventDefault());
+      });
+
       const dropdownEl = document.createElement('div');
       dropdownEl.className = 'ig-qcx-dropdown';
 
@@ -5268,6 +5277,19 @@ LegoCore.registerBlock({
       let pendingFlowName = '';
       let pendingSet = null;
       let previewPlayer = null;
+
+      // 🎙️ Recorder state (declared here so the helpers below can read it)
+      let isRecording = false;     // mic is capturing
+      let isFinishing = false;     // ⏳ trailing-lag window after stop was requested
+      let isProcessing = false;    // recorder stopped, auto-trim still running
+      let recordedPending = false; // the pending audio came from the recorder
+
+      // While a recording is live or its clip is waiting, Enter/Escape belong to the audio flow, not to a sequence
+      function audioOwnsEnter() { return isRecording || isFinishing || isProcessing || recordedPending; }
+      function syncSeqExempt() {
+        if (dropdownOpen || audioOwnsEnter() || parseSaveText(input.value) !== null) input.setAttribute('data-seq-exempt', '1');
+        else input.removeAttribute('data-seq-exempt');
+      }
       core.on('tagcolors:updated', () => { if (dropdownOpen) renderDropdown(); }); // 🎨 re-color tags live
 
       function openDropdown() {
@@ -5284,8 +5306,8 @@ LegoCore.registerBlock({
       }
       function closeDropdown() {
         searchToken++;
-        input.removeAttribute('data-seq-exempt');
         dropdownOpen = false; isEmojiMode = false; dropdownEl.style.display = 'none';
+        syncSeqExempt();
         transcriptPanelEl.style.display = 'none'; matches = []; currentSearchTokens = []; selectedIndex = 0;
         window.removeEventListener('scroll', onViewportChange, true);
         window.removeEventListener('resize', onViewportChange);
@@ -5630,12 +5652,14 @@ LegoCore.registerBlock({
       function clearPending() {
         pendingAudioBlob = null; pendingAudioName = ''; pendingTranscript = '';
         pendingFlowNs = null; pendingFlowName = ''; pendingSet = null;
+        recordedPending = false;
         previewBar.style.display = 'none';
         if (previewPlayer) { previewPlayer.pause(); previewPlayer = null; }
         previewPlayBtn.innerText = '▶️';
         previewPlayBtn.style.display = '';
         previewSaveBtn.style.display = '';
         previewDiscardBtn.style.display = '';
+        syncSeqExempt();
       }
 
       previewPlayBtn.onclick = () => {
@@ -6158,9 +6182,18 @@ LegoCore.registerBlock({
 
       input.addEventListener('input', () => { recomputeMatches(); });
       input.addEventListener('keydown', (e) => {
+        // 🎙️ RECORDING ENTER: 1st Enter stops the recording (normal trailing lag + auto-trim → preview).
+        // While ⏳ finishing / trimming, Enter is swallowed so it can never restart or discard the clip.
+        // Once the preview shows, the regular Enter below pastes it into Instagram's chat box.
+        if (e.key === 'Enter' && !e.shiftKey && !dropdownOpen && (isRecording || isFinishing || isProcessing)) {
+          e.preventDefault(); e.stopPropagation();
+          if (isRecording && !isFinishing) finishRecording();
+          return;
+        }
+
         // SEQUENCE GATE: with the dropdown closed, Enter/Escape belong to the Sequence Manager.
         const saveArmed = e.key === 'Enter' && parseSaveText(input.value) !== null;
-        if (sequenceIsActive() && !dropdownOpen && !saveArmed && (e.key === 'Enter' || e.key === 'Escape')) return;
+        if (sequenceIsActive() && !dropdownOpen && !saveArmed && !audioOwnsEnter() && (e.key === 'Enter' || e.key === 'Escape')) return;
 
         if (dropdownOpen) {
           if (e.key === 'ArrowDown') { e.preventDefault(); if (matches.length) { selectedIndex = (selectedIndex + 1) % matches.length; updateSelection(); } return; }
@@ -6192,8 +6225,6 @@ LegoCore.registerBlock({
 
       let mediaRecorder;
       let audioChunks = [];
-      let isRecording = false;
-      let isFinishing = false;
       let lagTimeoutId = null;
       let activeSessionId = 0;
       let discardNextStop = false;
@@ -6215,41 +6246,62 @@ LegoCore.registerBlock({
           const threshold = localStorage.getItem('sb_quick_silence_threshold') || '0.035';
 
           if (trimStart || trimEnd) blob = await detectAndTrimSilence(blob, trimStart, trimEnd, threshold);
-          if (mySession !== activeSessionId) return;
+          if (mySession !== activeSessionId) return; // a newer recording owns the state now
 
+          isProcessing = false;
           pendingAudioBlob = blob;
           pendingAudioName = 'quick_audio_' + Date.now();
           pendingTranscript = '';
+          recordedPending = true;
           showAudioPreview();
+          previewLabel.innerText = '🎙️ Clip ready · Enter ↵ to paste';
+          syncSeqExempt();
         };
       }).catch(err => console.warn("[QuickCommandExtension] Mic error:", err));
 
+      function startRecording() {
+        clearPending(); audioChunks = []; activeSessionId = Date.now(); isProcessing = false;
+        mediaRecorder.start(); isRecording = true;
+        recordBtn.classList.add('recording'); recordBtn.classList.remove('finishing'); recordBtn.innerText = '⏹️';
+        syncSeqExempt();
+        input.focus(); // keep Enter pointed at Quick Chat while recording
+      }
+
+      // Stop with the normal trailing lag; the clip then shows in the preview bar (via onstop)
+      function finishRecording() {
+        if (!isRecording || isFinishing) return;
+        isFinishing = true; const lagMs = parseInt(localStorage.getItem('sb_quick_trailing_lag')) || 800;
+        recordBtn.innerText = '⏳'; recordBtn.classList.remove('recording'); recordBtn.classList.add('finishing');
+        lagTimeoutId = setTimeout(() => {
+          isFinishing = false; isRecording = false;
+          if (mediaRecorder.state === 'recording') { isProcessing = true; mediaRecorder.stop(); }
+          recordBtn.classList.remove('finishing'); recordBtn.innerText = '🔴';
+          syncSeqExempt();
+        }, lagMs);
+      }
+
+      // Mouse-only: clicking 🔴 during ⏳ throws away the clip and starts over (Enter never does this)
+      function restartDuringFinish() {
+        clearTimeout(lagTimeoutId); isFinishing = false; discardNextStop = true; activeSessionId = Date.now();
+        if (mediaRecorder.state === 'recording') {
+          const restartHandler = () => {
+            clearPending(); audioChunks = []; mediaRecorder.start(); isRecording = true;
+            recordBtn.classList.add('recording'); recordBtn.classList.remove('finishing'); recordBtn.innerText = '⏹️';
+            syncSeqExempt();
+            mediaRecorder.removeEventListener('stop', restartHandler);
+          };
+          mediaRecorder.addEventListener('stop', restartHandler); mediaRecorder.stop();
+        } else {
+          isRecording = false; recordBtn.classList.remove('finishing', 'recording'); recordBtn.innerText = '🔴';
+          syncSeqExempt();
+        }
+      }
+
       recordBtn.onclick = () => {
         if (!mediaRecorder) { alert("Microphone not initialized."); return; }
-        if (isFinishing) {
-            clearTimeout(lagTimeoutId); isFinishing = false; discardNextStop = true; activeSessionId = Date.now();
-            if (mediaRecorder.state === 'recording') {
-                const restartHandler = () => {
-                    clearPending(); audioChunks = []; mediaRecorder.start(); isRecording = true;
-                    recordBtn.classList.add('recording'); recordBtn.classList.remove('finishing'); recordBtn.innerText = '⏹️';
-                    mediaRecorder.removeEventListener('stop', restartHandler);
-                };
-                mediaRecorder.addEventListener('stop', restartHandler); mediaRecorder.stop();
-            }
-            return;
-        }
-        if (!isRecording) {
-          clearPending(); audioChunks = []; activeSessionId = Date.now(); mediaRecorder.start(); isRecording = true;
-          recordBtn.classList.add('recording'); recordBtn.classList.remove('finishing'); recordBtn.innerText = '⏹️';
-        } else {
-          isFinishing = true; const lagMs = parseInt(localStorage.getItem('sb_quick_trailing_lag')) || 800;
-          recordBtn.innerText = '⏳'; recordBtn.classList.remove('recording'); recordBtn.classList.add('finishing');
-          lagTimeoutId = setTimeout(() => {
-            isFinishing = false; isRecording = false;
-            if (mediaRecorder.state === 'recording') mediaRecorder.stop();
-            recordBtn.classList.remove('finishing'); recordBtn.innerText = '🔴';
-          }, lagMs);
-        }
+        if (isFinishing) { restartDuringFinish(); return; }
+        if (!isRecording) startRecording();
+        else finishRecording();
       };
 
       document.addEventListener('click', async (e) => {
