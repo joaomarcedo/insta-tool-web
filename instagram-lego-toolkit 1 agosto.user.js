@@ -2,7 +2,7 @@
 // @name         Instagram Lego Toolkit
 // @namespace    https://node-builder.local/
 // @version      1.0.0
-// @description  Compiled by Node Builder -- 26 block(s): Quick Message Recorder, Sidebar Plugin Manager, Recorder Studio, Audio Library, Dual Sidebar UI Shell, menuCollapseModule, Menu Panel Switcher Module, Menu Card Pop-out Module, Header Toolbar Organizer Module, Workspace Profile & Visibility Manager, Instagram Resizer Feature, Sidebar-to-Resizer Sync, Quick Chat Box, Text Library Module (Saved Snippets), image manager, Highlighter, Commands, Reorder Module, text sync Google Sheets, ManyChat Integration, ManyChat Username Detector, Text Library Height Fix (v1), Reset menus, Image Library, Emoji Module, Audio Bunny Sync
+// @description  Compiled by Node Builder -- 28 block(s): Quick Message Recorder, Sidebar Plugin Manager, Recorder Studio, Audio Library, Dual Sidebar UI Shell, menuCollapseModule, Menu Panel Switcher Module, Menu Card Pop-out Module, Header Toolbar Organizer Module, Workspace Profile & Visibility Manager, Instagram Resizer Feature, Sidebar-to-Resizer Sync, Quick Chat Box, Text Library Module (Saved Snippets), image manager, Highlighter, Commands, Reorder Module, Text Library Height Fix (v1), Reset menus, Image Library, Emoji Module, Mobile Core, Mobile Bottom Sheet UI, Master Config Bunny Sync, native emoji picker, Sequence Manager, Tag Colors
 // @author       You
 // @match        https://www.instagram.com/*
 // @grant        GM_xmlhttpRequest
@@ -7301,15 +7301,31 @@ LegoCore.registerBlock({
 
 
 /* ============================================================
-   BLOCK: Master Config Bunny Sync (v5)
+   BLOCK: Master Config Bunny Sync (v6)
    ============================================================ */
 /* ============================================================
-   BLOCK: Central Cloud Sync Center (v3 - Folder Path Fix + Sequences in Master Config)
+   BLOCK: Central Cloud Sync Center (v4 - Exact Names + Sync Manifests)
+   - Cloud file names keep (), dots, ¿¡, accents and emojis
+   - ig_sync_meta/audio_manifest.json carries each clip's exact name, folder,
+     color, custom command, transcript and order (+ folder order)
+   - Pull repairs old mangled names ("3_anicolor_ x" -> "3(anicolor) x")
+     in place, without re-downloading audio
+   - Smart Backup warns before deleting clips this computer never pulled
+   - Image Sets: exact set titles via image_manifest.json, webp/gif support,
+     fixed Pull (transaction no longer expires during downloads)
    ============================================================ */
 LegoCore.registerBlock({
   id: 'cloudSyncCenterModule',
   init(core) {
     const BUNNY_PREFS_KEY = 'ig_bunny_sync_prefs_v1';
+    const AUDIO_KNOWN_KEY = 'ig_audio_sync_known_v1'; // per-device on purpose (NOT in master config)
+
+    const AUDIO_DIR = 'ig_audio_backup';
+    const IMAGE_DIR = 'ig_image_backup';
+    const AUDIO_MANIFEST = 'ig_sync_meta/audio_manifest.json';
+    const IMAGE_MANIFEST = 'ig_sync_meta/image_manifest.json';
+    const AUDIO_EXT_RE = /\.m4a$/i;
+    const IMAGE_EXT_RE = /\.(jpe?g|png|webp|gif)$/i;
 
     // Everything to bundle into master_config.json
     const MASTER_KEYS = [
@@ -7330,12 +7346,39 @@ LegoCore.registerBlock({
     let prefs = JSON.parse(localStorage.getItem(BUNNY_PREFS_KEY)) || { zoneName: '', apiKey: '', region: 'default' };
     function savePrefs() { localStorage.setItem(BUNNY_PREFS_KEY, JSON.stringify(prefs)); }
 
+    // ============================================================
     // Helpers
-    function safeString(str) { return (str || 'Untitled').replace(/[^a-zA-Z0-9-_ \u00C0-\u017F]/g, '_').trim(); }
-    function compareKey(folder, name) {
-        const f = (folder || 'General').toLowerCase().replace(/[^a-z0-9\u00C0-\u017F]/g, '');
-        const n = (name || 'item').toLowerCase().replace(/[^a-z0-9\u00C0-\u017F]/g, '');
-        return `${f}||${n}`;
+    // ============================================================
+    const sleep = ms => new Promise(r => setTimeout(r, ms));
+    const is404 = e => String(e && e.message).includes('404');
+
+    // Only strips characters that are illegal in file paths.
+    // Keeps ( ) . , ¿ ¡ ñ accents emojis — so "3(anicolor) microfono" stays exactly that.
+    function safeString(str) {
+        const s = String(str || '').normalize('NFC')
+            .replace(/[\/\\:*?"<>|\u0000-\u001F\u007F]/g, '_')
+            .trim();
+        return s || 'Untitled';
+    }
+
+    // Loose identity — ignores punctuation, so "3(anicolor) x" == "3_anicolor_ x".
+    // Used to match old mangled copies so they can be repaired.
+    function looseKey(folder, name) {
+        const clean = s => String(s || '').normalize('NFC').toLowerCase().replace(/[^a-z0-9\u00C0-\u017F]/g, '');
+        return `${clean(folder || 'General')}||${clean(name || 'item')}`;
+    }
+
+    // Exact identity of a file in the cloud (case/unicode-normalized)
+    function fileKey(dir, fileName) { return `${dir}/${fileName}`.normalize('NFC').toLowerCase(); }
+
+    function newSyncId() {
+        if (window.crypto && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+        return 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 12);
+    }
+
+    function imageExt(type) {
+        const e = String(type || '').split('/')[1] || '';
+        return /^(jpe?g|png|webp|gif)$/i.test(e) ? e.toLowerCase() : 'jpeg';
     }
 
     function blobToArrayBuffer(blob) {
@@ -7363,13 +7406,28 @@ LegoCore.registerBlock({
             canvas.getContext('2d').drawImage(img, 0, 0, w, h);
             resolve(canvas.toDataURL('image/jpeg', 0.6));
           };
+          img.onerror = () => resolve('');
           img.src = e.target.result;
         };
+        reader.onerror = () => resolve('');
         reader.readAsDataURL(blob);
       });
     }
 
+    // Per-device memory of which clips this computer has already seen in the cloud
+    function getKnownIds() {
+        try { return new Set(JSON.parse(localStorage.getItem(AUDIO_KNOWN_KEY)) || []); }
+        catch (e) { return new Set(); }
+    }
+    function addKnownIds(ids) {
+        const s = getKnownIds();
+        ids.forEach(id => { if (id) s.add(id); });
+        localStorage.setItem(AUDIO_KNOWN_KEY, JSON.stringify([...s]));
+    }
+
+    // ============================================================
     // Bunny API Request Engine
+    // ============================================================
     function bunnyRequest(method, path, data = null, responseType = '') {
       return new Promise((resolve, reject) => {
         if (!prefs.zoneName || !prefs.apiKey) return reject(new Error('Missing API Key or Zone Name.'));
@@ -7407,25 +7465,95 @@ LegoCore.registerBlock({
       });
     }
 
-    // DB Getters
-    function getLocalClips() {
-        return new Promise(resolve => {
-            const db = core.getDb();
-            if (!db) return resolve([]);
-            db.transaction(['clips'], 'readonly').objectStore('clips').getAll().onsuccess = e => resolve(e.target.result || []);
+    async function fetchJSON(path) {
+        try {
+            const data = await bunnyRequest('GET', path);
+            return (data && typeof data === 'object') ? data : null;
+        } catch (e) {
+            if (is404(e)) return null;
+            throw e;
+        }
+    }
+
+    async function putJSON(path, obj) {
+        const blob = new Blob([JSON.stringify(obj)], { type: 'application/json' });
+        await bunnyRequest('PUT', path, await blobToArrayBuffer(blob));
+    }
+
+    // ============================================================
+    // IndexedDB helpers (audio DB comes from core)
+    // ============================================================
+    function txDone(tx) {
+        return new Promise((resolve, reject) => {
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error || new Error('DB transaction failed'));
+            tx.onabort = () => reject(tx.error || new Error('DB transaction aborted'));
         });
     }
-    function saveClipToLocalDB(clipData) {
-        return new Promise(resolve => {
-            const db = core.getDb();
-            const tx = db.transaction(['folders', 'clips'], 'readwrite');
-            tx.objectStore('folders').put({ name: clipData.folder });
-            const store = tx.objectStore('clips');
-            const req = store.count();
-            req.onsuccess = () => { clipData.order = req.result; store.add(clipData); };
-            tx.oncomplete = resolve;
+
+    function requireAudioDb() {
+        const db = core.getDb();
+        if (!db) throw new Error('Audio DB not ready yet.');
+        return db;
+    }
+
+    function getAllFrom(db, storeName) {
+        return new Promise((resolve, reject) => {
+            const req = db.transaction([storeName], 'readonly').objectStore(storeName).getAll();
+            req.onsuccess = () => resolve(req.result || []);
+            req.onerror = () => reject(req.error);
         });
     }
+
+    const getLocalClips = () => getAllFrom(requireAudioDb(), 'clips');
+    const getLocalFolders = () => getAllFrom(requireAudioDb(), 'folders');
+
+    async function putClips(clips) {
+        if (!clips.length) return;
+        const tx = requireAudioDb().transaction(['clips'], 'readwrite');
+        const store = tx.objectStore('clips');
+        clips.forEach(c => store.put(c));
+        await txDone(tx);
+    }
+
+    async function addClip(clipData) {
+        const tx = requireAudioDb().transaction(['clips'], 'readwrite');
+        tx.objectStore('clips').add(clipData);
+        await txDone(tx);
+    }
+
+    // Creates missing folders; applies cloud order when given. Never wipes existing fields.
+    async function ensureFolders(list) {
+        const byName = new Map();
+        list.forEach(f => {
+            if (!f || !f.name) return;
+            const prev = byName.get(f.name);
+            if (!prev || (typeof f.order === 'number' && typeof prev.order !== 'number')) byName.set(f.name, f);
+        });
+        if (!byName.size) return;
+
+        const tx = requireAudioDb().transaction(['folders'], 'readwrite');
+        const store = tx.objectStore('folders');
+        byName.forEach(f => {
+            const req = store.get(f.name);
+            req.onsuccess = () => {
+                const existing = req.result;
+                const hasOrder = typeof f.order === 'number';
+                if (!existing) store.put(hasOrder ? { name: f.name, order: f.order } : { name: f.name });
+                else if (hasOrder && existing.order !== f.order) store.put({ ...existing, order: f.order });
+            };
+        });
+        await txDone(tx);
+    }
+
+    // Gives every clip a permanent sync ID (same clip = same ID on every computer)
+    async function ensureSyncIds(clips) {
+        const missing = clips.filter(c => !c.syncId);
+        missing.forEach(c => { c.syncId = newSyncId(); });
+        await putClips(missing);
+    }
+
+    // Image DB
     function getImageDb() {
         return new Promise(resolve => {
             const req = indexedDB.open('IG_ImageSets_Core_DB', 1);
@@ -7435,43 +7563,421 @@ LegoCore.registerBlock({
     }
     function getLocalImageSets(imgDb) {
         return new Promise(resolve => {
-            if (!imgDb) return resolve([]);
-            if (!imgDb.objectStoreNames.contains('sets')) return resolve([]);
+            if (!imgDb || !imgDb.objectStoreNames.contains('sets')) return resolve([]);
             imgDb.transaction(['sets'], 'readonly').objectStore('sets').getAll().onsuccess = e => resolve(e.target.result || []);
         });
     }
 
-    // Cloud Inventory Scan
-    async function getCloudInventory(folderPath, ext) {
-        let inventory = [];
+    // ============================================================
+    // Cloud inventory scan (what files actually exist on Bunny)
+    // ============================================================
+    async function getCloudInventory(dir, extRe) {
+        const inventory = [];
         try {
-            // FIX: Added the trailing slash so Bunny.net returns folder contents, not the folder itself!
-            const rootItems = await bunnyRequest('GET', folderPath + '/');
+            // Trailing slash so Bunny returns folder contents, not the folder itself
+            const rootItems = await bunnyRequest('GET', dir + '/');
             if (!Array.isArray(rootItems)) return inventory;
 
-            for (let item of rootItems) {
+            for (const item of rootItems) {
                 if (item.IsDirectory) {
-                    const files = await bunnyRequest('GET', `${folderPath}/${encodeURIComponent(item.ObjectName)}/`);
-                    if (Array.isArray(files)) {
-                        files.forEach(f => {
-                            if (!f.IsDirectory && f.ObjectName.match(ext)) {
-                                inventory.push({
-                                    folder: item.ObjectName,
-                                    name: f.ObjectName.replace(ext, ''),
-                                    path: `${folderPath}/${encodeURIComponent(item.ObjectName)}/${encodeURIComponent(f.ObjectName)}`
-                                });
-                            }
+                    const files = await bunnyRequest('GET', `${dir}/${encodeURIComponent(item.ObjectName)}/`);
+                    if (!Array.isArray(files)) continue;
+                    files.forEach(f => {
+                        if (f.IsDirectory || !extRe.test(f.ObjectName)) return;
+                        inventory.push({
+                            folder: item.ObjectName,
+                            name: f.ObjectName.replace(extRe, ''),
+                            key: fileKey(item.ObjectName, f.ObjectName),
+                            path: `${dir}/${encodeURIComponent(item.ObjectName)}/${encodeURIComponent(f.ObjectName)}`
                         });
-                    }
-                } else if (item.ObjectName.match(ext)) {
-                    inventory.push({ folder: 'General', name: item.ObjectName.replace(ext, ''), path: `${folderPath}/${encodeURIComponent(item.ObjectName)}` });
+                    });
+                } else if (extRe.test(item.ObjectName)) {
+                    inventory.push({
+                        folder: 'General',
+                        name: item.ObjectName.replace(extRe, ''),
+                        key: fileKey('', item.ObjectName),
+                        path: `${dir}/${encodeURIComponent(item.ObjectName)}`
+                    });
                 }
             }
-        } catch (e) { if (!e.message.includes('404')) throw e; }
+        } catch (e) { if (!is404(e)) throw e; }
         return inventory;
     }
 
-    // UI Styles
+    // ============================================================
+    // AUDIO — planning
+    // ============================================================
+    function ownerMap(manifest) {
+        const map = new Map();
+        if (manifest && Array.isArray(manifest.clips)) {
+            manifest.clips.forEach(e => { if (e.key && e.syncId) map.set(e.key, e.syncId); });
+        }
+        return map;
+    }
+
+    // Decides the cloud file name for every clip. Duplicate names in the same folder
+    // get a short ID suffix; whoever owned the plain name before keeps it.
+    function planAudio(clips, prevOwner) {
+        const items = clips.map(c => {
+            const dir = safeString(c.folder || 'General');
+            const base = safeString(c.name || 'Untitled');
+            return { clip: c, dir, base, plainKey: fileKey(dir, base + '.m4a') };
+        });
+
+        const rank = it => (prevOwner.get(it.plainKey) === it.clip.syncId ? 0 : 1);
+        items.sort((a, b) => rank(a) - rank(b) || String(a.clip.syncId).localeCompare(String(b.clip.syncId)));
+
+        const used = new Set();
+        items.forEach(it => {
+            let fileName = it.base + '.m4a';
+            if (used.has(fileKey(it.dir, fileName))) fileName = `${it.base} [${String(it.clip.syncId).slice(0, 8)}].m4a`;
+            it.fileName = fileName;
+            it.key = fileKey(it.dir, fileName);
+            it.path = `${AUDIO_DIR}/${encodeURIComponent(it.dir)}/${encodeURIComponent(fileName)}`;
+            used.add(it.key);
+        });
+        return items;
+    }
+
+    function buildAudioManifest(plan, folders, pathByKey) {
+        const clips = plan
+            .map(it => ({
+                syncId: it.clip.syncId,
+                name: it.clip.name || 'Untitled',
+                folder: it.clip.folder || 'General',
+                color: it.clip.color || '#0095f6',
+                customCommand: it.clip.customCommand || '',
+                transcript: it.clip.transcript || '',
+                order: typeof it.clip.order === 'number' ? it.clip.order : 0,
+                key: it.key,
+                path: pathByKey.get(it.key) || it.path
+            }))
+            .sort((a, b) => a.order - b.order);
+
+        return {
+            version: 1,
+            updatedAt: new Date().toISOString(),
+            folders: folders.map(f => ({ name: f.name, order: typeof f.order === 'number' ? f.order : null })),
+            clips
+        };
+    }
+
+    // ============================================================
+    // AUDIO — backup (Smart Backup + Force)
+    // ============================================================
+    async function pushAudio(force) {
+        lockUI(force ? '♻️ Scanning Audio...' : '☁️ Scanning Audio...');
+        requireAudioDb();
+
+        const allClips = await getLocalClips();
+        await ensureSyncIds(allClips);
+        const clips = allClips.filter(c => c.blob);
+
+        const prev = await fetchJSON(AUDIO_MANIFEST);
+        const cloudInv = await getCloudInventory(AUDIO_DIR, AUDIO_EXT_RE);
+
+        // Safety: don't silently delete clips another computer added that this one never pulled
+        if (!force && prev && Array.isArray(prev.clips)) {
+            const localIds = new Set(allClips.map(c => c.syncId));
+            const known = getKnownIds();
+            const unseen = prev.clips.filter(e => e.syncId && !localIds.has(e.syncId) && !known.has(e.syncId));
+            if (unseen.length && !confirm(
+                `⚠️ The cloud has ${unseen.length} clip(s) from another computer that this one hasn't pulled yet.\n\n` +
+                `Smart Backup would DELETE them from the cloud.\n\n` +
+                `Cancel = stop (press 📥 Pull first)\nOK = delete them anyway`
+            )) {
+                return unlockUI('Cancelled — press 📥 Pull first.');
+            }
+        }
+
+        const prevOwner = force ? new Map() : ownerMap(prev);
+        const plan = planAudio(clips, prevOwner);
+
+        const cloudPathByKey = new Map(cloudInv.map(c => [c.key, c.path]));
+        const desiredKeys = new Set(plan.map(p => p.key));
+
+        const toUpload = force ? plan : plan.filter(p =>
+            !cloudPathByKey.has(p.key) ||
+            (prevOwner.has(p.key) && prevOwner.get(p.key) !== p.clip.syncId)
+        );
+        const toDelete = cloudInv.filter(c => !desiredKeys.has(c.key));
+
+        // Upload first, delete after — the cloud is never left half-empty
+        const uploadedKeys = new Set();
+        for (let i = 0; i < toUpload.length; i++) {
+            lockUI(`☁️ Audio: Pushing ${i + 1}/${toUpload.length}...`);
+            const p = toUpload[i];
+            await bunnyRequest('PUT', p.path, await blobToArrayBuffer(p.clip.blob));
+            uploadedKeys.add(p.key);
+            await sleep(100);
+        }
+        for (let i = 0; i < toDelete.length; i++) {
+            lockUI(`🗑️ Audio: Removing old file ${i + 1}/${toDelete.length}...`);
+            await bunnyRequest('DELETE', toDelete[i].path);
+        }
+
+        // Real path of files that already existed (keeps exact casing Bunny has)
+        const pathByKey = new Map();
+        plan.forEach(p => { if (!uploadedKeys.has(p.key) && cloudPathByKey.has(p.key)) pathByKey.set(p.key, cloudPathByKey.get(p.key)); });
+
+        lockUI('📝 Saving clip details...');
+        await putJSON(AUDIO_MANIFEST, buildAudioManifest(plan, await getLocalFolders(), pathByKey));
+        addKnownIds(allClips.map(c => c.syncId));
+
+        if (force) return unlockUI(`✅ Force Mirror Complete! Pushed ${toUpload.length} clips.`);
+        if (!toUpload.length && !toDelete.length) return unlockUI('✅ Audio up to date (details synced).');
+        unlockUI(`✅ Audio Backup: Uploaded ${toUpload.length}, Removed ${toDelete.length}.`);
+    }
+
+    // ============================================================
+    // AUDIO — pull (download missing + repair names/details)
+    // ============================================================
+    async function pullAudio() {
+        lockUI('📥 Fetching Audio Manifest...');
+        requireAudioDb();
+
+        const manifest = await fetchJSON(AUDIO_MANIFEST);
+        if (!manifest || !Array.isArray(manifest.clips)) return legacyPullAudio();
+
+        const local = await getLocalClips();
+        const entries = manifest.clips.filter(e => e && e.syncId && e.path);
+        const manifestIds = new Set(entries.map(e => e.syncId));
+
+        const bySync = new Map();
+        local.forEach(c => { if (c.syncId) bySync.set(c.syncId, c); });
+
+        const matched = new Set();
+        const updates = [];
+        const downloads = [];
+        const pending = [];
+
+        const applyEntry = (c, e) => {
+            const want = {
+                syncId: e.syncId,
+                name: e.name || 'Untitled',
+                folder: e.folder || 'General',
+                color: e.color || '#0095f6',
+                customCommand: e.customCommand || '',
+                transcript: e.transcript || '',
+                order: typeof e.order === 'number' ? e.order : (c.order || 0)
+            };
+            if (Object.keys(want).some(k => (c[k] ?? '') !== want[k])) {
+                Object.assign(c, want);
+                updates.push(c);
+            }
+        };
+
+        // Pass 1 — exact match by sync ID
+        entries.forEach(e => {
+            const c = bySync.get(e.syncId);
+            if (c && !matched.has(c.id)) { matched.add(c.id); applyEntry(c, e); }
+            else pending.push(e);
+        });
+
+        // Pass 2 — loose match by folder + name (repairs old mangled copies)
+        const looseIndex = new Map();
+        local.forEach(c => {
+            if (matched.has(c.id) || (c.syncId && manifestIds.has(c.syncId))) return;
+            const k = looseKey(c.folder, c.name);
+            if (!looseIndex.has(k)) looseIndex.set(k, []);
+            looseIndex.get(k).push(c);
+        });
+        pending.forEach(e => {
+            const list = looseIndex.get(looseKey(e.folder, e.name));
+            const c = list && list.shift();
+            if (c) { matched.add(c.id); applyEntry(c, e); }
+            else downloads.push(e);
+        });
+
+        await ensureFolders([
+            ...(Array.isArray(manifest.folders) ? manifest.folders : []),
+            ...entries.map(e => ({ name: e.folder || 'General' }))
+        ]);
+
+        if (updates.length) {
+            lockUI(`🛠️ Repairing ${updates.length} clip(s)...`);
+            await putClips(updates);
+        }
+
+        let pulled = 0, missing = 0;
+        for (let i = 0; i < downloads.length; i++) {
+            lockUI(`📥 Audio: Pulling ${i + 1}/${downloads.length}...`);
+            const e = downloads[i];
+            try {
+                const blob = await bunnyRequest('GET', e.path, null, 'blob');
+                await addClip({
+                    syncId: e.syncId,
+                    name: e.name || 'Untitled',
+                    folder: e.folder || 'General',
+                    color: e.color || '#0095f6',
+                    customCommand: e.customCommand || '',
+                    transcript: e.transcript || '',
+                    order: typeof e.order === 'number' ? e.order : local.length + i,
+                    blob: new Blob([blob], { type: 'audio/mp4' })
+                });
+                pulled++;
+            } catch (err) {
+                if (is404(err)) missing++;
+                else throw err;
+            }
+            await sleep(100);
+        }
+
+        addKnownIds([...manifestIds]);
+
+        if (!updates.length && !pulled && !missing) return unlockUI('✅ Local audio is fully synced.');
+        unlockUI(`✅ Pulled ${pulled} · Repaired ${updates.length}${missing ? ` · ${missing} missing in cloud` : ''}`);
+    }
+
+    // Old cloud backups (before v4) have no manifest — download by file name only
+    async function legacyPullAudio() {
+        lockUI('📥 No manifest yet — scanning folders...');
+        const local = await getLocalClips();
+        const cloudInv = await getCloudInventory(AUDIO_DIR, AUDIO_EXT_RE);
+        const localKeys = new Set(local.map(c => looseKey(c.folder, c.name)));
+        const toDownload = cloudInv.filter(c => !localKeys.has(looseKey(c.folder, c.name)));
+
+        if (!toDownload.length) return unlockUI('✅ Local audio is fully synced.');
+
+        await ensureFolders(toDownload.map(c => ({ name: c.folder })));
+        for (let i = 0; i < toDownload.length; i++) {
+            lockUI(`📥 Audio: Pulling ${i + 1}/${toDownload.length}...`);
+            const c = toDownload[i];
+            const blob = await bunnyRequest('GET', c.path, null, 'blob');
+            await addClip({
+                name: c.name, folder: c.folder, color: '#0095f6', customCommand: '',
+                order: local.length + i, blob: new Blob([blob], { type: 'audio/mp4' })
+            });
+            await sleep(100);
+        }
+        unlockUI(`✅ Audio Pulled: ${toDownload.length} clips. (Run Smart Backup/Force on your main computer to enable exact names.)`);
+    }
+
+    // ============================================================
+    // IMAGES
+    // ============================================================
+    function collectLocalImages(localSets) {
+        const out = [];
+        localSets.forEach(s => (s.images || []).forEach(i => {
+            if (!i.blob) return;
+            const dir = safeString(s.title);
+            const fileName = `${safeString(i.id)}.${imageExt(i.type)}`;
+            out.push({
+                setTitle: s.title, imgId: i.id, blob: i.blob,
+                key: fileKey(dir, fileName),
+                path: `${IMAGE_DIR}/${encodeURIComponent(dir)}/${encodeURIComponent(fileName)}`
+            });
+        }));
+        return out;
+    }
+
+    async function pushImages(force) {
+        lockUI(force ? '♻️ Scanning Images...' : '☁️ Scanning Images...');
+        const imgDb = await getImageDb();
+        if (!imgDb) throw new Error('Image DB not initialized.');
+
+        const localSets = await getLocalImageSets(imgDb);
+        const cloudInv = await getCloudInventory(IMAGE_DIR, IMAGE_EXT_RE);
+        const localImgs = collectLocalImages(localSets);
+
+        let toUpload, toDelete;
+        if (force) {
+            const desired = new Set(localImgs.map(i => i.key));
+            toUpload = localImgs;
+            toDelete = cloudInv.filter(c => !desired.has(c.key));
+        } else {
+            const localKeys = new Set(localImgs.map(i => looseKey(i.setTitle, i.imgId)));
+            const cloudKeys = new Set(cloudInv.map(c => looseKey(c.folder, c.name)));
+            toUpload = localImgs.filter(i => !cloudKeys.has(looseKey(i.setTitle, i.imgId)));
+            toDelete = cloudInv.filter(c => !localKeys.has(looseKey(c.folder, c.name)));
+        }
+
+        for (let i = 0; i < toUpload.length; i++) {
+            lockUI(`☁️ Img: Pushing ${i + 1}/${toUpload.length}...`);
+            await bunnyRequest('PUT', toUpload[i].path, await blobToArrayBuffer(toUpload[i].blob));
+            await sleep(100);
+        }
+        for (let i = 0; i < toDelete.length; i++) {
+            lockUI(`🗑️ Img: Removing ${i + 1}/${toDelete.length}...`);
+            await bunnyRequest('DELETE', toDelete[i].path);
+        }
+
+        lockUI('📝 Saving set titles...');
+        await putJSON(IMAGE_MANIFEST, {
+            version: 1,
+            updatedAt: new Date().toISOString(),
+            sets: localSets.map(s => ({ title: s.title, order: typeof s.order === 'number' ? s.order : null }))
+        });
+
+        if (force) return unlockUI(`✅ Force Mirror Complete! Pushed ${toUpload.length} images.`);
+        if (!toUpload.length && !toDelete.length) return unlockUI('✅ Images up to date (titles synced).');
+        unlockUI(`✅ Image Backup: Uploaded ${toUpload.length}, Removed ${toDelete.length}.`);
+    }
+
+    async function pullImages() {
+        lockUI('📥 Fetching Image Inventory...');
+        const imgDb = await getImageDb();
+        if (!imgDb) throw new Error('Image DB not initialized.');
+
+        const manifest = await fetchJSON(IMAGE_MANIFEST);
+        const titleByKey = new Map();
+        if (manifest && Array.isArray(manifest.sets)) {
+            manifest.sets.forEach(s => { if (s && s.title) titleByKey.set(looseKey(s.title, ''), s); });
+        }
+
+        const localSets = await getLocalImageSets(imgDb);
+        const cloudInv = await getCloudInventory(IMAGE_DIR, IMAGE_EXT_RE);
+
+        const localKeys = new Set();
+        localSets.forEach(s => (s.images || []).forEach(i => localKeys.add(looseKey(s.title, i.id))));
+        const toDownload = cloudInv.filter(c => !localKeys.has(looseKey(c.folder, c.name)));
+
+        const dirty = new Set();
+
+        // Repair mangled set titles
+        localSets.forEach(s => {
+            const m = titleByKey.get(looseKey(s.title, ''));
+            if (m && m.title !== s.title) { s.title = m.title; dirty.add(s); }
+        });
+        const repaired = dirty.size;
+
+        // Download everything first (network), write to DB afterwards in one transaction
+        for (let i = 0; i < toDownload.length; i++) {
+            lockUI(`📥 Img: Pulling ${i + 1}/${toDownload.length}...`);
+            const file = toDownload[i];
+            const setKey = looseKey(file.folder, '');
+            let set = localSets.find(s => looseKey(s.title, '') === setKey);
+            if (!set) {
+                const m = titleByKey.get(setKey);
+                set = {
+                    id: 'set_' + Date.now() + Math.random(),
+                    title: m ? m.title : file.folder,
+                    images: [],
+                    order: m && typeof m.order === 'number' ? m.order : localSets.length + 1
+                };
+                localSets.push(set);
+            }
+            const blob = await bunnyRequest('GET', file.path, null, 'blob');
+            const thumb = await compressThumbnail(blob);
+            set.images = set.images || [];
+            set.images.push({ id: file.name, type: blob.type || 'image/jpeg', blob, thumb });
+            dirty.add(set);
+            await sleep(100);
+        }
+
+        if (!dirty.size) return unlockUI('✅ Local images are fully synced.');
+
+        const tx = imgDb.transaction(['sets'], 'readwrite');
+        const store = tx.objectStore('sets');
+        dirty.forEach(s => store.put(s));
+        await txDone(tx);
+
+        unlockUI(`✅ Images: Pulled ${toDownload.length} · Repaired ${repaired} set title(s)`);
+    }
+
+    // ============================================================
+    // UI
+    // ============================================================
     const style = document.createElement('style');
     style.innerHTML = `
       .ig-csc-wrap { display:flex; flex-direction:column; gap:10px; font-size:11px; color:#fff; }
@@ -7517,9 +8023,9 @@ LegoCore.registerBlock({
       <div class="ig-csc-box">
         <div class="ig-csc-title">🔴 Audio Library</div>
         <div class="ig-csc-row">
-            <button class="ig-csc-btn ig-csc-btn-green" id="ig-csc-push-audio" title="Upload new clips & remove deleted ones">☁️ Smart Backup</button>
-            <button class="ig-csc-btn ig-csc-btn-blue" id="ig-csc-pull-audio" title="Download missing clips">📥 Pull</button>
-            <button class="ig-csc-btn ig-csc-btn-red" id="ig-csc-force-audio" title="Wipe cloud storage and rewrite from local">♻️ Force</button>
+            <button class="ig-csc-btn ig-csc-btn-green" id="ig-csc-push-audio" title="Upload new clips, remove deleted ones, sync names & details">☁️ Smart Backup</button>
+            <button class="ig-csc-btn ig-csc-btn-blue" id="ig-csc-pull-audio" title="Download missing clips and fix names & details">📥 Pull</button>
+            <button class="ig-csc-btn ig-csc-btn-red" id="ig-csc-force-audio" title="Rewrite the whole cloud copy from this computer">♻️ Force</button>
         </div>
       </div>
 
@@ -7527,8 +8033,8 @@ LegoCore.registerBlock({
         <div class="ig-csc-title">🖼️ Image Sets</div>
         <div class="ig-csc-row">
             <button class="ig-csc-btn ig-csc-btn-green" id="ig-csc-push-img" title="Upload new images & remove deleted ones">☁️ Smart Backup</button>
-            <button class="ig-csc-btn ig-csc-btn-blue" id="ig-csc-pull-img" title="Download missing images">📥 Pull</button>
-            <button class="ig-csc-btn ig-csc-btn-red" id="ig-csc-force-img" title="Wipe cloud storage and rewrite from local">♻️ Force</button>
+            <button class="ig-csc-btn ig-csc-btn-blue" id="ig-csc-pull-img" title="Download missing images and fix set titles">📥 Pull</button>
+            <button class="ig-csc-btn ig-csc-btn-red" id="ig-csc-force-img" title="Rewrite the whole cloud copy from this computer">♻️ Force</button>
         </div>
       </div>
       <div id="ig-csc-status-bar" class="ig-csc-status">Ready.</div>
@@ -7540,7 +8046,6 @@ LegoCore.registerBlock({
     }
     mountCard();
 
-    // UI State Management
     const statusEl = wrap.querySelector('#ig-csc-status-bar');
     const allBtns = Array.from(wrap.querySelectorAll('.ig-csc-btn'));
 
@@ -7549,7 +8054,7 @@ LegoCore.registerBlock({
         prefs.apiKey = wrap.querySelector('#ig-csc-key').value.trim();
         prefs.region = wrap.querySelector('#ig-csc-region').value;
         savePrefs();
-        return prefs.zoneName && prefs.apiKey;
+        return !!(prefs.zoneName && prefs.apiKey);
     }
 
     function lockUI(msg) {
@@ -7566,202 +8071,47 @@ LegoCore.registerBlock({
     wrap.querySelector('#ig-csc-key').onchange = setCreds;
     wrap.querySelector('#ig-csc-region').onchange = setCreds;
 
-    // --- MASTER CONFIG LOGIC ---
-    wrap.querySelector('#ig-csc-push-master').onclick = async () => {
-        if (!setCreds()) return unlockUI('❌ Missing credentials.', true);
+    // Wraps every button: credentials check, optional confirm, error display
+    function action(fn, confirmMsg) {
+        return async () => {
+            if (!setCreds()) return unlockUI('❌ Missing credentials.', true);
+            if (confirmMsg && !confirm(confirmMsg)) return;
+            try { await fn(); }
+            catch (e) { console.error('[CloudSyncCenter]', e); unlockUI(`❌ ${e.message}`, true); }
+        };
+    }
+
+    // --- MASTER CONFIG ---
+    wrap.querySelector('#ig-csc-push-master').onclick = action(async () => {
         lockUI('☁️ Pushing Master Config...');
-        try {
-            let payload = {};
-            MASTER_KEYS.forEach(k => { const val = localStorage.getItem(k); if (val !== null) payload[k] = val; });
-            const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
-            const arrayBuf = await blobToArrayBuffer(blob);
-            await bunnyRequest('PUT', 'ig_master_config/master_config.json', arrayBuf);
-            unlockUI('✅ Master Config pushed!');
-        } catch (e) { unlockUI(`❌ ${e.message}`, true); }
-    };
+        const payload = {};
+        MASTER_KEYS.forEach(k => { const val = localStorage.getItem(k); if (val !== null) payload[k] = val; });
+        await putJSON('ig_master_config/master_config.json', payload);
+        unlockUI('✅ Master Config pushed!');
+    });
 
-    wrap.querySelector('#ig-csc-pull-master').onclick = async () => {
-        if (!setCreds()) return unlockUI('❌ Missing credentials.', true);
-        if (!confirm("⚠️ Overwrite local text, sequences, emojis, and layouts with cloud config?")) return;
+    wrap.querySelector('#ig-csc-pull-master').onclick = action(async () => {
         lockUI('📥 Pulling Master Config...');
-        try {
-            const data = await bunnyRequest('GET', 'ig_master_config/master_config.json');
-            if (!data || typeof data !== 'object') throw new Error("Invalid cloud file.");
-            Object.keys(data).forEach(k => { if (MASTER_KEYS.includes(k)) localStorage.setItem(k, data[k]); });
-            unlockUI('✅ Config imported! Reloading...');
-            setTimeout(() => window.location.reload(), 1000);
-        } catch (e) { unlockUI(`❌ ${e.message}`, true); }
-    };
+        const data = await bunnyRequest('GET', 'ig_master_config/master_config.json');
+        if (!data || typeof data !== 'object') throw new Error('Invalid cloud file.');
+        Object.keys(data).forEach(k => { if (MASTER_KEYS.includes(k)) localStorage.setItem(k, data[k]); });
+        unlockUI('✅ Config imported! Reloading...');
+        setTimeout(() => window.location.reload(), 1000);
+    }, '⚠️ Overwrite local text, sequences, emojis, and layouts with cloud config?');
 
-    // --- AUDIO LOGIC ---
-    wrap.querySelector('#ig-csc-push-audio').onclick = async () => {
-        if (!setCreds()) return unlockUI('❌ Missing credentials.', true);
-        lockUI('☁️ Scanning Audio...');
-        try {
-            const localClips = await getLocalClips();
-            const cloudInv = await getCloudInventory('ig_audio_backup', /\.m4a$/i);
+    // --- AUDIO ---
+    wrap.querySelector('#ig-csc-push-audio').onclick = action(() => pushAudio(false));
+    wrap.querySelector('#ig-csc-pull-audio').onclick = action(() => pullAudio());
+    wrap.querySelector('#ig-csc-force-audio').onclick = action(() => pushAudio(true),
+        '⚠️ Rewrite the cloud audio from THIS computer?\nClips that only exist in the cloud will be removed.');
 
-            const localKeys = new Set(localClips.map(c => compareKey(c.folder, c.name)));
-            const cloudKeys = new Set(cloudInv.map(c => compareKey(c.folder, c.name)));
+    // --- IMAGES ---
+    wrap.querySelector('#ig-csc-push-img').onclick = action(() => pushImages(false));
+    wrap.querySelector('#ig-csc-pull-img').onclick = action(() => pullImages());
+    wrap.querySelector('#ig-csc-force-img').onclick = action(() => pushImages(true),
+        '⚠️ Rewrite the cloud images from THIS computer?\nImages that only exist in the cloud will be removed.');
 
-            const toUpload = localClips.filter(c => !cloudKeys.has(compareKey(c.folder, c.name)));
-            const toDelete = cloudInv.filter(c => !localKeys.has(compareKey(c.folder, c.name)));
-
-            if (!toUpload.length && !toDelete.length) return unlockUI('✅ Audio is up to date.');
-
-            for (let i=0; i<toDelete.length; i++) { lockUI(`🗑️ Audio: Deleting ${i+1}/${toDelete.length}...`); await bunnyRequest('DELETE', toDelete[i].path); }
-            for (let i=0; i<toUpload.length; i++) {
-                lockUI(`☁️ Audio: Pushing ${i+1}/${toUpload.length}...`);
-                const c = toUpload[i];
-                await bunnyRequest('PUT', `ig_audio_backup/${encodeURIComponent(safeString(c.folder))}/${encodeURIComponent(safeString(c.name))}.m4a`, await blobToArrayBuffer(c.blob));
-                await new Promise(r => setTimeout(r, 100));
-            }
-            unlockUI(`✅ Audio Backup: Uploaded ${toUpload.length}, Deleted ${toDelete.length}.`);
-        } catch (e) { unlockUI(`❌ ${e.message}`, true); }
-    };
-
-    wrap.querySelector('#ig-csc-pull-audio').onclick = async () => {
-        if (!setCreds()) return unlockUI('❌ Missing credentials.', true);
-        lockUI('📥 Fetching Audio Inventory...');
-        try {
-            const localClips = await getLocalClips();
-            const cloudInv = await getCloudInventory('ig_audio_backup', /\.m4a$/i);
-            const localKeys = new Set(localClips.map(c => compareKey(c.folder, c.name)));
-            const toDownload = cloudInv.filter(c => !localKeys.has(compareKey(c.folder, c.name)));
-
-            if (!toDownload.length) return unlockUI('✅ Local audio is fully synced.');
-
-            for (let i=0; i<toDownload.length; i++) {
-                lockUI(`📥 Audio: Pulling ${i+1}/${toDownload.length}...`);
-                const c = toDownload[i];
-                const blob = await bunnyRequest('GET', c.path, null, 'blob');
-                await saveClipToLocalDB({ name: c.name, folder: c.folder, blob: blob, color: '#0095f6', customCommand: '' });
-                await new Promise(r => setTimeout(r, 100));
-            }
-            unlockUI(`✅ Audio Pulled: ${toDownload.length} clips.`);
-        } catch (e) { unlockUI(`❌ ${e.message}`, true); }
-    };
-
-    wrap.querySelector('#ig-csc-force-audio').onclick = async () => {
-        if (!setCreds()) return unlockUI('❌ Missing credentials.', true);
-        if (!confirm("⚠️ Wipe cloud audio and rewrite from local database?")) return;
-        lockUI('♻️ Wiping Cloud Audio...');
-        try {
-            const cloudInv = await getCloudInventory('ig_audio_backup', /\.m4a$/i);
-            for (let i=0; i<cloudInv.length; i++) { lockUI(`♻️ Deleting ${i+1}/${cloudInv.length}...`); await bunnyRequest('DELETE', cloudInv[i].path); }
-
-            const localClips = await getLocalClips();
-            for (let i=0; i<localClips.length; i++) {
-                lockUI(`☁️ Audio: Pushing ${i+1}/${localClips.length}...`);
-                const c = localClips[i];
-                await bunnyRequest('PUT', `ig_audio_backup/${encodeURIComponent(safeString(c.folder))}/${encodeURIComponent(safeString(c.name))}.m4a`, await blobToArrayBuffer(c.blob));
-                await new Promise(r => setTimeout(r, 100));
-            }
-            unlockUI(`✅ Force Mirror Complete! Pushed ${localClips.length} clips.`);
-        } catch (e) { unlockUI(`❌ ${e.message}`, true); }
-    };
-
-    // --- IMAGE LOGIC ---
-    wrap.querySelector('#ig-csc-push-img').onclick = async () => {
-        if (!setCreds()) return unlockUI('❌ Missing credentials.', true);
-        lockUI('☁️ Scanning Images...');
-        try {
-            const imgDb = await getImageDb();
-            const localSets = await getLocalImageSets(imgDb);
-            const cloudInv = await getCloudInventory('ig_image_backup', /\.(jpg|png|jpeg)$/i);
-
-            let localImgs = [];
-            localSets.forEach(s => s.images.forEach(i => localImgs.push({ setTitle: s.title, imgId: i.id, blob: i.blob, type: i.type })));
-
-            const localKeys = new Set(localImgs.map(i => compareKey(i.setTitle, i.imgId)));
-            const cloudKeys = new Set(cloudInv.map(c => compareKey(c.folder, c.name)));
-
-            const toUpload = localImgs.filter(i => !cloudKeys.has(compareKey(i.setTitle, i.imgId)));
-            const toDelete = cloudInv.filter(c => !localKeys.has(compareKey(c.folder, c.name)));
-
-            if (!toUpload.length && !toDelete.length) return unlockUI('✅ Images are up to date.');
-
-            for (let i=0; i<toDelete.length; i++) { lockUI(`🗑️ Img: Deleting ${i+1}/${toDelete.length}...`); await bunnyRequest('DELETE', toDelete[i].path); }
-            for (let i=0; i<toUpload.length; i++) {
-                lockUI(`☁️ Img: Pushing ${i+1}/${toUpload.length}...`);
-                const img = toUpload[i];
-                const ext = img.type ? img.type.split('/')[1] : 'jpeg';
-                await bunnyRequest('PUT', `ig_image_backup/${encodeURIComponent(safeString(img.setTitle))}/${encodeURIComponent(safeString(img.imgId))}.${ext}`, await blobToArrayBuffer(img.blob));
-                await new Promise(r => setTimeout(r, 100));
-            }
-            unlockUI(`✅ Image Backup: Uploaded ${toUpload.length}, Deleted ${toDelete.length}.`);
-        } catch (e) { unlockUI(`❌ ${e.message}`, true); }
-    };
-
-    wrap.querySelector('#ig-csc-pull-img').onclick = async () => {
-        if (!setCreds()) return unlockUI('❌ Missing credentials.', true);
-        lockUI('📥 Fetching Image Inventory...');
-        try {
-            const imgDb = await getImageDb();
-            if (!imgDb) throw new Error("Image DB not initialized.");
-            const localSets = await getLocalImageSets(imgDb);
-            const cloudInv = await getCloudInventory('ig_image_backup', /\.(jpg|png|jpeg)$/i);
-
-            let localImgs = [];
-            localSets.forEach(s => s.images.forEach(i => localImgs.push({ setTitle: s.title, imgId: i.id })));
-
-            const localKeys = new Set(localImgs.map(i => compareKey(i.setTitle, i.imgId)));
-            const toDownload = cloudInv.filter(c => !localKeys.has(compareKey(c.folder, c.name)));
-
-            if (!toDownload.length) return unlockUI('✅ Local images are fully synced.');
-
-            const tx = imgDb.transaction(['sets'], 'readwrite');
-            const store = tx.objectStore('sets');
-            const setGroups = {};
-            toDownload.forEach(c => { if (!setGroups[c.folder]) setGroups[c.folder] = []; setGroups[c.folder].push(c); });
-
-            let dCount = 0;
-            for (let setName of Object.keys(setGroups)) {
-                let existingSet = localSets.find(s => compareKey(s.title, '') === compareKey(setName, ''));
-                if (!existingSet) {
-                    existingSet = { id: 'set_' + Date.now() + Math.random(), title: setName, images: [], order: localSets.length + 1 };
-                    localSets.push(existingSet);
-                }
-                for (let file of setGroups[setName]) {
-                    dCount++; lockUI(`📥 Img: Pulling ${dCount}/${toDownload.length}...`);
-                    const blob = await bunnyRequest('GET', file.path, null, 'blob');
-                    const thumb = await compressThumbnail(blob);
-                    existingSet.images.push({ id: file.name, type: blob.type || 'image/jpeg', blob: blob, thumb: thumb });
-                    await new Promise(r => setTimeout(r, 100));
-                }
-                store.put(existingSet);
-            }
-            tx.oncomplete = () => unlockUI(`✅ Images Pulled: ${toDownload.length} files.`);
-        } catch (e) { unlockUI(`❌ ${e.message}`, true); }
-    };
-
-    wrap.querySelector('#ig-csc-force-img').onclick = async () => {
-        if (!setCreds()) return unlockUI('❌ Missing credentials.', true);
-        if (!confirm("⚠️ Wipe cloud images and rewrite from local database?")) return;
-        lockUI('♻️ Wiping Cloud Images...');
-        try {
-            const cloudInv = await getCloudInventory('ig_image_backup', /\.(jpg|png|jpeg)$/i);
-            for (let i=0; i<cloudInv.length; i++) { lockUI(`♻️ Deleting ${i+1}/${cloudInv.length}...`); await bunnyRequest('DELETE', cloudInv[i].path); }
-
-            const imgDb = await getImageDb();
-            const localSets = await getLocalImageSets(imgDb);
-            let allLocalImgs = [];
-            localSets.forEach(s => s.images.forEach(i => allLocalImgs.push({ setTitle: s.title, imgId: i.id, blob: i.blob, type: i.type })));
-
-            if (!allLocalImgs.length) return unlockUI('✅ Cloud wiped. No local images to push.');
-
-            for (let i=0; i<allLocalImgs.length; i++) {
-                lockUI(`☁️ Img: Pushing ${i+1}/${allLocalImgs.length}...`);
-                const img = allLocalImgs[i];
-                const ext = img.type ? img.type.split('/')[1] : 'jpeg';
-                await bunnyRequest('PUT', `ig_image_backup/${encodeURIComponent(safeString(img.setTitle))}/${encodeURIComponent(safeString(img.imgId))}.${ext}`, await blobToArrayBuffer(img.blob));
-                await new Promise(r => setTimeout(r, 100));
-            }
-            unlockUI(`✅ Force Mirror Complete! Pushed ${allLocalImgs.length} images.`);
-        } catch (e) { unlockUI(`❌ ${e.message}`, true); }
-    };
-
-    console.log('[CloudSyncCenterModule] Unified Sync UI active.');
+    console.log('[CloudSyncCenterModule] v4 — exact names + manifests active.');
     core.emit('block:ready', { id: 'cloudSyncCenterModule' });
   }
 });
