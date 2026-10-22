@@ -21,6 +21,15 @@
    ============================================================ */
 /* ================================================================
    CORE ENGINE: Instagram Soundboard & Chat Infrastructure (Safe & Clean)
+   v4 — 🧠 Memory fix
+        - Audio clips + image sets are loaded ONCE and shared by every block
+          (search, Commands, Sequences, sequence repair). Before, each of them
+          re-loaded every audio file and every image on every keystroke/change.
+        - The shared copy is refreshed only when something actually changes
+          (save, rename, delete, sync) — or after 30 s at most, as a safety net.
+        - Sending re-reads the one item it sends, fresh from the database.
+        - Permanent IDs are written in ONE pass per session (no repeated rewrites
+          of every audio file if a write fails).
    v3 — 🔗 Permanent IDs for sequences
         - Every audio clip gets a permanent "syncId" the moment it is read
           (same ID on every computer once synced). Image sets get one too.
@@ -287,9 +296,11 @@ const LegoCore = (function () {
 
     // Gives every clip a permanent syncId. Only touches clips that don't have one yet.
     // If the write fails, the clips are left without one (a half-saved ID would be worse).
+    const syncIdTried = new Set(); // clips we already tried this session (never rewrite them twice)
     function ensureClipSyncIds(readyDb, clips) {
-        const missing = clips.filter(c => c && c.id !== undefined && c.id !== null && !c.syncId);
+        const missing = clips.filter(c => c && c.id !== undefined && c.id !== null && !c.syncId && !syncIdTried.has(c.id));
         if (!missing.length) return Promise.resolve(clips);
+        missing.forEach(c => syncIdTried.add(c.id));
         const assigned = new Map();
         missing.forEach(c => assigned.set(c.id, newSyncId()));
         return new Promise(resolve => {
@@ -339,9 +350,11 @@ const LegoCore = (function () {
     }
 
     // Image sets: the permanent ID is "syncId". First time, it is simply the set's own id.
+    const setSyncIdTried = new Set();
     function ensureSetSyncIds(idb, sets) {
-        const missing = sets.filter(s => s && s.id && !s.syncId);
+        const missing = sets.filter(s => s && s.id && !s.syncId && !setSyncIdTried.has(s.id));
         if (!missing.length) return Promise.resolve(sets);
+        missing.forEach(s => setSyncIdTried.add(s.id));
         return new Promise(resolve => {
             let tx;
             try { tx = idb.transaction(['sets'], 'readwrite'); } catch (e) { resolve(sets); return; }
@@ -399,13 +412,38 @@ const LegoCore = (function () {
         emit('sequences:updated', getSequences());
     }
 
+    // ONE shared copy of the heavy items (audio + image sets). Text snippets, flows
+    // and sequences live in localStorage and are always read fresh (they're tiny).
+    const CACHE_MAX_AGE_MS = 30000;
+    const heavy = { clips: null, imageSets: null, at: 0, valid: false, pending: null, gen: 0 };
+
+    function invalidateInventory() {
+        heavy.valid = false;
+        heavy.gen++;
+    }
+
+    function loadHeavy() {
+        const fresh = heavy.valid && (Date.now() - heavy.at) < CACHE_MAX_AGE_MS;
+        if (fresh) return Promise.resolve(heavy);
+        if (heavy.pending) return heavy.pending; // everyone waits for the same load
+        const gen = heavy.gen;
+        heavy.pending = Promise.all([getClips(), getImageSets()]).then(([clips, imageSets]) => {
+            heavy.clips = clips;
+            heavy.imageSets = imageSets;
+            heavy.at = Date.now();
+            heavy.valid = (gen === heavy.gen); // something changed while loading → load again next time
+            return heavy;
+        }).finally(() => { heavy.pending = null; });
+        return heavy.pending;
+    }
+
     async function getSearchableInventory() {
-        const [clips, imageSets] = await Promise.all([getClips(), getImageSets()]);
+        const h = await loadHeavy();
         return {
-            clips,
+            clips: (h.clips || []).slice(),
             textItems: getTextSnippets(),
             mcFlows: getMcFlows(),
-            imageSets,
+            imageSets: (h.imageSets || []).slice(),
             sequences: getSequences()
         };
     }
@@ -732,31 +770,82 @@ const LegoCore = (function () {
         return changed;
     }
 
-    // Anything that can rename / move / sync an item → repair the sequences shortly after
-    ['library:refresh', 'folders:refresh', 'textlib:updated', 'textlib:external-refresh',
-     'images:updated', 'images:external-refresh', 'items:renamed'].forEach(evt => on(evt, () => scheduleSequenceRepair()));
+    // Anything that can add / rename / move / delete / sync an item:
+    //   1) drop the shared copy (audio/images only — text is always read fresh)
+    //   2) a moment later: repair sequences, then announce ONE 'inventory:changed'
+    let changedTimer = null;
+    function itemsChanged(heavyToo) {
+        if (heavyToo) invalidateInventory();
+        clearTimeout(changedTimer);
+        changedTimer = setTimeout(() => {
+            scheduleSequenceRepair(0);
+            emit('inventory:changed');
+        }, 300);
+    }
+    ['library:refresh', 'folders:refresh', 'images:updated', 'images:external-refresh', 'items:renamed']
+        .forEach(evt => on(evt, () => itemsChanged(true)));
+    ['textlib:updated', 'textlib:external-refresh'].forEach(evt => on(evt, () => itemsChanged(false)));
 
     // 8. Data Fetcher (ready-to-inject payload, or null when the item can't be found)
     //   audio -> { kind, id, name, blob, transcript }
     //   set   -> { kind, id, title, images: [{ blob, type }] }
     //   text  -> { kind, id, title, text }
+    // Re-reads ONE record fresh from its database (so we never send a stale copy)
+    function getClipById(id) {
+        return whenDbReady().then(readyDb => new Promise(resolve => {
+            try {
+                const req = readyDb.transaction(['clips'], 'readonly').objectStore('clips').get(id);
+                req.onsuccess = () => resolve(req.result || null);
+                req.onerror = () => resolve(null);
+            } catch (e) { resolve(null); }
+        }));
+    }
+    async function getImageSetById(id) {
+        const idb = await openImageDb();
+        if (!idb) return null;
+        if (!idb.objectStoreNames.contains('sets')) { idb.close(); return null; }
+        const rec = await new Promise(resolve => {
+            try {
+                const req = idb.transaction(['sets'], 'readonly').objectStore('sets').get(id);
+                req.onsuccess = () => resolve(req.result || null);
+                req.onerror = () => resolve(null);
+            } catch (e) { resolve(null); }
+        });
+        try { idb.close(); } catch (e) { /* noop */ }
+        return rec;
+    }
+
+    // Finds the item via the shared copy, then confirms it with a fresh read.
+    // If the shared copy was out of date, it is reloaded once and tried again.
+    async function lookupFreshItem(step, retried) {
+        const kind = step.kind;
+        if (kind === 'text') return resolveStep(step, { textItems: getTextSnippets() });
+        const inv = await getSearchableInventory();
+        const hit = findStepItem(step, inv);
+        const fresh = hit ? (kind === 'audio' ? await getClipById(hit.id) : await getImageSetById(hit.id)) : null;
+        const sameItem = fresh && (stableIdOf(kind, fresh) || null) === (stableIdOf(kind, hit) || null)
+            && displayNameOf(kind, fresh) === displayNameOf(kind, hit);
+        if (sameItem) return isUsable(kind, fresh) ? fresh : null;
+        if (retried) return null;
+        invalidateInventory();
+        return lookupFreshItem(step, true);
+    }
+
     async function fetchStepData(step) {
         if (!step || !STEP_KINDS.includes(step.kind)) return null;
         const kind = step.kind;
         try {
+            const item = await lookupFreshItem(step, false);
+            if (!item) return null;
             if (kind === 'audio') {
-                const clip = resolveStep(step, { clips: await getClips() });
-                return clip ? { kind, id: clip.id, name: clip.name || 'clip', blob: clip.blob, transcript: clip.transcript || '' } : null;
+                return { kind, id: item.id, name: item.name || 'clip', blob: item.blob, transcript: item.transcript || '' };
             }
             if (kind === 'set') {
-                const set = resolveStep(step, { imageSets: await getImageSets() });
-                if (!set) return null;
-                const images = set.images.filter(i => i && i.blob).map(i => ({ blob: i.blob, type: i.type || i.blob.type || 'image/jpeg' }));
-                return images.length ? { kind, id: set.id, title: set.title || 'Image set', images } : null;
+                const images = item.images.filter(i => i && i.blob).map(i => ({ blob: i.blob, type: i.type || i.blob.type || 'image/jpeg' }));
+                return images.length ? { kind, id: item.id, title: item.title || 'Image set', images } : null;
             }
             if (kind === 'text') {
-                const item = resolveStep(step, { textItems: getTextSnippets() });
-                return item ? { kind, id: item.id, title: item.title || '', text: item.text } : null;
+                return { kind, id: item.id, title: item.title || '', text: item.text };
             }
         } catch (e) {
             console.error('[LegoCore] fetchStepData error:', e);
@@ -836,7 +925,7 @@ const LegoCore = (function () {
         // drag helpers
         makeDraggable, makeIsolatedDraggable,
         // shared inventory + search
-        getSearchableInventory, searchInventory, scoreInventory, parseSearchPrefix,
+        getSearchableInventory, invalidateInventory, searchInventory, scoreInventory, parseSearchPrefix,
         normalizeStr, getSearchTokens, matchAllTokens, markUsed, getUsageTimestamp,
         // sequence steps (permanent references)
         makeStep, stableIdOf, findStepItem, resolveStep, suggestForStep, repairStep,
@@ -9117,11 +9206,19 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Sequence Manager (v5)
+   BLOCK: Sequence Manager (v7)
    ============================================================ */
 /* ============================================================
-   BLOCK: Sequence Manager (v5 - 🔗 Permanent IDs + Fix missing steps)
-   Built for: LegoCore v3 + Commands v29 (from v28.1) + Quick Chat Box v2
+   BLOCK: Sequence Manager (v5.2 - 🔗 Permanent IDs + Fix missing steps)
+   Built for: LegoCore v4 + Commands v29 (from v28.1) + Quick Chat Box v2
+   v5.2:
+   - 🧠 Memory: reloads ONCE per change (LegoCore's 'inventory:changed') using
+     the shared item copy, instead of re-loading every audio + image 2–3 times
+   v5.1:
+   - FIX: a snippet / audio / image set created AFTER the Sequences card loaded
+     showed ⚠️ "not found" in the builder (sending still worked). The card now
+     reloads its item list whenever items are added, renamed, deleted or synced,
+     and an item picked from the dropdown always counts as found.
    v5:
    - Steps point at the item's PERMANENT ID (same on every computer), not the
      local database number → no more "random audio" on the other computer
@@ -9627,9 +9724,21 @@ LegoCore.registerBlock({
       if (opts && opts.scrollToEnd) draftZone.scrollTop = draftZone.scrollHeight;
     }
 
+    // The dropdown searched fresh data, so the picked item exists — make sure the
+    // builder's item list knows about it too (it may be newer than the last reload)
+    function rememberPickedItem(kind, item) {
+      if (!lastInventory || !item) return;
+      const key = kind === 'audio' ? 'clips' : kind === 'set' ? 'imageSets' : kind === 'text' ? 'textItems' : null;
+      if (!key) return;
+      const list = lastInventory[key] = Array.isArray(lastInventory[key]) ? lastInventory[key] : [];
+      const i = list.findIndex(x => x && x.id === item.id);
+      if (i === -1) list.push(item); else list[i] = item;
+    }
+
     function addStepFromMatch(m) {
       const step = core.makeStep(m.kind, m.item); // permanent ID, not the local number
       if (!step) return;
+      rememberPickedItem(m.kind, m.item);
       cmdInput.value = '';
       closeDropdown();
       if (replaceIdx !== null && replaceIdx < draft.steps.length) {
@@ -10546,6 +10655,10 @@ LegoCore.registerBlock({
     });
     core.on('sequence:step', () => renderHud());
     core.on('sequences:updated', () => renderList());
+
+    // Items added / renamed / deleted / synced anywhere → LegoCore announces it once
+    // (refreshes ⚠️ in the builder and the saved list)
+    core.on('inventory:changed', () => renderList());
     core.on('tagcolors:updated', () => { renderList(); if (dropdownOpen) renderDropdown(); }); // 🎨 re-color tags live
     // ✏️ on a sequence row in the /commands dropdown -> open it here in the builder
     core.on('sequence:edit-request', (payload) => {
@@ -10556,7 +10669,6 @@ LegoCore.registerBlock({
       if (card) card.scrollIntoView({ block: 'nearest', inline: 'nearest' });
       startEditing(seq);
     });
-    ['library:refresh', 'folders:refresh', 'images:external-refresh'].forEach(evt => core.on(evt, () => renderList()));
 
     /* ---------------------------------------------------------
        MOUNT
