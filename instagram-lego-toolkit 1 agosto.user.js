@@ -2,7 +2,7 @@
 // @name         Instagram Lego Toolkit
 // @namespace    https://node-builder.local/
 // @version      1.0.0
-// @description  Compiled by Node Builder -- 28 block(s): Quick Message Recorder, Sidebar Plugin Manager, Recorder Studio, Audio Library, Dual Sidebar UI Shell, menuCollapseModule, Menu Panel Switcher Module, Menu Card Pop-out Module, Header Toolbar Organizer Module, Workspace Profile & Visibility Manager, Instagram Resizer Feature, Sidebar-to-Resizer Sync, Quick Chat Box, Text Library Module (Saved Snippets), image manager, Highlighter, Commands, Reorder Module, Text Library Height Fix (v1), Reset menus, Image Library, Emoji Module, Mobile Core, Mobile Bottom Sheet UI, Master Config Bunny Sync, native emoji picker, Sequence Manager, Tag Colors
+// @description  Compiled by Node Builder -- 29 block(s): Quick Message Recorder, Sidebar Plugin Manager, Recorder Studio, Audio Library, Dual Sidebar UI Shell, menuCollapseModule, Menu Panel Switcher Module, Menu Card Pop-out Module, Header Toolbar Organizer Module, Workspace Profile & Visibility Manager, Instagram Resizer Feature, Sidebar-to-Resizer Sync, Quick Chat Box, Text Library Module (Saved Snippets), image manager, Highlighter, Commands, Reorder Module, Text Library Height Fix (v1), Reset menus, Image Library, Emoji Module, Mobile Core, Mobile Bottom Sheet UI, Master Config Bunny Sync, native emoji picker, Sequence Manager, Tag Colors, Audio Engine
 // @author       You
 // @match        https://www.instagram.com/*
 // @grant        GM_xmlhttpRequest
@@ -21,6 +21,18 @@
    ============================================================ */
 /* ================================================================
    CORE ENGINE: Instagram Soundboard & Chat Infrastructure (Safe & Clean)
+   v3 — 🔗 Permanent IDs for sequences
+        - Every audio clip gets a permanent "syncId" the moment it is read
+          (same ID on every computer once synced). Image sets get one too.
+          Text snippets already had one (their id travels with the master config).
+        - Sequence steps now point at that permanent ID ("ref"), not at the
+          local database number. The local number is different on each
+          computer — that was the "random audio" bug.
+        - Step lookup: permanent ID → exact name (only if it's the ONLY match)
+          → skip with ⚠️. It never sends "whatever has that number" anymore.
+        - Automatic repair: whenever something is renamed/moved/synced, every
+          sequence step's title (and audio folder) follows the item, and old
+          steps are converted to permanent IDs when it's 100% safe.
    v2 — Shared Inventory Search (v28.1 token/MRU engine) + Image Set Bridge
         + Sequence State
    Handles IndexedDB storage, hotkey configurations, chat injection
@@ -102,6 +114,12 @@ const LegoCore = (function () {
     }
     function norm(s) { return String(s === undefined || s === null ? '' : s).trim().toLowerCase(); }
 
+    // Permanent IDs (same format the Sync Center uses)
+    function newSyncId() {
+        if (window.crypto && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+        return 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 12);
+    }
+
     // 2. Shortcut Configurations
     const getShortcutConfig = (action, defaultKey, defaultMod) => {
         return {
@@ -164,7 +182,7 @@ const LegoCore = (function () {
         return true;
     }
 
-    // NEW: packages a whole image set into ONE DataTransfer (one drop = one album)
+    // Packages a whole image set into ONE DataTransfer (one drop = one album)
     function injectImageSetToChat(imagesArray, opts = {}) {
         const images = (imagesArray || []).filter(img => img && img.blob);
         if (!images.length) return false;
@@ -258,7 +276,6 @@ const LegoCore = (function () {
             if (!dragging) return;
             dragging = false;
             header.style.cursor = "grab";
-            // FIX: previously removed `onMouseMove` (undefined here) -> ReferenceError on drop
             document.removeEventListener('mousemove', onMove);
             document.removeEventListener('mouseup', onUp);
             const rect = panel.getBoundingClientRect();
@@ -267,6 +284,37 @@ const LegoCore = (function () {
     }
 
     // 5. Shared Data Readers
+
+    // Gives every clip a permanent syncId. Only touches clips that don't have one yet.
+    // If the write fails, the clips are left without one (a half-saved ID would be worse).
+    function ensureClipSyncIds(readyDb, clips) {
+        const missing = clips.filter(c => c && c.id !== undefined && c.id !== null && !c.syncId);
+        if (!missing.length) return Promise.resolve(clips);
+        const assigned = new Map();
+        missing.forEach(c => assigned.set(c.id, newSyncId()));
+        return new Promise(resolve => {
+            let tx;
+            try { tx = readyDb.transaction(['clips'], 'readwrite'); } catch (e) { resolve(clips); return; }
+            const store = tx.objectStore('clips');
+            missing.forEach(c => {
+                const req = store.get(c.id);
+                req.onsuccess = () => {
+                    const rec = req.result;
+                    if (!rec) { assigned.delete(c.id); return; }
+                    if (rec.syncId) { assigned.set(c.id, rec.syncId); return; } // someone else got there first
+                    rec.syncId = assigned.get(c.id);
+                    store.put(rec);
+                };
+            });
+            tx.oncomplete = () => {
+                missing.forEach(c => { if (assigned.has(c.id)) c.syncId = assigned.get(c.id); });
+                resolve(clips);
+            };
+            tx.onerror = () => resolve(clips);
+            tx.onabort = () => resolve(clips);
+        });
+    }
+
     function getClips() {
         return whenDbReady().then(readyDb => new Promise(resolve => {
             try {
@@ -274,7 +322,7 @@ const LegoCore = (function () {
                 req.onsuccess = e => resolve(e.target.result || []);
                 req.onerror = () => resolve([]);
             } catch (e) { resolve([]); }
-        }));
+        }).then(clips => ensureClipSyncIds(readyDb, clips)));
     }
 
     // Opens the Image Sets DB WITHOUT ever creating it: if it doesn't exist yet,
@@ -290,20 +338,44 @@ const LegoCore = (function () {
         });
     }
 
+    // Image sets: the permanent ID is "syncId". First time, it is simply the set's own id.
+    function ensureSetSyncIds(idb, sets) {
+        const missing = sets.filter(s => s && s.id && !s.syncId);
+        if (!missing.length) return Promise.resolve(sets);
+        return new Promise(resolve => {
+            let tx;
+            try { tx = idb.transaction(['sets'], 'readwrite'); } catch (e) { resolve(sets); return; }
+            const store = tx.objectStore('sets');
+            const got = new Map();
+            missing.forEach(s => {
+                const req = store.get(s.id);
+                req.onsuccess = () => {
+                    const rec = req.result;
+                    if (!rec) return;
+                    if (!rec.syncId) { rec.syncId = rec.id; store.put(rec); }
+                    got.set(s.id, rec.syncId);
+                };
+            });
+            tx.oncomplete = () => { missing.forEach(s => { if (got.has(s.id)) s.syncId = got.get(s.id); }); resolve(sets); };
+            tx.onerror = () => resolve(sets);
+            tx.onabort = () => resolve(sets);
+        });
+    }
+
     async function getImageSets() {
         const idb = await openImageDb();
         if (!idb) return [];
         if (!idb.objectStoreNames.contains('sets')) { idb.close(); return []; }
-        return new Promise(resolve => {
+        const sets = await new Promise(resolve => {
             try {
-                const tx = idb.transaction(['sets'], 'readonly');
-                const req = tx.objectStore('sets').getAll();
+                const req = idb.transaction(['sets'], 'readonly').objectStore('sets').getAll();
                 req.onsuccess = ev => resolve(ev.target.result || []);
                 req.onerror = () => resolve([]);
-                tx.oncomplete = () => idb.close();
-                tx.onabort = () => idb.close();
-            } catch (e) { idb.close(); resolve([]); }
+            } catch (e) { resolve([]); }
         });
+        await ensureSetSyncIds(idb, sets);
+        try { idb.close(); } catch (e) { /* noop */ }
+        return sets;
     }
 
     function getTextSnippets() {
@@ -350,7 +422,7 @@ const LegoCore = (function () {
     function normalizeStr(str) {
         return String(str || '')
             .normalize('NFD')
-            .replace(/[̀-ͯ]/g, '')
+            .replace(/[\u0300-\u036f]/g, '')
             .toLowerCase()
             .replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?"'¡¿]/g, ' ')
             .replace(/\s+/g, ' ')
@@ -472,52 +544,205 @@ const LegoCore = (function () {
         return scoreInventory(query, mode, inventory, opts);
     }
 
-    // 7. Step Resolution + Data Fetcher
-    //    Steps store { kind, refId, title, folder? }. The id is tried first, but because
-    //    audio ids (autoIncrement) and pulled image-set ids differ between devices after a
-    //    Bunny sync, title (+folder) is used as a fallback so synced sequences keep working.
-    function resolveFromList(list, step, getId, getName, getFolder) {
-        const idStr = String(step.refId === undefined || step.refId === null ? '' : step.refId);
-        const title = norm(step.title);
-        const folder = step.folder !== undefined && step.folder !== null ? norm(step.folder) : null;
+    // 7. Sequence Steps — permanent references
+    //    New step shape: { kind, ref, title, folder? }
+    //      ref   = permanent ID (audio: syncId · set: syncId · text: id)
+    //      title = display label only — kept up to date automatically
+    //    Old steps (before v3) have { kind, refId, title, folder? } where refId is the
+    //    LOCAL database number. They are converted automatically when it's safe.
+    const STEP_KINDS = ['audio', 'set', 'text'];
 
-        const byId = idStr ? (list.find(x => String(getId(x)) === idStr) || null) : null;
-        if (byId && (!title || norm(getName(byId)) === title)) return byId;
-
-        if (title) {
-            let candidates = list.filter(x => norm(getName(x)) === title);
-            if (folder && getFolder) {
-                const inFolder = candidates.filter(x => norm(getFolder(x) || 'General') === folder);
-                if (inFolder.length) candidates = inFolder;
-            }
-            if (candidates.length) return candidates[0];
-        }
-        return byId; // item was renamed but id still valid
-    }
-
-    function resolveStep(step, inventory) {
-        if (!step || !inventory) return null;
-        if (step.kind === 'audio') {
-            const clip = resolveFromList(inventory.clips || [], step, c => c.id, c => c.name, c => c.folder);
-            return clip && clip.blob ? clip : null;
-        }
-        if (step.kind === 'set') {
-            const set = resolveFromList(inventory.imageSets || [], step, s => s.id, s => s.title);
-            return set && Array.isArray(set.images) && set.images.some(i => i && i.blob) ? set : null;
-        }
-        if (step.kind === 'text') {
-            const item = resolveFromList(inventory.textItems || [], step, t => t.id, t => t.title);
-            return item && item.text ? item : null;
-        }
+    function stableIdOf(kind, item) {
+        if (!item) return null;
+        if (kind === 'audio') return item.syncId || null;
+        if (kind === 'set') return item.syncId || item.id || null;
+        if (kind === 'text') return item.id || null;
         return null;
     }
+    function displayNameOf(kind, item) {
+        if (!item) return '';
+        return String((kind === 'audio' ? item.name : item.title) || '');
+    }
+    function listFor(kind, inv) {
+        if (!inv) return [];
+        if (kind === 'audio') return inv.clips || [];
+        if (kind === 'set') return inv.imageSets || [];
+        if (kind === 'text') return inv.textItems || [];
+        return [];
+    }
+    function isUsable(kind, item) {
+        if (!item) return false;
+        if (kind === 'audio') return !!item.blob;
+        if (kind === 'set') return Array.isArray(item.images) && item.images.some(i => i && i.blob);
+        if (kind === 'text') return !!item.text;
+        return false;
+    }
 
-    // Returns a ready-to-inject payload, or null when the item no longer exists.
+    // Exact name, but ONLY when it points at a single item (audio: folder breaks ties)
+    function uniqueByTitle(kind, list, step) {
+        const title = norm(step.title);
+        if (!title) return null;
+        let candidates = list.filter(x => norm(displayNameOf(kind, x)) === title);
+        if (candidates.length > 1 && kind === 'audio' && step.folder) {
+            const f = norm(step.folder);
+            const inFolder = candidates.filter(x => norm(x.folder || 'General') === f);
+            if (inFolder.length) candidates = inFolder;
+        }
+        return candidates.length === 1 ? candidates[0] : null;
+    }
+
+    // Old steps: the local number is only trusted when
+    //   - audio: the clip with that number STILL has the saved name
+    //     (the number means something different on the other computer)
+    //   - set / text: their ids are unique strings, so a hit is always the same item
+    function legacyMatch(kind, list, step) {
+        if (step.refId === undefined || step.refId === null || step.refId === '') return null;
+        const idStr = String(step.refId);
+        const hit = list.find(x => String(x.id) === idStr);
+        if (!hit) return null;
+        if (kind === 'audio' && norm(hit.name) !== norm(step.title)) return null;
+        return hit;
+    }
+
+    // Finds the item a step points to (even if it can't be sent right now). Never guesses.
+    function findStepItem(step, inventory) {
+        if (!step || !inventory || !STEP_KINDS.includes(step.kind)) return null;
+        const kind = step.kind;
+        const list = listFor(kind, inventory);
+        if (step.ref) {
+            const hit = list.find(x => stableIdOf(kind, x) === step.ref);
+            if (hit) return hit;
+        } else {
+            const legacy = legacyMatch(kind, list, step);
+            if (legacy) return legacy;
+        }
+        return uniqueByTitle(kind, list, step);
+    }
+
+    // Same, but only returns items that can actually be sent
+    function resolveStep(step, inventory) {
+        const item = findStepItem(step, inventory);
+        return item && isUsable(step.kind, item) ? item : null;
+    }
+
+    // For OLD audio steps that can't be confirmed: what the old number points to on THIS
+    // computer. Only ever shown as a suggestion (✓ in the builder) — never sent on its own.
+    function suggestForStep(step, inventory) {
+        if (!step || step.ref || !inventory || findStepItem(step, inventory)) return null;
+        if (step.refId === undefined || step.refId === null || step.refId === '') return null;
+        const hit = listFor(step.kind, inventory).find(x => String(x.id) === String(step.refId));
+        return hit ? { item: hit, title: displayNameOf(step.kind, hit) } : null;
+    }
+
+    // Builds a step for an item (used by the Sequence Manager builder)
+    function makeStep(kind, item) {
+        if (!STEP_KINDS.includes(kind) || !item) return null;
+        const fallback = kind === 'text' ? String(item.text || '').slice(0, 25) : '';
+        const step = { kind, title: displayNameOf(kind, item) || fallback || '(untitled)' };
+        const ref = stableIdOf(kind, item);
+        if (ref) step.ref = ref;
+        else step.refId = item.id; // no permanent ID yet → upgraded automatically on the next repair
+        if (kind === 'audio') step.folder = item.folder || 'General';
+        return step;
+    }
+
+    // Returns a fixed copy of a step, or null if nothing needs to change.
+    function repairStep(step, inventory) {
+        if (!step || !STEP_KINDS.includes(step.kind)) return null;
+        const kind = step.kind;
+        const list = listFor(kind, inventory);
+        const next = Object.assign({}, step);
+        let item = null;
+
+        if (step.ref) {
+            // Only follow the permanent ID here. If it's not on this computer yet, leave it alone.
+            item = list.find(x => stableIdOf(kind, x) === step.ref) || null;
+        } else {
+            item = legacyMatch(kind, list, step) || uniqueByTitle(kind, list, step);
+            const ref = stableIdOf(kind, item);
+            if (item && ref) {
+                next.ref = ref;
+                delete next.refId;
+            } else if (!item && kind === 'text' && step.refId) {
+                // Text ids travel with the master config, so the old id is already permanent
+                next.ref = String(step.refId);
+                delete next.refId;
+            }
+        }
+
+        if (item) {
+            const name = displayNameOf(kind, item);
+            if (name && name !== next.title) next.title = name;
+            if (kind === 'audio') {
+                const folder = item.folder || 'General';
+                if (folder !== next.folder) next.folder = folder;
+            }
+        }
+        return JSON.stringify(next) === JSON.stringify(step) ? null : next;
+    }
+
+    // Runs over every saved sequence: titles follow renames, old steps get permanent IDs.
+    let repairTimer = null;
+    let repairRunning = false;
+    let repairAgain = false;
+
+    function scheduleSequenceRepair(delay) {
+        clearTimeout(repairTimer);
+        repairTimer = setTimeout(runSequenceRepair, delay === undefined ? 400 : delay);
+    }
+
+    async function runSequenceRepair() {
+        if (repairRunning) { repairAgain = true; return; }
+        if (!getSequences().length) return;
+        repairRunning = true;
+        try {
+            const inventory = await getSearchableInventory();
+            const list = getSequences(); // read AFTER the wait, so nothing saved meanwhile is lost
+            let changed = 0;
+            list.forEach(seq => {
+                seq.steps = seq.steps.map(step => {
+                    const fixed = repairStep(step, inventory);
+                    if (fixed) { changed++; return fixed; }
+                    return step;
+                });
+            });
+            if (changed) saveSequences(list);
+        } catch (e) {
+            console.error('[LegoCore] sequence repair error:', e);
+        } finally {
+            repairRunning = false;
+            if (repairAgain) { repairAgain = false; scheduleSequenceRepair(); }
+        }
+    }
+
+    // When a sync gives an item a different permanent ID, point the sequences at the new one.
+    // map: Map or object { oldRef: newRef }
+    function remapSequenceRefs(kind, map) {
+        const entries = map instanceof Map ? map : new Map(Object.entries(map || {}));
+        if (!entries.size) return 0;
+        const list = getSequences();
+        let changed = 0;
+        list.forEach(seq => seq.steps.forEach(step => {
+            if (step && step.kind === kind && step.ref && entries.has(step.ref)) {
+                step.ref = entries.get(step.ref);
+                changed++;
+            }
+        }));
+        if (changed) saveSequences(list);
+        return changed;
+    }
+
+    // Anything that can rename / move / sync an item → repair the sequences shortly after
+    ['library:refresh', 'folders:refresh', 'textlib:updated', 'textlib:external-refresh',
+     'images:updated', 'images:external-refresh', 'items:renamed'].forEach(evt => on(evt, () => scheduleSequenceRepair()));
+
+    // 8. Data Fetcher (ready-to-inject payload, or null when the item can't be found)
     //   audio -> { kind, id, name, blob, transcript }
     //   set   -> { kind, id, title, images: [{ blob, type }] }
     //   text  -> { kind, id, title, text }
-    async function fetchItemData(kind, refId, hint = {}) {
-        const step = Object.assign({}, hint, { kind, refId });
+    async function fetchStepData(step) {
+        if (!step || !STEP_KINDS.includes(step.kind)) return null;
+        const kind = step.kind;
         try {
             if (kind === 'audio') {
                 const clip = resolveStep(step, { clips: await getClips() });
@@ -534,12 +759,17 @@ const LegoCore = (function () {
                 return item ? { kind, id: item.id, title: item.title || '', text: item.text } : null;
             }
         } catch (e) {
-            console.error('[LegoCore] fetchItemData error:', e);
+            console.error('[LegoCore] fetchStepData error:', e);
         }
         return null;
     }
 
-    // 8. Global Sequence State
+    // Kept for older blocks: fetchItemData(kind, refId, step)
+    function fetchItemData(kind, refId, hint = {}) {
+        return fetchStepData(Object.assign({ refId }, hint, { kind }));
+    }
+
+    // 9. Global Sequence State
     let activeSequence = null;   // { id, name, steps: [...] }
     let sequenceStepIndex = 0;
 
@@ -587,18 +817,20 @@ const LegoCore = (function () {
         emit('sequence:ended', { reason, sequence: ended });
     }
 
-    // 9. Block Registry
+    // 10. Block Registry
     const registeredBlocks = [];
     function registerBlock(block) { registeredBlocks.push(block); }
     function boot() {
         registeredBlocks.forEach(b => {
             try { b.init(api); } catch (e) { console.error('[LegoCore] Block init error:', b.id, e); }
         });
+        // First repair pass once everything has loaded
+        setTimeout(() => scheduleSequenceRepair(0), 1500);
     }
 
     const api = {
         on, off, emit, registerBlock, boot,
-        getDb: () => db, whenDbReady, getShortcutConfig, escapeHtml,
+        getDb: () => db, whenDbReady, getShortcutConfig, escapeHtml, newSyncId,
         // injection bridges
         injectClipToChat, injectImageToChat, injectImageSetToChat, injectTextToChat, getActiveChatZone,
         // drag helpers
@@ -606,8 +838,11 @@ const LegoCore = (function () {
         // shared inventory + search
         getSearchableInventory, searchInventory, scoreInventory, parseSearchPrefix,
         normalizeStr, getSearchTokens, matchAllTokens, markUsed, getUsageTimestamp,
+        // sequence steps (permanent references)
+        makeStep, stableIdOf, findStepItem, resolveStep, suggestForStep, repairStep,
+        scheduleSequenceRepair, remapSequenceRefs,
         // items + sequences data
-        fetchItemData, resolveStep, getSequences, saveSequences,
+        fetchStepData, fetchItemData, getSequences, saveSequences,
         // sequence state
         setActiveSequence, getActiveSequence, getSequenceStepIndex, setSequenceStepIndex, cancelSequence
     };
@@ -616,11 +851,18 @@ const LegoCore = (function () {
 })();
 
 /* ============================================================
-   BLOCK: Quick Message Recorder (v1)
+   BLOCK: Quick Message Recorder (v3)
    ============================================================ */
 /* ================================================================
-   BLOCK: Audio Quick Record (Standalone Plugin)
+   BLOCK: Audio Quick Record (Standalone Plugin) (v4 - Delay on/off)
+   v4: Delay On/Off switch (Off = stop instantly). 0 ms now really means 0
+       (before, 0 silently became 800 ms). Also applies to the Commands menu.
    Handles the mini rapid-fire recorder, auto-trim, and auto-send.
+   v3: "Cut start" = Off / Auto / Manual (ms). Manual cuts a fixed
+       amount with no detection. Trim + WAV conversion in ONE pass.
+       These settings also apply to the Commands menu recorder.
+   v2: every recording is converted to WAV mono (needs the
+       "Audio WAV Engine" block; without it, works as before).
 ================================================================ */
 LegoCore.registerBlock({
   id: 'audioQuickRecord',
@@ -632,18 +874,33 @@ LegoCore.registerBlock({
 
     const quickAutoTrimStartPref = localStorage.getItem('sb_quick_autotrim_start') === 'true';
     const quickAutoTrimEndPref = localStorage.getItem('sb_quick_autotrim_end') === 'true';
+    let quickCutMode = localStorage.getItem('sb_quick_cutstart_mode');
+    if (!['off', 'auto', 'manual'].includes(quickCutMode)) quickCutMode = quickAutoTrimStartPref ? 'auto' : 'off';
+    const quickCutMsRaw = parseInt(localStorage.getItem('sb_quick_cutstart_ms'), 10);
+    const quickCutMs = Number.isFinite(quickCutMsRaw) ? quickCutMsRaw : 300;
     const quickAutoSendPref = localStorage.getItem('sb_quick_autosend') === 'true';
     const quickSavedThreshold = localStorage.getItem('sb_quick_silence_threshold') || "0.035";
     const quickSavedLag = localStorage.getItem('sb_quick_trailing_lag') || "800";
+    const quickLagOn = localStorage.getItem('sb_quick_trailing_lag_on') !== 'false';
 
     const quickUI = document.createElement('div');
     quickUI.style.cssText = 'display:flex; flex-direction:column; gap:8px; font-size:10px; color:#fff;';
     quickUI.innerHTML = `
       <div style="background:#18181b; padding:6px; border-radius:4px; display:flex; flex-direction:column; gap:6px; border:1px solid #334155;">
           <div style="display:flex; gap:6px; justify-content:space-between;">
-              <label style="cursor:pointer; display:flex; align-items:center; gap:2px;"><input type="checkbox" id="sb-quick-trim-start-chk" ${quickAutoTrimStartPref ? 'checked' : ''}> Trim Start</label>
               <label style="cursor:pointer; display:flex; align-items:center; gap:2px;"><input type="checkbox" id="sb-quick-trim-end-chk" ${quickAutoTrimEndPref ? 'checked' : ''}> Trim End</label>
               <label style="cursor:pointer; color:#ffb703; display:flex; align-items:center; gap:2px;"><input type="checkbox" id="sb-quick-auto-send-chk" ${quickAutoSendPref ? 'checked' : ''}> Auto Send</label>
+          </div>
+          <div style="display:flex; justify-content:space-between; align-items:center; gap:4px;">
+              <span style="color:#94a3b8;">Cut start:</span>
+              <div style="display:flex; align-items:center; gap:4px;">
+                  <select id="sb-quick-cutstart-mode" title="Manual = always cut a fixed amount (no lag)" style="background:#0f172a; color:#fff; border:1px solid #334155; border-radius:3px; padding:2px; font-size:9px;">
+                      <option value="off" ${quickCutMode === 'off' ? 'selected' : ''}>Off</option>
+                      <option value="auto" ${quickCutMode === 'auto' ? 'selected' : ''}>Auto</option>
+                      <option value="manual" ${quickCutMode === 'manual' ? 'selected' : ''}>Manual</option>
+                  </select>
+                  <input type="number" id="sb-quick-cutstart-ms" value="${quickCutMs}" min="0" step="50" title="Milliseconds to cut from the start" style="width:50px; background:#0f172a; color:#fff; border:1px solid #334155; border-radius:3px; padding:2px; font-size:9px; text-align:center; ${quickCutMode === 'manual' ? '' : 'display:none;'}">
+              </div>
           </div>
           <div style="display:flex; justify-content:space-between; align-items:center;">
               <span style="color:#94a3b8;">Sensitivity:</span>
@@ -653,7 +910,10 @@ LegoCore.registerBlock({
           </div>
           <div style="display:flex; justify-content:space-between; align-items:center;">
               <span style="color:#94a3b8;">Delay (ms):</span>
-              <input type="number" id="sb-quick-trailing-lag-input" value="${quickSavedLag}" step="100" style="width:50px; background:#0f172a; color:#fff; border:1px solid #334155; border-radius:3px; padding:2px; font-size:9px; text-align:center;">
+              <div style="display:flex; align-items:center; gap:4px;">
+                  <label title="Off = stops instantly when you press stop (fastest)" style="cursor:pointer; display:flex; align-items:center; gap:2px;"><input type="checkbox" id="sb-quick-lag-on-chk" ${quickLagOn ? 'checked' : ''}> On</label>
+                  <input type="number" id="sb-quick-trailing-lag-input" value="${quickSavedLag}" min="0" step="100" style="width:50px; background:#0f172a; color:#fff; border:1px solid #334155; border-radius:3px; padding:2px; font-size:9px; text-align:center; ${quickLagOn ? '' : 'display:none;'}">
+              </div>
           </div>
       </div>
       <button id="sb-quick-rec-btn" class="ig-base-btn" style="background:#0284c7; padding:8px; font-size:11px; width:100%; border:none; border-radius:4px; color:white; font-weight:bold; cursor:pointer;">🔴 Quick Record</button>
@@ -673,11 +933,33 @@ LegoCore.registerBlock({
     }
     mountCards();
 
-    quickUI.querySelector('#sb-quick-trim-start-chk').onchange = e => localStorage.setItem('sb_quick_autotrim_start', e.target.checked);
+    const cutModeSel = quickUI.querySelector('#sb-quick-cutstart-mode');
+    const cutMsInput = quickUI.querySelector('#sb-quick-cutstart-ms');
+    cutModeSel.onchange = e => {
+        const mode = e.target.value;
+        localStorage.setItem('sb_quick_cutstart_mode', mode);
+        localStorage.setItem('sb_quick_autotrim_start', String(mode === 'auto')); // keep the old setting in sync
+        cutMsInput.style.display = mode === 'manual' ? '' : 'none';
+    };
+    cutMsInput.onchange = e => {
+        const ms = Math.max(0, parseInt(e.target.value, 10) || 0);
+        e.target.value = ms;
+        localStorage.setItem('sb_quick_cutstart_ms', String(ms));
+    };
     quickUI.querySelector('#sb-quick-trim-end-chk').onchange = e => localStorage.setItem('sb_quick_autotrim_end', e.target.checked);
     quickUI.querySelector('#sb-quick-auto-send-chk').onchange = e => localStorage.setItem('sb_quick_autosend', e.target.checked);
     quickUI.querySelector('#sb-quick-threshold-select').onchange = e => localStorage.setItem('sb_quick_silence_threshold', e.target.value);
     quickUI.querySelector('#sb-quick-trailing-lag-input').onchange = e => localStorage.setItem('sb_quick_trailing_lag', e.target.value);
+    quickUI.querySelector('#sb-quick-lag-on-chk').onchange = e => {
+        localStorage.setItem('sb_quick_trailing_lag_on', String(e.target.checked));
+        quickUI.querySelector('#sb-quick-trailing-lag-input').style.display = e.target.checked ? '' : 'none';
+    };
+    // Delay in ms: Off → 0. An empty/invalid box → 800. A real 0 stays 0.
+    function quickLagMs() {
+        if (!quickUI.querySelector('#sb-quick-lag-on-chk').checked) return 0;
+        const n = parseInt(quickUI.querySelector('#sb-quick-trailing-lag-input').value, 10);
+        return Number.isFinite(n) ? Math.max(0, n) : 800;
+    }
 
     navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
         quickMediaRecorder = new MediaRecorder(stream);
@@ -685,10 +967,16 @@ LegoCore.registerBlock({
         quickMediaRecorder.onstop = async () => {
             quickCurrentBlob = new Blob(quickAudioChunks, { type: 'audio/mp4' });
             quickAudioChunks = [];
-            const trimStart = quickUI.querySelector('#sb-quick-trim-start-chk').checked;
-            const trimEnd = quickUI.querySelector('#sb-quick-trim-end-chk').checked;
-            if (trimStart || trimEnd) {
-                quickCurrentBlob = await detectAndTrimSilence(quickCurrentBlob, trimStart, trimEnd, quickUI.querySelector('#sb-quick-threshold-select').value);
+            if (core.audio && core.audio.process) {
+                // 🎧 Trim + WAV mono in ONE pass (Manual cut start = no detection at all)
+                quickCurrentBlob = (await core.audio.process(quickCurrentBlob, core.audio.getQuickTrimOpts())).blob;
+            } else {
+                // Fallback without the Audio WAV Engine block (old behavior)
+                const trimStart = cutModeSel.value === 'auto';
+                const trimEnd = quickUI.querySelector('#sb-quick-trim-end-chk').checked;
+                if (trimStart || trimEnd) {
+                    quickCurrentBlob = await detectAndTrimSilence(quickCurrentBlob, trimStart, trimEnd, quickUI.querySelector('#sb-quick-threshold-select').value);
+                }
             }
             showQuickActionControls();
         };
@@ -706,7 +994,7 @@ LegoCore.registerBlock({
             quickRecBtn.innerText = "⏹️ Stop Quick Rec";
             quickRecBtn.style.background = "#dc2626";
         } else {
-            const lagMs = parseInt(quickUI.querySelector('#sb-quick-trailing-lag-input').value) || 800;
+            const lagMs = quickLagMs();
             quickRecBtn.innerText = "⏳ Finishing...";
             quickRecBtn.style.background = "#555";
             setTimeout(() => {
@@ -844,15 +1132,21 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Recorder Studio (v1)
+   BLOCK: Recorder Studio (v2)
    ============================================================ */
 /* ================================================================
-   BLOCK: Audio Recorder Studio (Standalone Plugin)
+   BLOCK: Audio Recorder Studio (Standalone Plugin) (v3 - Delay on/off)
+   v3: Delay On/Off switch (Off = stop instantly). 0 ms now really means 0.
    Handles main recording, shortcuts, stitching logic, and saves to DB.
+   v2: recordings and uploads are converted to WAV mono (needs the
+       "Audio WAV Engine" block; without it, works as before).
+       Stitching no longer produces a broken file if joining fails.
 ================================================================ */
 LegoCore.registerBlock({
   id: 'audioRecorderStudio',
   init(core) {
+    const toWav = b => (core.audio && core.audio.toWav) ? core.audio.toWav(b) : Promise.resolve(b);
+
     let db;
     let mediaRecorder;
     let audioChunks = [];
@@ -879,6 +1173,7 @@ LegoCore.registerBlock({
     const autoSendPref = localStorage.getItem('sb_autosend') === 'true';
     const savedThreshold = localStorage.getItem('sb_silence_threshold') || "0.035";
     const savedLag = localStorage.getItem('sb_trailing_lag') || "800";
+    const lagOn = localStorage.getItem('sb_trailing_lag_on') !== 'false';
 
     const getShortcutConfig = (action, defaultKey, defaultMod) => {
       return { key: localStorage.getItem(`sb_sc_${action}_key`) || defaultKey, mod: localStorage.getItem(`sb_sc_${action}_mod`) || defaultMod };
@@ -906,7 +1201,10 @@ LegoCore.registerBlock({
           </div>
           <div style="display:flex; justify-content:space-between; align-items:center;">
               <span style="color:#94a3b8;">Delay (ms):</span>
-              <input type="number" id="sb-trailing-lag-input" value="${savedLag}" step="100" style="width:50px; background:#0f172a; color:#fff; border:1px solid #334155; border-radius:3px; padding:2px; font-size:9px; text-align:center;">
+              <div style="display:flex; align-items:center; gap:4px;">
+                  <label title="Off = stops instantly when you press stop (fastest)" style="cursor:pointer; display:flex; align-items:center; gap:2px;"><input type="checkbox" id="sb-lag-on-chk" ${lagOn ? 'checked' : ''}> On</label>
+                  <input type="number" id="sb-trailing-lag-input" value="${savedLag}" min="0" step="100" style="width:50px; background:#0f172a; color:#fff; border:1px solid #334155; border-radius:3px; padding:2px; font-size:9px; text-align:center; ${lagOn ? '' : 'display:none;'}">
+              </div>
           </div>
       </div>
       <div style="display:flex; gap:4px;">
@@ -999,18 +1297,28 @@ LegoCore.registerBlock({
     recUI.querySelector('#sb-auto-send-chk').onchange = e => localStorage.setItem('sb_autosend', e.target.checked);
     recUI.querySelector('#sb-threshold-select').onchange = e => localStorage.setItem('sb_silence_threshold', e.target.value);
     recUI.querySelector('#sb-trailing-lag-input').onchange = e => localStorage.setItem('sb_trailing_lag', e.target.value);
+    recUI.querySelector('#sb-lag-on-chk').onchange = e => {
+        localStorage.setItem('sb_trailing_lag_on', String(e.target.checked));
+        recUI.querySelector('#sb-trailing-lag-input').style.display = e.target.checked ? '' : 'none';
+    };
+    // Delay in ms: Off → 0. An empty/invalid box → 800. A real 0 stays 0.
+    function studioLagMs() {
+        if (!recUI.querySelector('#sb-lag-on-chk').checked) return 0;
+        const n = parseInt(recUI.querySelector('#sb-trailing-lag-input').value, 10);
+        return Number.isFinite(n) ? Math.max(0, n) : 800;
+    }
 
     navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
         mediaRecorder = new MediaRecorder(stream);
         mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
         mediaRecorder.onstop = async () => {
-            currentBlob = new Blob(audioChunks, { type: 'audio/mp4' });
+            currentBlob = await toWav(new Blob(audioChunks)); // 🎧 always WAV mono
             audioChunks = [];
             originalBlobBackup = currentBlob;
             const trimStart = recUI.querySelector('#sb-auto-trim-start-chk').checked;
             const trimEnd = recUI.querySelector('#sb-auto-trim-end-chk').checked;
             if (trimStart || trimEnd) {
-                currentBlob = await detectAndTrimSilence(currentBlob, trimStart, trimEnd, recUI.querySelector('#sb-threshold-select').value);
+                currentBlob = await toWav(await detectAndTrimSilence(currentBlob, trimStart, trimEnd, recUI.querySelector('#sb-threshold-select').value));
                 recUI.querySelector('#sb-undo-trim-btn').style.display = "inline-block";
             }
             await showActionControls("voice_note");
@@ -1029,7 +1337,7 @@ LegoCore.registerBlock({
             recBtn.innerText = "⏹️ Stop Recording";
             recBtn.style.background = "#dc2626";
         } else {
-            const lagMs = parseInt(recUI.querySelector('#sb-trailing-lag-input').value) || 800;
+            const lagMs = studioLagMs();
             recBtn.innerText = "⏳ Finishing...";
             recBtn.style.background = "#555";
             setTimeout(() => {
@@ -1159,7 +1467,12 @@ LegoCore.registerBlock({
                 out.set(buf2.getChannelData(c < buf2.numberOfChannels ? c : 0), buf1.length);
             }
             return new Blob([audioBufferToWav(merged)], { type: 'audio/mp4' });
-        } catch (e) { return new Blob([b1, b2], { type: 'audio/mp4' }); }
+        } catch (e) {
+            // Gluing two raw files together makes a broken audio — keep just the recording instead
+            console.warn('[RecorderStudio] Could not join clips:', e);
+            alert("Couldn't join the recording with the pitch clip. Only your recording will be used.");
+            return b1;
+        }
     }
 
     function audioBufferToWav(buffer) {
@@ -1217,7 +1530,7 @@ LegoCore.registerBlock({
     fileInput.onchange = async e => {
         const file = e.target.files[0];
         if (!file) return;
-        currentBlob = new Blob([file], { type: 'audio/mp4' });
+        currentBlob = await toWav(file); // 🎧 uploads become WAV mono too
         originalBlobBackup = currentBlob;
         await showActionControls(file.name.replace(/\.[^/.]+$/, ""));
         fileInput.value = "";
@@ -1269,14 +1582,26 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Audio Library (v2)
+   BLOCK: Audio Library (v5)
    ============================================================ */
 /* ============================================================
-   BLOCK: Audio Library (v13 - Hash-Colored Course Tags & Tooltip Fix)
+   BLOCK: Audio Library (v16 - 🔗 Renames reach sequences)
+   ------------------------------------------------------------
+   v16: Saving or deleting a clip in the ✏️ window now announces it
+        ('library:refresh'), so sequences pick up the new name right away.
+   v15: ⚙️ panel → "✂️ Trim + convert" (Start / End, keep-after-voice ms,
+        Medium sensitivity, follows the folder filter, safe to re-run).
+        ✏️ Edit window → ▶️ 24 kHz / ▶️ 48 kHz to compare the same clip.
+   v14: ⚙️ panel → audio quality (24 / 48 kHz), send as .m4a / .wav,
+        "Convert all to WAV mono". Uploads are converted to WAV mono.
+        Downloads are real .wav files, and the color tag survives a
+        download → re-upload. Needs the "Audio WAV Engine" block.
+   v13: Hash-Colored Course Tags & Tooltip Fix
    ============================================================ */
 LegoCore.registerBlock({
   id: 'audioLibrary',
   init(core) {
+    const toWav = b => (core.audio && core.audio.toWav) ? core.audio.toWav(b) : Promise.resolve(b);
     let db;
     let activeFolderFilter = 'All';
     let activeTagFilter = 'All';
@@ -1411,6 +1736,25 @@ LegoCore.registerBlock({
       .ig-audio-footer button:hover { opacity: 0.9; }
       .ig-audio-dl-btn { background: #2e7d32; }
       .ig-audio-ul-btn { background: #4527a0; }
+      .ig-audio-gear-btn { background: none; border: none; color: #94a3b8; cursor: pointer; font-size: 12px; padding: 0 2px; }
+      .ig-audio-gear-btn:hover, .ig-audio-gear-btn.active { color: #fff; }
+      .ig-audio-settings { display: flex; flex-direction: column; gap: 8px; padding: 8px; border: 1px solid var(--ig-border, #333); border-radius: 6px; background: rgba(0,0,0,0.2); }
+      .ig-audio-set-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+      .ig-audio-set-row > span { color: #94a3b8; font-weight: bold; font-size: 10px; }
+      .ig-audio-seg { display: flex; border: 1px solid var(--ig-border, #333); border-radius: 5px; overflow: hidden; }
+      .ig-audio-seg button { background: transparent; border: none; color: #94a3b8; font-size: 10px; font-weight: bold; padding: 4px 9px; cursor: pointer; }
+      .ig-audio-seg button.on { background: #334155; color: #fff; }
+      .ig-audio-convert-btn { background: #334155; color: #fff; border: none; border-radius: 5px; padding: 6px; font-size: 10px; font-weight: bold; cursor: pointer; }
+      .ig-audio-convert-btn:hover { background: #475569; }
+      .ig-audio-convert-btn:disabled { opacity: 0.6; cursor: wait; }
+      .ig-audio-set-status { color: #94a3b8; font-size: 10px; min-height: 12px; white-space: pre-wrap; }
+      .ig-audio-set-sep { border-top: 1px solid rgba(255,255,255,0.08); }
+      .ig-audio-set-row label { display: flex; align-items: center; gap: 3px; color: #cbd5e1; font-size: 10px; cursor: pointer; }
+      .ig-audio-set-num { width: 52px; background: #0f172a; color: #fff; border: 1px solid #334155; border-radius: 3px; padding: 2px; font-size: 10px; text-align: center; }
+      .ig-audio-ab-row { display: flex; gap: 6px; }
+      .ig-audio-ab-row button { flex: 1; font-size: 11px; }
+      .ig-audio-ab-row button:disabled { opacity: 0.4; cursor: not-allowed; }
+      .ig-audio-ab-note { font-size: 10px; color: #94a3b8; min-height: 12px; }
       .ig-pipeline-badge { display: inline-block; padding: 1px 5px; border-radius: 4px; font-weight: bold; color: #fff; margin-right: 4px; font-size: 10px; box-shadow: 0 1px 2px rgba(0,0,0,0.3); }
       .ig-course-badge { display: inline-block; padding: 1px 5px; border-radius: 4px; font-weight: bold; color: #fff; margin-right: 4px; font-size: 9px; text-transform: uppercase; box-shadow: 0 1px 2px rgba(0,0,0,0.3); }
       .ig-audio-tx-tooltip { position: fixed; z-index: 2147483647 !important; transform: translateY(-100%); background: rgba(15, 23, 42, 0.95); backdrop-filter: blur(4px); color: #cbd5e1; padding: 10px 12px; border-radius: 6px; border: 1px solid #475569; max-width: 250px; font-size: 11px; pointer-events: none; display: none; box-shadow: 0 10px 25px rgba(0,0,0,0.6); white-space: pre-wrap; word-wrap: break-word; line-height: 1.4; }
@@ -1432,7 +1776,43 @@ LegoCore.registerBlock({
     libUI.innerHTML = `
       <div class="ig-audio-lib-header">
         <span>Filters:</span>
-        <button id="ig-audio-new-folder-btn" class="ig-audio-lib-new-btn">+ New Folder</button>
+        <div style="display:flex; align-items:center; gap:4px;">
+          <button id="ig-audio-new-folder-btn" class="ig-audio-lib-new-btn">+ New Folder</button>
+          <button id="ig-audio-gear-btn" class="ig-audio-gear-btn" title="Audio settings">⚙️</button>
+        </div>
+      </div>
+      <div id="ig-audio-settings" class="ig-audio-settings" style="display:none;">
+        <div class="ig-audio-set-row">
+          <span>Quality</span>
+          <div class="ig-audio-seg" id="ig-audio-rate-seg">
+            <button data-rate="24000">24 kHz</button>
+            <button data-rate="48000">48 kHz</button>
+          </div>
+        </div>
+        <div class="ig-audio-set-row">
+          <span>Send as</span>
+          <div class="ig-audio-seg" id="ig-audio-sendas-seg">
+            <button data-sendas="m4a">.m4a</button>
+            <button data-sendas="wav">.wav</button>
+          </div>
+        </div>
+        <button id="ig-audio-convert-btn" class="ig-audio-convert-btn">🔄 Convert all to WAV mono</button>
+        <div class="ig-audio-set-sep"></div>
+        <div class="ig-audio-set-row">
+          <span>✂️ Trim</span>
+          <div style="display:flex; gap:10px;">
+            <label><input type="checkbox" id="ig-audio-trim-start"> Start</label>
+            <label><input type="checkbox" id="ig-audio-trim-end"> End</label>
+          </div>
+        </div>
+        <div class="ig-audio-set-row">
+          <span>Keep after voice</span>
+          <div style="display:flex; align-items:center; gap:3px; color:#94a3b8; font-size:10px;">
+            <input type="number" id="ig-audio-trim-margin" class="ig-audio-set-num" min="0" step="50"> ms
+          </div>
+        </div>
+        <button id="ig-audio-trim-btn" class="ig-audio-convert-btn">✂️ Trim + convert</button>
+        <div id="ig-audio-set-status" class="ig-audio-set-status"></div>
       </div>
       <input type="text" id="ig-audio-search-input" class="ig-audio-search" placeholder="🔍 Search clips... (Enter to send)">
       <div class="ig-audio-lib-filters">
@@ -1577,6 +1957,12 @@ LegoCore.registerBlock({
           <div class="ig-audio-modal-label">Transcript (shown in the Quick Command preview panel):</div>
           <textarea id="ig-audio-modal-transcript" class="ig-audio-modal-textarea" placeholder="Type out what this clip says...">${String(clip.transcript || '').replace(/</g, '&lt;')}</textarea>
           <button id="ig-audio-modal-play" class="ig-audio-modal-play-btn">▶️ Preview</button>
+          <div class="ig-audio-modal-label">Compare quality (same clip, nothing is saved):</div>
+          <div class="ig-audio-ab-row">
+            <button id="ig-audio-ab-24" class="ig-audio-modal-play-btn" data-rate="24000">▶️ 24 kHz</button>
+            <button id="ig-audio-ab-48" class="ig-audio-modal-play-btn" data-rate="48000">▶️ 48 kHz</button>
+          </div>
+          <div id="ig-audio-ab-note" class="ig-audio-ab-note"></div>
           <div style="display:flex; justify-content:space-between; margin-top:8px;">
             <div style="display:flex; gap:8px;">
               <button id="ig-audio-modal-del" style="background:#dc2626; color:#fff; border:none; padding:6px 12px; border-radius:4px; font-weight:bold; cursor:pointer;">🗑️ Delete</button>
@@ -1590,6 +1976,14 @@ LegoCore.registerBlock({
         </div>
       `;
       document.body.appendChild(overlay);
+
+      const modalPlayers = new Set();   // every <audio> started from this window
+      const modalUrls = [];
+      function closeModal() {
+        modalPlayers.forEach(p => { try { p.pause(); } catch (e) {} });
+        modalUrls.forEach(u => URL.revokeObjectURL(u));
+        overlay.remove();
+      }
 
       const folderSel = overlay.querySelector('#ig-audio-modal-folder');
       const tx0 = db.transaction(['folders'], 'readonly');
@@ -1610,7 +2004,9 @@ LegoCore.registerBlock({
         if (!previewPlayer) {
           const blob = await getClipBlob(clip.id);
           if (!blob) return alert("Audio file not found in DB.");
+          stopAB();
           previewPlayer = new Audio(URL.createObjectURL(blob));
+          modalPlayers.add(previewPlayer);
           btn.innerText = '⏹️ Stop';
           previewPlayer.play();
           previewPlayer.onended = () => { btn.innerText = '▶️ Preview'; previewPlayer = null; };
@@ -1622,12 +2018,13 @@ LegoCore.registerBlock({
       };
 
       overlay.querySelector('#ig-audio-modal-dl').onclick = async () => {
-        const blob = await getClipBlob(clip.id);
-        if (!blob) return alert("Audio file not found.");
+        const raw = await getClipBlob(clip.id);
+        if (!raw) return alert("Audio file not found.");
+        const blob = await toWav(raw);
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = `${clip.folder || 'General'}.${clip.color || '#0095f6'}.${clip.name}.m4a`;
+        a.download = downloadName(clip);
         document.body.appendChild(a); a.click(); a.remove();
         setTimeout(() => URL.revokeObjectURL(url), 300);
       };
@@ -1636,10 +2033,10 @@ LegoCore.registerBlock({
         if (!confirm('Permanently delete this clip?')) return;
         const tx = db.transaction(['clips'], 'readwrite');
         tx.objectStore('clips').delete(clip.id);
-        tx.oncomplete = () => { renderClips(); overlay.remove(); };
+        tx.oncomplete = () => { core.emit('library:refresh'); closeModal(); }; // re-renders this list + updates sequences
       };
 
-      overlay.querySelector('#ig-audio-modal-cancel').onclick = () => overlay.remove();
+      overlay.querySelector('#ig-audio-modal-cancel').onclick = () => closeModal();
 
       overlay.querySelector('#ig-audio-modal-save').onclick = () => {
         const newName = overlay.querySelector('#ig-audio-modal-name').value.trim() || clip.name;
@@ -1658,8 +2055,62 @@ LegoCore.registerBlock({
             store.put(c);
           }
         };
-        tx.oncomplete = () => { renderClips(); overlay.remove(); };
+        tx.oncomplete = () => { core.emit('library:refresh'); closeModal(); }; // re-renders this list + updates sequences
       };
+
+      // ---------- 🎧 A/B compare: the same clip at 24 kHz and 48 kHz ----------
+      const abBtns = { 24000: overlay.querySelector('#ig-audio-ab-24'), 48000: overlay.querySelector('#ig-audio-ab-48') };
+      const abNote = overlay.querySelector('#ig-audio-ab-note');
+      const abCache = {};               // rate → { url, size }
+      let abPlayer = null, abRate = null;
+      const fmtMB = n => (n / 1048576).toFixed(1) + ' MB';
+      const abLabel = rate => `▶️ ${rate / 1000} kHz` + (abCache[rate] ? ` · ${fmtMB(abCache[rate].size)}` : '');
+
+      function stopAB() {
+        if (abPlayer) { abPlayer.pause(); abPlayer = null; }
+        abRate = null;
+        Object.keys(abBtns).forEach(r => { abBtns[r].innerText = abLabel(Number(r)); });
+      }
+
+      async function getAB(rate) {
+        if (abCache[rate]) return abCache[rate];
+        const raw = await getClipBlob(clip.id);
+        if (!raw || !core.audio) return null;
+        const wav = (await core.audio.process(raw, { rate })).blob;
+        const url = URL.createObjectURL(wav);
+        modalUrls.push(url);
+        return (abCache[rate] = { url, size: wav.size });
+      }
+
+      Object.keys(abBtns).forEach(r => {
+        const rate = Number(r);
+        abBtns[r].onclick = async () => {
+          if (abRate === rate) return stopAB();          // same button = stop
+          stopAB();
+          if (previewPlayer) { previewPlayer.pause(); previewPlayer = null; overlay.querySelector('#ig-audio-modal-play').innerText = '▶️ Preview'; }
+          abBtns[r].innerText = '⏳';
+          const v = await getAB(rate);
+          if (!v) { abBtns[r].innerText = abLabel(rate); abNote.textContent = 'Needs the "Audio WAV Engine" block.'; return; }
+          abPlayer = new Audio(v.url);
+          modalPlayers.add(abPlayer);
+          abRate = rate;
+          abBtns[r].innerText = `⏹️ ${rate / 1000} kHz · ${fmtMB(v.size)}`;
+          abPlayer.play();
+          abPlayer.onended = () => stopAB();
+        };
+      });
+
+      // A clip already stored at 24 kHz can't get its detail back
+      (async () => {
+        if (!core.audio) { abNote.textContent = 'Needs the "Audio WAV Engine" block.'; return; }
+        const raw = await getClipBlob(clip.id);
+        if (!raw) return;
+        const info = await core.audio.sniff(raw);
+        if (info.kind === 'wav' && info.rate && info.rate <= 24000) {
+          abBtns[48000].disabled = true;
+          abNote.textContent = 'This clip is stored at 24 kHz, so 48 kHz can\'t be compared.';
+        }
+      })();
     }
 
     // --- Hover Tooltip Binding Helper ---
@@ -1926,10 +2377,10 @@ LegoCore.registerBlock({
         const clips = e.target.result || [];
         for (let clip of clips) {
           if (!clip.blob) continue;
-          const url = URL.createObjectURL(clip.blob);
+          const url = URL.createObjectURL(await toWav(clip.blob));
           const a = document.createElement('a');
           a.href = url;
-          a.download = `${clip.folder || 'General'}.${clip.color || '#0095f6'}.${clip.name}.m4a`;
+          a.download = downloadName(clip);
           document.body.appendChild(a); a.click(); a.remove();
           await new Promise(r => setTimeout(r, 150));
           URL.revokeObjectURL(url);
@@ -1941,24 +2392,34 @@ LegoCore.registerBlock({
     const batchBtn = libUI.querySelector('#ig-audio-ul-btn');
     const batchInput = libUI.querySelector('#ig-audio-batch-input');
     batchBtn.onclick = () => batchInput.click();
-    batchInput.onchange = e => {
-      const files = e.target.files;
+    batchInput.onchange = async e => {
+      const files = Array.from(e.target.files || []);
+      batchInput.value = '';
       if (!files.length) return;
+
+      // 🎧 Convert every file to WAV mono first (a database transaction can't wait for this)
+      const converted = [];
+      for (let i = 0; i < files.length; i++) {
+        batchBtn.innerText = `⏳ ${i + 1}/${files.length}`;
+        converted.push(await toWav(files[i]));
+      }
       batchBtn.innerText = '⏳ Sorting...';
+
       const tx = db.transaction(['folders', 'clips'], 'readwrite');
       const fStore = tx.objectStore('folders'), cStore = tx.objectStore('clips');
       const folders = new Set(['General']);
 
       for (let i = 0; i < files.length; i++) {
         const parts = files[i].name.replace(/\.[^/.]+$/, '').split('.');
-        let folder = 'General', color = '#0095f6', name = files[i].name;
-        if (parts.length >= 3 && parts[1].startsWith('#')) {
-          folder = parts[0].trim(); color = parts[1].trim(); name = parts.slice(2).join('.').trim();
+        let folder = 'General', color = '#0095f6', name = parts.join('.').trim();
+        // Color tag with or without "#" (browsers drop "#" from downloaded file names)
+        if (parts.length >= 3 && /^#?[0-9a-f]{6}$/i.test(parts[1].trim())) {
+          folder = parts[0].trim(); color = '#' + parts[1].trim().replace(/^#/, ''); name = parts.slice(2).join('.').trim();
         } else if (parts.length >= 2) {
           folder = parts[0].trim(); name = parts.slice(1).join('.').trim();
         }
         folders.add(folder);
-        cStore.add({ name, folder, color, order: i, blob: new Blob([files[i]], { type: 'audio/mp4' }) });
+        cStore.add({ name, folder, color, order: i, blob: converted[i] });
       }
       folders.forEach(f => fStore.put({ name: f }));
       tx.oncomplete = () => {
@@ -1967,7 +2428,190 @@ LegoCore.registerBlock({
         renderClips();
         core.emit('folders:refresh');
       };
-      batchInput.value = '';
+    };
+
+    // ============================================================
+    // 🎧 WAV helpers + ⚙️ settings panel
+    // ============================================================
+    function downloadName(clip) {
+      const color = String(clip.color || '#0095f6').replace(/^#/, '');
+      return `${clip.folder || 'General'}.${color}.${clip.name}.wav`;
+    }
+
+    const gearBtn = libUI.querySelector('#ig-audio-gear-btn');
+    const settingsEl = libUI.querySelector('#ig-audio-settings');
+    const rateSeg = libUI.querySelector('#ig-audio-rate-seg');
+    const sendSeg = libUI.querySelector('#ig-audio-sendas-seg');
+    const convertBtn = libUI.querySelector('#ig-audio-convert-btn');
+    const statusEl = libUI.querySelector('#ig-audio-set-status');
+
+    function paintSettings() {
+      if (!core.audio) {
+        statusEl.textContent = '⚠️ Add the "Audio WAV Engine" block to use these settings.';
+        return;
+      }
+      const prefs = core.audio.getPrefs();
+      rateSeg.querySelectorAll('button').forEach(b => b.classList.toggle('on', Number(b.dataset.rate) === prefs.rate));
+      sendSeg.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.sendas === prefs.sendAs));
+    }
+
+    gearBtn.onclick = () => {
+      const open = settingsEl.style.display === 'none';
+      settingsEl.style.display = open ? 'flex' : 'none';
+      gearBtn.classList.toggle('active', open);
+      if (open) paintSettings();
+    };
+    rateSeg.onclick = e => {
+      const b = e.target.closest('button[data-rate]');
+      if (!b || !core.audio) return;
+      core.audio.setPrefs({ rate: Number(b.dataset.rate) });
+      statusEl.textContent = 'New recordings use this quality. Press Convert to change existing clips.';
+      paintSettings();
+    };
+    sendSeg.onclick = e => {
+      const b = e.target.closest('button[data-sendas]');
+      if (!b || !core.audio) return;
+      core.audio.setPrefs({ sendAs: b.dataset.sendas });
+      statusEl.textContent = '';
+      paintSettings();
+    };
+
+    convertBtn.onclick = async () => {
+      if (!core.audio || !db) return paintSettings();
+      const rate = core.audio.getPrefs().rate;
+      if (!confirm(`Convert every clip to WAV mono at ${rate / 1000} kHz?\n\nTip: press 📥 DL first if you want a backup.`)) return;
+
+      convertBtn.disabled = true;
+      statusEl.textContent = '';
+      const ids = await new Promise(res => {
+        db.transaction(['clips'], 'readonly').objectStore('clips').getAllKeys().onsuccess = ev => res(ev.target.result || []);
+      });
+
+      let converted = 0, skipped = 0, failed = 0;
+      for (let i = 0; i < ids.length; i++) {
+        convertBtn.textContent = `⏳ ${i + 1} / ${ids.length}`;
+        const blob = await getClipBlob(ids[i]);
+        if (!blob || await core.audio.isTargetWav(blob, rate)) { skipped++; continue; }
+
+        const wav = await core.audio.toWav(blob, { rate });
+        if (!(await core.audio.isTargetWav(wav, rate))) { failed++; continue; }
+
+        // Replace only the audio — name, folder, color, order, command and transcript stay
+        const ok = await new Promise(res => {
+          const tx = db.transaction(['clips'], 'readwrite');
+          const store = tx.objectStore('clips');
+          store.get(ids[i]).onsuccess = ev => {
+            const c = ev.target.result;
+            if (c) { c.blob = wav; store.put(c); }
+          };
+          tx.oncomplete = () => res(true);
+          tx.onerror = () => res(false);
+        });
+        ok ? converted++ : failed++;
+      }
+
+      convertBtn.disabled = false;
+      convertBtn.textContent = '🔄 Convert all to WAV mono';
+      statusEl.textContent = `✅ ${converted} converted · ${skipped} already done` + (failed ? ` · ⚠️ ${failed} failed` : '');
+      core.emit('library:refresh');
+    };
+
+    // ---------- ✂️ Batch trim + convert ----------
+    const TRIM_PREFS_KEY = 'ig_audio_batch_trim_v1';
+    const MEDIUM_SENSITIVITY = 0.035; // same as the recorders' "Medium"
+    const trimStartChk = libUI.querySelector('#ig-audio-trim-start');
+    const trimEndChk = libUI.querySelector('#ig-audio-trim-end');
+    const trimMarginInput = libUI.querySelector('#ig-audio-trim-margin');
+    const trimBtn = libUI.querySelector('#ig-audio-trim-btn');
+
+    function getTrimPrefs() {
+      try {
+        const p = JSON.parse(localStorage.getItem(TRIM_PREFS_KEY)) || {};
+        return { start: p.start !== false, end: p.end !== false, margin: Number.isFinite(p.margin) ? p.margin : 500 };
+      } catch (e) { return { start: true, end: true, margin: 500 }; }
+    }
+    function saveTrimPrefs() {
+      const margin = Math.max(0, parseInt(trimMarginInput.value, 10) || 0);
+      trimMarginInput.value = margin;
+      localStorage.setItem(TRIM_PREFS_KEY, JSON.stringify({ start: trimStartChk.checked, end: trimEndChk.checked, margin }));
+    }
+    (() => {
+      const p = getTrimPrefs();
+      trimStartChk.checked = p.start; trimEndChk.checked = p.end; trimMarginInput.value = p.margin;
+    })();
+    trimStartChk.onchange = saveTrimPrefs;
+    trimEndChk.onchange = saveTrimPrefs;
+    trimMarginInput.onchange = saveTrimPrefs;
+
+    trimBtn.onclick = async () => {
+      if (!core.audio || !core.audio.process || !db) return paintSettings();
+      saveTrimPrefs();
+      const { start, end, margin } = getTrimPrefs();
+      if (!start && !end) { statusEl.textContent = 'Tick Start and/or End first.'; return; }
+
+      const rate = core.audio.getPrefs().rate;
+      const folderFilter = libUI.querySelector('#ig-audio-folder-filter').value || 'All';
+      const scope = folderFilter === 'All' ? 'ALL folders' : `the folder "${folderFilter}"`;
+      const what = [start && 'start', end && `end (keeping ${margin} ms after the voice)`].filter(Boolean).join(' + ');
+      if (!confirm(`Trim the ${what} of every clip in ${scope}, and save as WAV mono ${rate / 1000} kHz?\n\nTrimming can't be undone — press 📥 DL first if you want a backup.`)) return;
+
+      trimBtn.disabled = true;
+      statusEl.textContent = '';
+
+      // Which clips? (follows the folder filter)
+      const targets = await new Promise(res => {
+        db.transaction(['clips'], 'readonly').objectStore('clips').getAll().onsuccess = ev => {
+          res((ev.target.result || [])
+            .filter(c => folderFilter === 'All' || (c.folder || 'General') === folderFilter)
+            .map(c => ({ id: c.id, name: c.name || 'Untitled' })));
+        };
+      });
+
+      let trimmed = 0, convertedOnly = 0, clean = 0, failed = 0, totalCutMs = 0;
+      const skippedNames = [];
+      for (let i = 0; i < targets.length; i++) {
+        trimBtn.textContent = `⏳ ${i + 1} / ${targets.length}`;
+        const blob = await getClipBlob(targets[i].id);
+        if (!blob) { failed++; continue; }
+
+        const r = await core.audio.process(blob, {
+          rate, autoStart: start, autoEnd: end,
+          threshold: MEDIUM_SENSITIVITY, startPadMs: 50, endPadMs: margin, guard: true
+        });
+
+        if (r.status === 'unchanged') { clean++; continue; }
+        if (r.status === 'silent' || r.status === 'too-much') { skippedNames.push(targets[i].name); continue; }
+        if (r.status === 'error') { failed++; continue; }
+
+        // Replace only the audio — name, folder, color, order, command and transcript stay
+        const ok = await new Promise(res => {
+          const tx = db.transaction(['clips'], 'readwrite');
+          const store = tx.objectStore('clips');
+          store.get(targets[i].id).onsuccess = ev => {
+            const c = ev.target.result;
+            if (c) { c.blob = r.blob; store.put(c); }
+          };
+          tx.oncomplete = () => res(true);
+          tx.onerror = () => res(false);
+        });
+        if (!ok) { failed++; continue; }
+        const cut = r.cutStartMs + r.cutEndMs;
+        if (cut > 0) { trimmed++; totalCutMs += cut; } else convertedOnly++;
+      }
+
+      trimBtn.disabled = false;
+      trimBtn.textContent = '✂️ Trim + convert';
+      const parts = [`✂️ ${trimmed} trimmed` + (trimmed ? ` (avg ${(totalCutMs / trimmed / 1000).toFixed(1)} s cut)` : '')];
+      if (convertedOnly) parts.push(`${convertedOnly} converted`);
+      parts.push(`${clean} already clean`);
+      if (failed) parts.push(`⚠️ ${failed} failed`);
+      let msg = parts.join(' · ');
+      if (skippedNames.length) {
+        msg += `\n⚠️ Skipped ${skippedNames.length} (silent or would cut over half): ` +
+               skippedNames.slice(0, 3).join(', ') + (skippedNames.length > 3 ? '…' : '');
+      }
+      statusEl.textContent = msg;
+      core.emit('library:refresh');
     };
 
     core.emit('block:ready', { id: 'audioLibrary' });
@@ -3823,10 +4467,12 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Text Library Module (Saved Snippets) (v2)
+   BLOCK: Text Library Module (Saved Snippets) (v3)
    ============================================================ */
 /* ============================================================
-   BLOCK: Text Library Module (Saved Snippets) (v6 - Safe Paste Edition)
+   BLOCK: Text Library Module (Saved Snippets) (v7 - 🔗 Renames reach sequences)
+   v7: every save announces 'textlib:updated', so a renamed snippet's
+       title updates in your sequences right away.
    ============================================================ */
 LegoCore.registerBlock({
   id: 'textLibraryModule',
@@ -3849,7 +4495,10 @@ LegoCore.registerBlock({
       }
     }
 
-    function saveData() { localStorage.setItem(PRO_KEY, JSON.stringify(libraryData)); }
+    function saveData() {
+      localStorage.setItem(PRO_KEY, JSON.stringify(libraryData));
+      core.emit('textlib:updated'); // lets sequences follow renames
+    }
     core.on('textlib:external-refresh', () => { libraryData = JSON.parse(localStorage.getItem(PRO_KEY)) || libraryData; renderTree(); }); // reload after Commands saves/edits a snippet
 
     let activeFolderFilter = 'All';
@@ -4696,10 +5345,13 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Commands (v6)
+   BLOCK: Commands (v9)
    ============================================================ */
 /* ============================================================
-   BLOCK: Commands (v30.1 - 🎙️ Enter while recording = stop → preview (never restarts/discards)
+   BLOCK: Commands (v30.4 - ⚡ Follows Quick Message "Delay" On/Off (Off = stop instantly; 0 ms really = 0)
+                    v30.3 - ✂️ Trim + WAV in one pass; follows Quick Message "Cut start" Off/Auto/Manual
+                    v30.2 - 🎧 Recordings saved as WAV mono (via "Audio WAV Engine" block)
+                    v30.1 - 🎙️ Enter while recording = stop → preview (never restarts/discards)
                         + Record/preview buttons no longer steal focus from the input
                     v30 - 📌 Floating always-on-top window + "/save" text snippets
                       + Image drop/paste tray (reorder, save as set, paste)
@@ -6241,11 +6893,19 @@ LegoCore.registerBlock({
 
           const mySession = activeSessionId;
           const effectsEnabled = localStorage.getItem(EFFECTS_KEY) !== 'false';
-          const trimStart = effectsEnabled && localStorage.getItem('sb_quick_autotrim_start') === 'true';
-          const trimEnd = effectsEnabled && localStorage.getItem('sb_quick_autotrim_end') === 'true';
-          const threshold = localStorage.getItem('sb_quick_silence_threshold') || '0.035';
 
-          if (trimStart || trimEnd) blob = await detectAndTrimSilence(blob, trimStart, trimEnd, threshold);
+          if (core.audio && core.audio.process) {
+            // 🎧 Trim + WAV mono in ONE pass, using the Quick Message settings
+            // (Cut start Off / Auto / Manual ms, Trim End). Effects off = no trimming.
+            const trim = effectsEnabled ? core.audio.getQuickTrimOpts() : {};
+            blob = (await core.audio.process(blob, trim)).blob;
+          } else {
+            // Fallback without the Audio WAV Engine block (old behavior)
+            const trimStart = effectsEnabled && localStorage.getItem('sb_quick_autotrim_start') === 'true';
+            const trimEnd = effectsEnabled && localStorage.getItem('sb_quick_autotrim_end') === 'true';
+            const threshold = localStorage.getItem('sb_quick_silence_threshold') || '0.035';
+            if (trimStart || trimEnd) blob = await detectAndTrimSilence(blob, trimStart, trimEnd, threshold);
+          }
           if (mySession !== activeSessionId) return; // a newer recording owns the state now
 
           isProcessing = false;
@@ -6270,7 +6930,10 @@ LegoCore.registerBlock({
       // Stop with the normal trailing lag; the clip then shows in the preview bar (via onstop)
       function finishRecording() {
         if (!isRecording || isFinishing) return;
-        isFinishing = true; const lagMs = parseInt(localStorage.getItem('sb_quick_trailing_lag')) || 800;
+        isFinishing = true;
+        const lagOn = localStorage.getItem('sb_quick_trailing_lag_on') !== 'false';
+        const lagRaw = parseInt(localStorage.getItem('sb_quick_trailing_lag'), 10);
+        const lagMs = !lagOn ? 0 : (Number.isFinite(lagRaw) ? Math.max(0, lagRaw) : 800);
         recordBtn.innerText = '⏳'; recordBtn.classList.remove('recording'); recordBtn.classList.add('finishing');
         lagTimeoutId = setTimeout(() => {
           isFinishing = false; isRecording = false;
@@ -6717,7 +7380,10 @@ LegoCore.registerBlock({
    BLOCK: Image Library (v2)
    ============================================================ */
 /* ============================================================
-   BLOCK: Image Sets Library (v3 - Cleaned UI)
+   BLOCK: Image Sets Library (v4 - 🔗 Permanent set IDs)
+   v4: new sets get a permanent "syncId" (sequences point at it).
+       Editing a set re-reads it from the database before saving, so the
+       permanent ID (and anything a sync added) is never overwritten.
    ============================================================ */
 LegoCore.registerBlock({
   id: 'imageSetsLibraryModule',
@@ -6908,11 +7574,20 @@ LegoCore.registerBlock({
         const store = tx.objectStore('sets');
 
         if (isEdit) {
-          existingSet.title = title; existingSet.images = draftImages; store.put(existingSet);
+          // Re-read the saved copy so fields added since this window opened (e.g. syncId) survive
+          const getReq = store.get(existingSet.id);
+          getReq.onsuccess = () => {
+            const rec = getReq.result || existingSet;
+            rec.title = title;
+            rec.images = draftImages;
+            if (!rec.syncId) rec.syncId = rec.id;
+            store.put(rec);
+          };
         } else {
           const countReq = store.count();
           countReq.onsuccess = () => {
-            store.add({ id: 'set_' + Date.now(), title: title, images: draftImages, order: countReq.result });
+            const newId = 'set_' + Date.now();
+            store.add({ id: newId, syncId: newId, title: title, images: draftImages, order: countReq.result });
           };
         }
         tx.oncomplete = () => { renderTree(); closeModal(); core.emit('images:updated'); };
@@ -7301,10 +7976,10 @@ LegoCore.registerBlock({
 
 
 /* ============================================================
-   BLOCK: Master Config Bunny Sync (v6)
+   BLOCK: Master Config Bunny Sync (v7)
    ============================================================ */
 /* ============================================================
-   BLOCK: Central Cloud Sync Center (v4 - Exact Names + Sync Manifests)
+   BLOCK: Central Cloud Sync Center (v5 - Exact Names + Sync Manifests + Permanent IDs)
    - Cloud file names keep (), dots, ¿¡, accents and emojis
    - ig_sync_meta/audio_manifest.json carries each clip's exact name, folder,
      color, custom command, transcript and order (+ folder order)
@@ -7313,6 +7988,13 @@ LegoCore.registerBlock({
    - Smart Backup warns before deleting clips this computer never pulled
    - Image Sets: exact set titles via image_manifest.json, webp/gif support,
      fixed Pull (transaction no longer expires during downloads)
+   - v4.1: Sequence Manager folders (order + collapsed state) ride the master config
+   - v5: 🔗 Permanent IDs
+       · Image sets carry a permanent syncId + their image list in image_manifest.json
+       · Pull matches sets by ID / shared images / title → a renamed set is renamed
+         here instead of downloaded a second time; leftover duplicates can be removed
+       · When a pull gives a clip or set a different permanent ID, sequences are
+         re-pointed to it automatically
    ============================================================ */
 LegoCore.registerBlock({
   id: 'cloudSyncCenterModule',
@@ -7339,6 +8021,7 @@ LegoCore.registerBlock({
         'ig_text_highlighter_master_v1', 'ig_qcx_instant_search_v1', 'ig_qcx_float_v1',
         // Sequence Manager (JSON — rides the master config)
         'ig_sequences_v1', 'ig_seq_col_widths_v1', 'ig_seq_hud_pos_v1',
+        'ig_seq_folders_v1', 'ig_seq_folders_collapsed_v1',
         // Tag Colors (number + course badge colors)
         'ig_tag_colors_v1'
     ];
@@ -7557,6 +8240,10 @@ LegoCore.registerBlock({
     function getImageDb() {
         return new Promise(resolve => {
             const req = indexedDB.open('IG_ImageSets_Core_DB', 1);
+            req.onupgradeneeded = e => { // same schema as the Image Sets module
+                const d = e.target.result;
+                if (!d.objectStoreNames.contains('sets')) d.createObjectStore('sets', { keyPath: 'id' }).createIndex('order', 'order', { unique: false });
+            };
             req.onsuccess = e => resolve(e.target.result);
             req.onerror = () => resolve(null);
         });
@@ -7751,7 +8438,9 @@ LegoCore.registerBlock({
         const downloads = [];
         const pending = [];
 
+        const remap = new Map(); // this computer's old ID → the cloud's ID (for sequences)
         const applyEntry = (c, e) => {
+            if (c.syncId && c.syncId !== e.syncId) remap.set(c.syncId, e.syncId);
             const want = {
                 syncId: e.syncId,
                 name: e.name || 'Untitled',
@@ -7798,6 +8487,7 @@ LegoCore.registerBlock({
             lockUI(`🛠️ Repairing ${updates.length} clip(s)...`);
             await putClips(updates);
         }
+        if (core.remapSequenceRefs) core.remapSequenceRefs('audio', remap);
 
         let pulled = 0, missing = 0;
         for (let i = 0; i < downloads.length; i++) {
@@ -7845,6 +8535,7 @@ LegoCore.registerBlock({
             const c = toDownload[i];
             const blob = await bunnyRequest('GET', c.path, null, 'blob');
             await addClip({
+                syncId: newSyncId(),
                 name: c.name, folder: c.folder, color: '#0095f6', customCommand: '',
                 order: local.length + i, blob: new Blob([blob], { type: 'audio/mp4' })
             });
@@ -7871,12 +8562,27 @@ LegoCore.registerBlock({
         return out;
     }
 
+    // Image identity across computers: the image's own id (the cloud file is named after it)
+    const imgKey = id => String(id || '').normalize('NFC').toLowerCase().replace(/[^a-z0-9À-ſ]/g, '');
+
+    // Every set gets a permanent syncId (first time = its own id). Writes back only the ones missing it.
+    async function ensureSetSyncIds(imgDb, localSets) {
+        const missing = localSets.filter(s => !s.syncId);
+        if (!missing.length) return;
+        missing.forEach(s => { s.syncId = s.id; });
+        const tx = imgDb.transaction(['sets'], 'readwrite');
+        const store = tx.objectStore('sets');
+        missing.forEach(s => store.put(s));
+        await txDone(tx);
+    }
+
     async function pushImages(force) {
         lockUI(force ? '♻️ Scanning Images...' : '☁️ Scanning Images...');
         const imgDb = await getImageDb();
-        if (!imgDb) throw new Error('Image DB not initialized.');
+        if (!imgDb || !imgDb.objectStoreNames.contains('sets')) throw new Error('Image DB not initialized.');
 
         const localSets = await getLocalImageSets(imgDb);
+        await ensureSetSyncIds(imgDb, localSets);
         const cloudInv = await getCloudInventory(IMAGE_DIR, IMAGE_EXT_RE);
         const localImgs = collectLocalImages(localSets);
 
@@ -7892,6 +8598,7 @@ LegoCore.registerBlock({
             toDelete = cloudInv.filter(c => !localKeys.has(looseKey(c.folder, c.name)));
         }
 
+        // Upload first, delete after — the cloud is never left half-empty
         for (let i = 0; i < toUpload.length; i++) {
             lockUI(`☁️ Img: Pushing ${i + 1}/${toUpload.length}...`);
             await bunnyRequest('PUT', toUpload[i].path, await blobToArrayBuffer(toUpload[i].blob));
@@ -7902,77 +8609,163 @@ LegoCore.registerBlock({
             await bunnyRequest('DELETE', toDelete[i].path);
         }
 
-        lockUI('📝 Saving set titles...');
+        lockUI('📝 Saving set details...');
         await putJSON(IMAGE_MANIFEST, {
-            version: 1,
+            version: 2,
             updatedAt: new Date().toISOString(),
-            sets: localSets.map(s => ({ title: s.title, order: typeof s.order === 'number' ? s.order : null }))
+            sets: localSets.map(s => ({
+                syncId: s.syncId || s.id,
+                title: s.title,
+                order: typeof s.order === 'number' ? s.order : null,
+                images: (s.images || []).filter(i => i && i.blob).map(i => String(i.id))
+            }))
         });
 
         if (force) return unlockUI(`✅ Force Mirror Complete! Pushed ${toUpload.length} images.`);
-        if (!toUpload.length && !toDelete.length) return unlockUI('✅ Images up to date (titles synced).');
+        if (!toUpload.length && !toDelete.length) return unlockUI('✅ Images up to date (details synced).');
         unlockUI(`✅ Image Backup: Uploaded ${toUpload.length}, Removed ${toDelete.length}.`);
     }
 
+    // Pull matches each cloud set to a local set by: permanent ID → shared images → title.
+    // So a renamed set is RENAMED here (before v5 it was downloaded again as a second set).
     async function pullImages() {
         lockUI('📥 Fetching Image Inventory...');
         const imgDb = await getImageDb();
-        if (!imgDb) throw new Error('Image DB not initialized.');
+        if (!imgDb || !imgDb.objectStoreNames.contains('sets')) throw new Error('Image DB not initialized.');
 
         const manifest = await fetchJSON(IMAGE_MANIFEST);
-        const titleByKey = new Map();
-        if (manifest && Array.isArray(manifest.sets)) {
-            manifest.sets.forEach(s => { if (s && s.title) titleByKey.set(looseKey(s.title, ''), s); });
-        }
-
+        const mSets = (manifest && Array.isArray(manifest.sets)) ? manifest.sets.filter(s => s && s.title) : [];
         const localSets = await getLocalImageSets(imgDb);
         const cloudInv = await getCloudInventory(IMAGE_DIR, IMAGE_EXT_RE);
 
-        const localKeys = new Set();
-        localSets.forEach(s => (s.images || []).forEach(i => localKeys.add(looseKey(s.title, i.id))));
-        const toDownload = cloudInv.filter(c => !localKeys.has(looseKey(c.folder, c.name)));
-
         const dirty = new Set();
-
-        // Repair mangled set titles
         localSets.forEach(s => {
-            const m = titleByKey.get(looseKey(s.title, ''));
-            if (m && m.title !== s.title) { s.title = m.title; dirty.add(s); }
+            if (!Array.isArray(s.images)) { s.images = []; dirty.add(s); }
+            if (!s.syncId) { s.syncId = s.id; dirty.add(s); }
         });
-        const repaired = dirty.size;
 
-        // Download everything first (network), write to DB afterwards in one transaction
-        for (let i = 0; i < toDownload.length; i++) {
-            lockUI(`📥 Img: Pulling ${i + 1}/${toDownload.length}...`);
-            const file = toDownload[i];
-            const setKey = looseKey(file.folder, '');
-            let set = localSets.find(s => looseKey(s.title, '') === setKey);
-            if (!set) {
-                const m = titleByKey.get(setKey);
-                set = {
-                    id: 'set_' + Date.now() + Math.random(),
-                    title: m ? m.title : file.folder,
-                    images: [],
-                    order: m && typeof m.order === 'number' ? m.order : localSets.length + 1
-                };
-                localSets.push(set);
+        const fileByImg = new Map();
+        cloudInv.forEach(f => { const k = imgKey(f.name); if (k && !fileByImg.has(k)) fileByImg.set(k, f); });
+
+        // 1) The sets the cloud describes
+        const remote = [];
+        const claimed = new Set();
+        mSets.forEach(m => {
+            if (!Array.isArray(m.images)) return; // older manifest → grouped by cloud folder below
+            const keys = m.images.map(imgKey).filter(Boolean);
+            keys.forEach(k => claimed.add(k));
+            remote.push({ syncId: m.syncId || null, title: m.title, order: typeof m.order === 'number' ? m.order : null, keys, ordered: true });
+        });
+        // Files no manifest set claims (older backups): one set per cloud folder
+        const metaByFolder = new Map(mSets.map(m => [looseKey(m.title, ''), m]));
+        const legacyGroups = new Map();
+        cloudInv.forEach(f => {
+            const k = imgKey(f.name);
+            if (!k || claimed.has(k)) return;
+            const gk = looseKey(f.folder, '');
+            if (!legacyGroups.has(gk)) {
+                const m = metaByFolder.get(gk);
+                legacyGroups.set(gk, { syncId: null, title: m ? m.title : f.folder, order: m && typeof m.order === 'number' ? m.order : null, keys: [], ordered: false });
             }
+            legacyGroups.get(gk).keys.push(k);
+        });
+        legacyGroups.forEach(g => remote.push(g));
+
+        // 2) Match: permanent ID first (for all sets), then shared images, then title
+        const keysOf = new Map(localSets.map(s => [s, new Set(s.images.map(i => imgKey(i.id)))]));
+        const pairs = new Map(); // remote → local
+        const used = new Set();
+        const stages = [
+            (r, s) => !!r.syncId && s.syncId === r.syncId,
+            (r, s) => r.keys.some(k => keysOf.get(s).has(k)),
+            (r, s) => looseKey(s.title, '') === looseKey(r.title, '')
+        ];
+        stages.forEach(test => remote.forEach(r => {
+            if (pairs.has(r)) return;
+            const s = localSets.find(x => !used.has(x) && test(r, x));
+            if (s) { pairs.set(r, s); used.add(s); }
+        }));
+
+        const remap = new Map(); // old permanent ID → new one (for sequences)
+        let renamed = 0, created = 0;
+        remote.forEach(r => {
+            let s = pairs.get(r);
+            if (!s) {
+                if (!r.keys.some(k => fileByImg.has(k))) return; // nothing downloadable
+                const id = 'set_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7);
+                s = { id, syncId: r.syncId || id, title: r.title, images: [], order: r.order !== null ? r.order : localSets.length + 1 };
+                localSets.push(s); keysOf.set(s, new Set()); pairs.set(r, s); used.add(s);
+                dirty.add(s); created++;
+                return;
+            }
+            if (r.title && s.title !== r.title) { s.title = r.title; renamed++; dirty.add(s); }
+            if (r.syncId && s.syncId !== r.syncId) { if (s.syncId) remap.set(s.syncId, r.syncId); s.syncId = r.syncId; dirty.add(s); }
+            if (r.order !== null && s.order !== r.order) { s.order = r.order; dirty.add(s); }
+        });
+
+        // 3) Download missing images (network first, database write at the end)
+        const jobs = [];
+        pairs.forEach((s, r) => {
+            const have = keysOf.get(s);
+            r.keys.forEach(k => { if (!have.has(k) && fileByImg.has(k)) { have.add(k); jobs.push({ s, file: fileByImg.get(k) }); } });
+        });
+        for (let i = 0; i < jobs.length; i++) {
+            lockUI(`📥 Img: Pulling ${i + 1}/${jobs.length}...`);
+            const { s, file } = jobs[i];
             const blob = await bunnyRequest('GET', file.path, null, 'blob');
             const thumb = await compressThumbnail(blob);
-            set.images = set.images || [];
-            set.images.push({ id: file.name, type: blob.type || 'image/jpeg', blob, thumb });
-            dirty.add(set);
+            s.images.push({ id: file.name, type: blob.type || 'image/jpeg', blob, thumb });
+            dirty.add(s);
             await sleep(100);
         }
 
-        if (!dirty.size) return unlockUI('✅ Local images are fully synced.');
+        // Same image order as the other computer
+        pairs.forEach((s, r) => {
+            if (!r.ordered) return;
+            const pos = new Map(r.keys.map((k, i) => [k, i]));
+            const at = img => (pos.has(imgKey(img.id)) ? pos.get(imgKey(img.id)) : 1e9);
+            const before = s.images.map(i => i.id).join('|');
+            s.images.sort((a, b) => at(a) - at(b));
+            if (s.images.map(i => i.id).join('|') !== before) dirty.add(s);
+        });
+
+        // 4) Duplicates left behind by renaming a set before this update
+        //    (a local set that isn't in the cloud and only holds images of a cloud set)
+        const dupes = [];
+        localSets.forEach(x => {
+            if (used.has(x)) return;
+            const ks = [...keysOf.get(x)];
+            if (!ks.length) return;
+            for (const [r, s] of pairs) {
+                if (s !== x && ks.every(k => r.keys.includes(k))) { dupes.push({ dupe: x, keep: s }); break; }
+            }
+        });
+        let removed = 0;
+        if (dupes.length && confirm(
+            `Found ${dupes.length} duplicate image set(s), left over from renaming sets before this update:\n\n` +
+            dupes.slice(0, 8).map(d => `• "${d.dupe.title}"  (same images as "${d.keep.title}")`).join('\n') +
+            (dupes.length > 8 ? '\n…' : '') +
+            `\n\nRemove the duplicates? Sequences that used them will point to the kept set.`
+        )) {
+            dupes.forEach(d => { if (d.dupe.syncId && d.keep.syncId) remap.set(d.dupe.syncId, d.keep.syncId); });
+            removed = dupes.length;
+        }
+
+        if (!dirty.size && !removed) return unlockUI('✅ Local images are fully synced.');
 
         const tx = imgDb.transaction(['sets'], 'readwrite');
         const store = tx.objectStore('sets');
         dirty.forEach(s => store.put(s));
+        if (removed) dupes.forEach(d => store.delete(d.dupe.id));
         await txDone(tx);
 
-        unlockUI(`✅ Images: Pulled ${toDownload.length} · Repaired ${repaired} set title(s)`);
+        if (core.remapSequenceRefs) core.remapSequenceRefs('set', remap);
+
+        const parts = [`Pulled ${jobs.length}`];
+        if (renamed) parts.push(`Renamed ${renamed}`);
+        if (created) parts.push(`New sets ${created}`);
+        if (removed) parts.push(`Removed ${removed} duplicate(s)`);
+        unlockUI(`✅ Images: ${parts.join(' · ')}`);
     }
 
     // ============================================================
@@ -8111,7 +8904,7 @@ LegoCore.registerBlock({
     wrap.querySelector('#ig-csc-force-img').onclick = action(() => pushImages(true),
         '⚠️ Rewrite the cloud images from THIS computer?\nImages that only exist in the cloud will be removed.');
 
-    console.log('[CloudSyncCenterModule] v4 — exact names + manifests active.');
+    console.log('[CloudSyncCenterModule] v5 — exact names + manifests + permanent IDs active.');
     core.emit('block:ready', { id: 'cloudSyncCenterModule' });
   }
 });
@@ -8324,24 +9117,44 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Sequence Manager (v3)
+   BLOCK: Sequence Manager (v5)
    ============================================================ */
 /* ============================================================
-   BLOCK: Sequence Manager (v2 - Keyboard Builder + Enter-Paced Playback)
-   Built for: LegoCore v2 + Commands v29 (from v28.1) + Quick Chat Box v2
+   BLOCK: Sequence Manager (v5 - 🔗 Permanent IDs + Fix missing steps)
+   Built for: LegoCore v3 + Commands v29 (from v28.1) + Quick Chat Box v2
+   v5:
+   - Steps point at the item's PERMANENT ID (same on every computer), not the
+     local database number → no more "random audio" on the other computer
+   - Renaming an audio / snippet / image set renames it in every sequence
+     (LegoCore repairs the titles; this list re-draws on its own)
+   - Builder (✏️): steps that can't be found are orange ⚠️
+       ✓ = use the suggested item   ↻ = pick the right item (Esc cancels)
+   - Missing items are never guessed — they're skipped with a warning
    - Builder: Commands v28.1-style dropdown + side preview panel
               (badges, token highlights, smooth hover — duplicated, own classes)
    - Search: core.searchInventory (same accent-insensitive engine as /commands)
    - Saved list: Text-Library-style rows (duplicated styles, own classes)
-   - HUD: Enter = next step, Esc = cancel, 1s double-tap lock,
+   - HUD: Enter = next step, Esc = cancel, double-tap lock,
           missing items auto-skipped
-   Storage: localStorage 'ig_sequences_v1' (synced via Bunny master config)
+   v3:
+   - 🔁 own icon (no longer shares 📋 with the Text Library)
+   - ✏️ pencil = edit steps AND rename (inline name field in the builder)
+   - Draft steps are a vertical list, drag ⠿ up/down to reorder
+   - 📁 Folders: create, rename, delete (sequences kept), drag to reorder,
+     collapse/expand, drag sequences onto a folder to file them
+   Storage: 'ig_sequences_v1' (each sequence may carry .folder)
+            'ig_seq_folders_v1' (folder order, incl. empty folders)
+            'ig_seq_folders_collapsed_v1' (collapsed folders)
+            — all synced via Bunny master config
    ============================================================ */
 LegoCore.registerBlock({
   id: 'sequenceManagerModule',
   init(core) {
     const COL_PREF_KEY = 'ig_seq_col_widths_v1';
     const HUD_POS_KEY = 'ig_seq_hud_pos_v1';
+    const FOLDERS_KEY = 'ig_seq_folders_v1';
+    const COLLAPSED_KEY = 'ig_seq_folders_collapsed_v1';
+    const SEQ_ICON = '🔁';
     // Debounce only — NOT a "wait for Instagram" delay. The async-fetch race is already covered
     // by run.sending; this just absorbs OS key-repeat (holding Enter) and stray duplicate
     // keydowns. It must stay short: the user's normal rhythm is load‑Enter, send‑Enter, back to
@@ -8358,6 +9171,9 @@ LegoCore.registerBlock({
       try { const raw = localStorage.getItem(key); if (raw === null) return fallback; const v = JSON.parse(raw); return v == null ? fallback : v; }
       catch (e) { return fallback; }
     }
+    function writeJson(key, value) {
+      try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { /* noop */ }
+    }
     function el(tag, className, text) {
       const node = document.createElement(tag);
       if (className) node.className = className;
@@ -8366,6 +9182,32 @@ LegoCore.registerBlock({
     }
     function iconFor(kind) { return KIND_ICON[kind] || '•'; }
     function stepLabel(step) { return `${iconFor(step.kind)} ${step.title || '(untitled)'}`; }
+
+    /* ---- Folder helpers ---- */
+    function folderOf(seq) { return String((seq && seq.folder) || '').trim(); }
+    function getStoredFolders() {
+      const v = readJson(FOLDERS_KEY, []);
+      return Array.isArray(v) ? v.map(n => String(n || '').trim()).filter(Boolean) : [];
+    }
+    // Stored order first, then any folder a sequence points to that isn't in the list yet
+    function getFolderList() {
+      const list = [];
+      const seen = new Set();
+      const add = (n) => { if (n && !seen.has(n)) { seen.add(n); list.push(n); } };
+      getStoredFolders().forEach(add);
+      core.getSequences().forEach(s => add(folderOf(s)));
+      return list;
+    }
+    function saveFolderList(list) { writeJson(FOLDERS_KEY, list); }
+    function folderExists(name, except) {
+      const low = name.toLowerCase();
+      return getFolderList().some(n => n !== except && n.toLowerCase() === low);
+    }
+    function getCollapsed() {
+      const v = readJson(COLLAPSED_KEY, []);
+      return new Set(Array.isArray(v) ? v : []);
+    }
+    function saveCollapsed(set) { writeJson(COLLAPSED_KEY, [...set]); }
 
     /* ---- Duplicated render helpers (from Commands v28.1) — kept local so this block can diverge ---- */
     function tokenToAccentRegex(token) {
@@ -8431,26 +9273,42 @@ LegoCore.registerBlock({
       .ig-seq-hbtn.active-filter { background: #6366f1; color: white; border-color: #8b5cf6; }
       .ig-seq-find-input { width: 100%; background: #1e293b; border: 1px solid #475569; color: #fff; padding: 6px 8px; border-radius: 4px; font-size: 11px; box-sizing: border-box; outline: none; }
       .ig-seq-find-input:focus { border-color: #6366f1; }
+      .ig-seq-find-input.invalid { border-color: #dc2626; }
 
       /* ---- Builder ---- */
       .ig-seq-builder { display: flex; flex-direction: column; gap: 6px; background: rgba(0,0,0,0.2); border: 1px solid #334155; border-radius: 6px; padding: 8px; }
       .ig-seq-builder.is-editing { border-color: #c9a876; }
       .ig-seq-builder-head { display: flex; align-items: center; gap: 6px; }
       .ig-seq-mode-label { flex: 1; font-size: 11px; font-weight: bold; color: #94a3b8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-      .ig-seq-builder.is-editing .ig-seq-mode-label { color: #c9a876; }
-      .ig-seq-draft-zone { display: flex; flex-wrap: wrap; gap: 4px; min-height: 26px; max-height: 120px; overflow-y: auto; padding: 2px; }
+      .ig-seq-builder.is-editing .ig-seq-mode-label { flex: 0 0 auto; color: #c9a876; }
+      .ig-seq-name-input { flex: 1; min-width: 0; background: #0f172a; color: #fff; border: 1px solid #c9a876; border-radius: 4px; padding: 4px 6px; font-size: 11px; font-weight: bold; outline: none; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+      .ig-seq-name-input:focus { border-color: #e5c99a; box-shadow: 0 0 0 1px rgba(201,168,118,0.4); }
+
+      /* Draft steps — vertical list */
+      .ig-seq-draft-zone { display: flex; flex-direction: column; gap: 3px; min-height: 26px; max-height: 220px; overflow-y: auto; padding: 2px; }
       .ig-seq-draft-zone::-webkit-scrollbar { width: 4px; }
       .ig-seq-draft-zone::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
       .ig-seq-draft-empty { font-size: 10px; color: #64748b; font-style: italic; padding: 5px 2px; }
-      .ig-seq-pill { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; background: #1e293b; border: 1px solid #475569; border-radius: 12px; padding: 2px 4px 2px 6px; font-size: 10px; color: #f8fafc; cursor: grab; user-select: none; }
-      .ig-seq-pill:active { cursor: grabbing; }
-      .ig-seq-pill.is-dragging { opacity: 0.35; }
-      .ig-seq-pill.drop-left { box-shadow: -2px 0 0 #10b981; }
-      .ig-seq-pill.drop-right { box-shadow: 2px 0 0 #10b981; }
-      .ig-seq-pill-num { font-size: 9px; font-weight: bold; color: #c9a876; }
-      .ig-seq-pill-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 120px; }
-      .ig-seq-pill-x { background: transparent; border: none; color: #64748b; cursor: pointer; font-size: 9px; padding: 1px 3px; border-radius: 8px; line-height: 1; }
-      .ig-seq-pill-x:hover { color: #fff; background: rgba(220,38,38,0.6); }
+      .ig-seq-step { display: flex; align-items: center; gap: 6px; background: #1e293b; border: 1px solid #475569; border-radius: 5px; padding: 4px 4px 4px 6px; font-size: 11px; color: #f8fafc; cursor: grab; user-select: none; transition: background 0.1s; }
+      .ig-seq-step:hover { background: #273449; }
+      .ig-seq-step:active { cursor: grabbing; }
+      .ig-seq-step.is-dragging { opacity: 0.35; }
+      .ig-seq-step.drop-above { box-shadow: 0 -2px 0 #10b981; }
+      .ig-seq-step.drop-below { box-shadow: 0 2px 0 #10b981; }
+      .ig-seq-step-grip { color: #475569; font-size: 10px; flex-shrink: 0; }
+      .ig-seq-step-num { font-size: 9px; font-weight: bold; color: #c9a876; min-width: 14px; text-align: right; flex-shrink: 0; }
+      .ig-seq-step-icon { flex-shrink: 0; }
+      .ig-seq-step-title { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .ig-seq-step-x { background: transparent; border: none; color: #64748b; cursor: pointer; font-size: 10px; padding: 2px 5px; border-radius: 4px; line-height: 1; flex-shrink: 0; }
+      .ig-seq-step-x:hover { color: #fff; background: rgba(220,38,38,0.6); }
+      .ig-seq-step.is-missing { border-color: #f59e0b; background: rgba(245,158,11,0.08); }
+      .ig-seq-step.is-missing .ig-seq-step-title { color: #fbbf24; }
+      .ig-seq-step.is-replacing { border-color: #6366f1; box-shadow: 0 0 0 1px #6366f1; }
+      .ig-seq-step-suggest { max-width: 45%; flex-shrink: 1; min-width: 0; font-size: 10px; color: #94a3b8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .ig-seq-step-fix { background: rgba(255,255,255,0.08); border: none; color: #e2e8f0; cursor: pointer; font-size: 10px; font-weight: bold; padding: 2px 6px; border-radius: 4px; line-height: 1.2; flex-shrink: 0; }
+      .ig-seq-step-fix:hover { background: #6366f1; color: #fff; }
+      .ig-seq-step-fix.ok:hover { background: #10b981; }
+
       .ig-seq-cmd-input { width: 100%; background: #0f172a; color: #fff; border: 1px solid #334155; border-radius: 6px; padding: 7px 8px; font-size: 12px; outline: none; box-sizing: border-box; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; transition: border 0.2s; }
       .ig-seq-cmd-input:focus { border-color: #6366f1; }
       .ig-seq-builder-status { font-size: 10px; color: #64748b; min-height: 13px; line-height: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -8495,6 +9353,7 @@ LegoCore.registerBlock({
       .ig-seq-row-item.is-editing { box-shadow: inset 2px 0 0 #c9a876; }
 
       .ig-seq-row { display: flex; align-items: center; padding: 4px 6px; }
+      .ig-seq-row-item.in-folder .ig-seq-row { padding-left: 18px; }
       .ig-seq-drag-grip { color: #475569; font-size: 10px; cursor: grab; margin-right: 6px; }
       .ig-seq-drag-grip:active { cursor: grabbing; }
       .ig-seq-title-col { display: flex; align-items: center; font-size: 11px; color: #f8fafc; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; gap: 4px; }
@@ -8511,8 +9370,26 @@ LegoCore.registerBlock({
       .ig-seq-btn:hover { background: rgba(255,255,255,0.1); color: #fff; }
 
       .ig-seq-preview { font-size: 10px; color: #94a3b8; padding: 0 8px 8px 30px; line-height: 1.5; display: none; white-space: pre-wrap; word-wrap: break-word; background: rgba(0,0,0,0.2); }
+      .ig-seq-row-item.in-folder .ig-seq-preview { padding-left: 42px; }
       .ig-seq-preview.visible { display: block; }
       .ig-seq-preview-line.missing { color: #f59e0b; }
+
+      /* ---- Folders ---- */
+      .ig-seq-folder-head { display: flex; align-items: center; gap: 5px; padding: 5px 6px; margin-top: 3px; border-radius: 4px; background: rgba(255,255,255,0.04); border: 1px solid transparent; cursor: pointer; font-size: 11px; font-weight: bold; color: #e2e8f0; user-select: none; transition: background 0.15s; }
+      .ig-seq-folder-head:hover { background: rgba(255,255,255,0.08); }
+      .ig-seq-folder-head.is-drop-into { border-color: #10b981; background: rgba(16,185,129,0.12); }
+      .ig-seq-folder-head .ig-seq-drag-grip { margin-right: 0; }
+      .ig-seq-folder-caret { color: #64748b; font-size: 9px; width: 8px; flex-shrink: 0; }
+      .ig-seq-folder-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .ig-seq-folder-actions { display: flex; gap: 2px; opacity: 0; transition: opacity 0.15s; }
+      .ig-seq-folder-head:hover .ig-seq-folder-actions { opacity: 1; }
+      .ig-seq-folder-actions .ig-seq-btn { font-size: 10px; padding: 2px 4px; }
+      .ig-seq-folder-rename { flex: 1; min-width: 0; background: #0f172a; color: #fff; border: 1px solid #6366f1; border-radius: 4px; padding: 2px 5px; font-size: 11px; font-weight: bold; outline: none; box-sizing: border-box; }
+      .ig-seq-folder-rename.invalid { border-color: #dc2626; }
+      .ig-seq-folder-empty { font-size: 10px; color: #64748b; font-style: italic; padding: 4px 6px 6px 26px; }
+      .ig-seq-unfile-drop { display: none; font-size: 10px; color: #94a3b8; text-align: center; padding: 6px; margin-bottom: 4px; border: 1px dashed #475569; border-radius: 4px; }
+      .ig-seq-unfile-drop.visible { display: block; }
+      .ig-seq-unfile-drop.is-over { border-color: #10b981; color: #10b981; background: rgba(16,185,129,0.08); }
 
       /* ---- HUD ---- */
       .ig-seq-hud { position: fixed; z-index: 2147483646; width: 340px; max-width: calc(100vw - 16px); box-sizing: border-box; background: rgba(15, 23, 42, 0.96); backdrop-filter: blur(8px); border: 1px solid #6366f1; border-radius: 10px; padding: 10px 12px; display: none; flex-direction: column; gap: 6px; box-shadow: 0 10px 30px rgba(0,0,0,0.55); font-family: -apple-system, sans-serif; color: #fff; }
@@ -8538,12 +9415,15 @@ LegoCore.registerBlock({
     ui.innerHTML = `
       <div class="ig-seq-header-btns">
         <button type="button" class="ig-seq-hbtn" data-act="new" title="Start a new empty sequence">➕ New</button>
+        <button type="button" class="ig-seq-hbtn" data-act="folder" title="Create a folder">📁 Folder</button>
         <button type="button" class="ig-seq-hbtn" data-act="find" title="Filter saved sequences">🔍 Find</button>
       </div>
-      <input type="text" class="ig-seq-find-input" data-seq-exempt="1" placeholder="Filter sequences by name..." style="display:none;">
+      <input type="text" class="ig-seq-find-input" data-role="newfolder" data-seq-exempt="1" autocomplete="off" spellcheck="false" placeholder="New folder name, then Enter..." style="display:none;">
+      <input type="text" class="ig-seq-find-input" data-role="find" data-seq-exempt="1" placeholder="Filter sequences or folders by name..." style="display:none;">
       <div class="ig-seq-builder">
         <div class="ig-seq-builder-head">
           <span class="ig-seq-mode-label">✨ New sequence</span>
+          <input type="text" class="ig-seq-name-input" data-seq-exempt="1" autocomplete="off" spellcheck="false" placeholder="Sequence name" title="Rename — Enter saves" style="display:none;">
           <button type="button" class="ig-seq-btn ig-seq-cancel-edit" title="Stop editing (discard changes)" style="display:none;">✕</button>
         </div>
         <div class="ig-seq-draft-zone"></div>
@@ -8554,10 +9434,13 @@ LegoCore.registerBlock({
     `;
 
     const newBtn = ui.querySelector('[data-act="new"]');
+    const folderBtn = ui.querySelector('[data-act="folder"]');
     const findBtn = ui.querySelector('[data-act="find"]');
-    const findInput = ui.querySelector('.ig-seq-find-input');
+    const newFolderInput = ui.querySelector('[data-role="newfolder"]');
+    const findInput = ui.querySelector('[data-role="find"]');
     const builderEl = ui.querySelector('.ig-seq-builder');
     const modeLabel = ui.querySelector('.ig-seq-mode-label');
+    const nameInput = ui.querySelector('.ig-seq-name-input');
     const cancelEditBtn = ui.querySelector('.ig-seq-cancel-edit');
     const draftZone = ui.querySelector('.ig-seq-draft-zone');
     const cmdInput = ui.querySelector('.ig-seq-cmd-input');
@@ -8574,8 +9457,10 @@ LegoCore.registerBlock({
     /* ---------------------------------------------------------
        DRAFT STATE
        --------------------------------------------------------- */
-    let draft = { editingId: null, name: '', steps: [] };
-    const DEFAULT_HINT = '↑↓ pick · Enter add · ⌫ on empty removes last · /save Name';
+    let draft = { editingId: null, name: '', folder: '', steps: [] };
+    let lastInventory = null; // latest items (set by renderList) — used to check draft steps
+    let replaceIdx = null;    // ↻ re-pick: the next item picked replaces this step
+    const DEFAULT_HINT = '↑↓ pick · Enter add · drag ⠿ to reorder · ⌫ on empty removes last · /save Name';
 
     let statusTimer = null;
     function setBuilderStatus(msg, tone, ms) {
@@ -8586,8 +9471,10 @@ LegoCore.registerBlock({
     }
 
     function resetDraft() {
-      draft = { editingId: null, name: '', steps: [] };
+      draft = { editingId: null, name: '', folder: '', steps: [] };
+      replaceIdx = null;
       cmdInput.value = '';
+      nameInput.value = '';
       closeDropdown();
       renderDraft();
       highlightRows();
@@ -8595,106 +9482,195 @@ LegoCore.registerBlock({
     }
 
     function startEditing(seq) {
-      draft = { editingId: seq.id, name: seq.name || '', steps: (seq.steps || []).map(s => Object.assign({}, s)) };
+      draft = { editingId: seq.id, name: seq.name || '', folder: folderOf(seq), steps: (seq.steps || []).map(s => Object.assign({}, s)) };
+      replaceIdx = null;
       cmdInput.value = '';
+      nameInput.value = draft.name;
       closeDropdown();
       renderDraft();
       highlightRows();
-      setBuilderStatus('✏️ Edit steps, then /save (keeps name) or /save New Name', 'info', 3500);
+      setBuilderStatus('✏️ Rename above · add or drag steps below · Enter in the name (or /save) saves', 'info', 4000);
       builderEl.scrollIntoView({ block: 'nearest' });
       cmdInput.focus();
+      renderList(); // fresh item check for the draft (⚠️ / ✓ / ↻)
     }
 
-    let draggedPillIdx = null;
-    function clearPillDropMarks() {
-      draftZone.querySelectorAll('.drop-left, .drop-right').forEach(p => p.classList.remove('drop-left', 'drop-right'));
+    function replaceHint() { return `↻ Pick the right item for step ${replaceIdx + 1} · Esc cancels`; }
+
+    // ↻ — the next pick from the dropdown replaces this step
+    function startReplace(idx) {
+      const st = draft.steps[idx];
+      if (!st) return;
+      replaceIdx = idx;
+      cmdInput.value = `${st.kind} ${st.title || ''}`.trim() + ' ';
+      renderDraft();
+      setBuilderStatus(replaceHint(), 'info');
+      cmdInput.focus();
+      cmdInput.setSelectionRange(cmdInput.value.length, cmdInput.value.length);
+      recomputeMatches(true);
     }
 
-    function renderDraft() {
+    // Name field: rename while editing. Typing only updates the draft; Enter saves.
+    nameInput.addEventListener('input', () => { draft.name = nameInput.value; });
+    nameInput.addEventListener('keydown', (e) => {
+      if (e.isComposing) return;
+      if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); saveDraft(nameInput.value); }
+      else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); cmdInput.focus(); }
+    });
+
+    let draggedStepIdx = null;
+    function clearStepDropMarks() {
+      draftZone.querySelectorAll('.drop-above, .drop-below').forEach(r => r.classList.remove('drop-above', 'drop-below'));
+    }
+
+    function renderDraft(opts) {
       draftZone.innerHTML = '';
       if (!draft.steps.length) {
         draftZone.appendChild(el('div', 'ig-seq-draft-empty', 'Draft is empty — type below to add steps.'));
       }
+      const inv = lastInventory;
       draft.steps.forEach((step, idx) => {
-        const pill = el('div', 'ig-seq-pill');
-        pill.draggable = true;
-        pill.title = `${step.title || '(untitled)'} — drag to reorder`;
-        const rm = el('button', 'ig-seq-pill-x', '✕');
-        rm.type = 'button'; rm.title = 'Remove step';
-        rm.onclick = (e) => { e.stopPropagation(); draft.steps.splice(idx, 1); renderDraft(); cmdInput.focus(); };
-        pill.append(el('span', 'ig-seq-pill-num', String(idx + 1)), el('span', null, iconFor(step.kind)), el('span', 'ig-seq-pill-title', step.title || '(untitled)'), rm);
+        // Live check against the current items: refresh the name, flag what can't be found
+        let missing = false, suggestion = null;
+        if (inv) {
+          const found = core.findStepItem(step, inv);
+          if (found) {
+            const sid = core.stableIdOf(step.kind, found);
+            if (!step.ref || sid === step.ref) {
+              const fresh = core.makeStep(step.kind, found);
+              if (fresh) { draft.steps[idx] = fresh; step = fresh; }
+            }
+          }
+          missing = !core.resolveStep(step, inv);
+          if (missing) suggestion = core.suggestForStep(step, inv);
+        }
 
-        pill.addEventListener('dragstart', (e) => {
-          draggedPillIdx = idx;
+        const row = el('div', 'ig-seq-step' + (missing ? ' is-missing' : '') + (replaceIdx === idx ? ' is-replacing' : ''));
+        row.draggable = true;
+        row.title = missing
+          ? (suggestion ? `Can't confirm this item. ✓ = use "${suggestion.title}" · ↻ = pick another` : `Not found on this computer. ↻ = pick the right item`)
+          : `${step.title || '(untitled)'} — drag up or down to reorder`;
+
+        const noDrag = (b) => { b.type = 'button'; b.draggable = false; b.onmousedown = (e) => { e.stopPropagation(); e.preventDefault(); }; return b; };
+        const rm = noDrag(el('button', 'ig-seq-step-x', '✕'));
+        rm.title = 'Remove step';
+        rm.onclick = (e) => { e.stopPropagation(); draft.steps.splice(idx, 1); replaceIdx = null; renderDraft(); cmdInput.focus(); };
+
+        const parts = [
+          el('span', 'ig-seq-step-grip', '⠿'),
+          el('span', 'ig-seq-step-num', String(idx + 1)),
+          el('span', 'ig-seq-step-icon', iconFor(step.kind)),
+          el('span', 'ig-seq-step-title', (missing ? '⚠️ ' : '') + (step.title || '(untitled)'))
+        ];
+        if (suggestion) {
+          parts.push(el('span', 'ig-seq-step-suggest', `→ ${suggestion.title}?`));
+          const ok = noDrag(el('button', 'ig-seq-step-fix ok', '✓'));
+          ok.title = `Use "${suggestion.title}"`;
+          ok.onclick = (e) => {
+            e.stopPropagation();
+            const fixed = core.makeStep(step.kind, suggestion.item);
+            if (!fixed) return;
+            draft.steps[idx] = fixed; replaceIdx = null;
+            renderDraft();
+            setBuilderStatus(`✓ Step ${idx + 1} is now ${stepLabel(fixed)} — /save to keep it`, 'ok', 2500);
+            cmdInput.focus();
+          };
+          parts.push(ok);
+        }
+        if (missing) {
+          const re = noDrag(el('button', 'ig-seq-step-fix', '↻'));
+          re.title = 'Pick the right item for this step';
+          re.onclick = (e) => { e.stopPropagation(); startReplace(idx); };
+          parts.push(re);
+        }
+        parts.push(rm);
+        row.append(...parts);
+
+        row.addEventListener('dragstart', (e) => {
+          draggedStepIdx = idx;
           e.dataTransfer.effectAllowed = 'move';
-          try { e.dataTransfer.setData('text/plain', 'ig-seq-pill'); } catch (_) { /* noop */ }
-          setTimeout(() => pill.classList.add('is-dragging'), 0);
+          try { e.dataTransfer.setData('text/plain', 'ig-seq-step'); } catch (_) { /* noop */ }
+          setTimeout(() => row.classList.add('is-dragging'), 0);
         });
-        pill.addEventListener('dragend', () => { pill.classList.remove('is-dragging'); draggedPillIdx = null; clearPillDropMarks(); });
-        pill.addEventListener('dragover', (e) => {
-          if (draggedPillIdx === null) return;
+        row.addEventListener('dragend', () => { row.classList.remove('is-dragging'); draggedStepIdx = null; clearStepDropMarks(); });
+        row.addEventListener('dragover', (e) => {
+          if (draggedStepIdx === null) return;
           e.preventDefault(); e.stopPropagation();
-          clearPillDropMarks();
-          if (draggedPillIdx === idx) return;
-          const r = pill.getBoundingClientRect();
-          pill.classList.add(e.clientX < r.left + r.width / 2 ? 'drop-left' : 'drop-right');
+          clearStepDropMarks();
+          if (draggedStepIdx === idx) return;
+          const r = row.getBoundingClientRect();
+          row.classList.add(e.clientY < r.top + r.height / 2 ? 'drop-above' : 'drop-below');
         });
-        pill.addEventListener('drop', (e) => {
-          if (draggedPillIdx === null) return;
+        row.addEventListener('drop', (e) => {
+          if (draggedStepIdx === null) return;
           e.preventDefault(); e.stopPropagation();
-          const r = pill.getBoundingClientRect();
-          const before = e.clientX < r.left + r.width / 2;
-          const moved = draft.steps.splice(draggedPillIdx, 1)[0];
-          let target = idx > draggedPillIdx ? idx - 1 : idx;
+          const r = row.getBoundingClientRect();
+          const before = e.clientY < r.top + r.height / 2;
+          const from = draggedStepIdx;
+          draggedStepIdx = null;
+          if (from === idx) { clearStepDropMarks(); return; }
+          replaceIdx = null;
+          const moved = draft.steps.splice(from, 1)[0];
+          let target = idx > from ? idx - 1 : idx;
           if (!before) target += 1;
           draft.steps.splice(target, 0, moved);
-          draggedPillIdx = null;
           renderDraft();
         });
-        draftZone.appendChild(pill);
+        draftZone.appendChild(row);
       });
 
       const editing = !!draft.editingId;
       builderEl.classList.toggle('is-editing', editing);
-      modeLabel.textContent = editing ? `✏️ Editing: ${draft.name || 'Untitled'}` : '✨ New sequence';
+      modeLabel.textContent = editing ? '✏️ Name' : '✨ New sequence';
+      nameInput.style.display = editing ? '' : 'none';
       cancelEditBtn.style.display = editing ? '' : 'none';
-      draftZone.scrollTop = draftZone.scrollHeight;
+      if (opts && opts.scrollToEnd) draftZone.scrollTop = draftZone.scrollHeight;
     }
 
     function addStepFromMatch(m) {
-      let step = null;
-      if (m.kind === 'audio') step = { kind: 'audio', refId: m.item.id, title: m.item.name || 'Audio clip', folder: m.item.folder || 'General' };
-      else if (m.kind === 'set') step = { kind: 'set', refId: m.item.id, title: m.item.title || 'Image set' };
-      else if (m.kind === 'text') step = { kind: 'text', refId: m.item.id, title: m.item.title || (m.item.text || '').slice(0, 25) || 'Text' };
+      const step = core.makeStep(m.kind, m.item); // permanent ID, not the local number
       if (!step) return;
-      draft.steps.push(step);
       cmdInput.value = '';
       closeDropdown();
-      renderDraft();
-      setBuilderStatus(`➕ Added ${stepLabel(step)}`, 'ok', 1500);
+      if (replaceIdx !== null && replaceIdx < draft.steps.length) {
+        const at = replaceIdx;
+        replaceIdx = null;
+        draft.steps[at] = step;
+        renderDraft();
+        setBuilderStatus(`↻ Step ${at + 1} is now ${stepLabel(step)}`, 'ok', 1800);
+      } else {
+        replaceIdx = null;
+        draft.steps.push(step);
+        renderDraft({ scrollToEnd: true });
+        setBuilderStatus(`➕ Added ${stepLabel(step)}`, 'ok', 1500);
+      }
       cmdInput.focus();
     }
 
     function saveDraft(nameArg) {
-      const name = (nameArg || '').trim() || draft.name;
+      const name = (nameArg || '').trim() || (draft.name || '').trim();
       if (!draft.steps.length) { setBuilderStatus('⚠️ Add at least one step before saving.', 'warn', 2500); return; }
-      if (!name) { setBuilderStatus('⚠️ Name it: /save My Sequence', 'warn', 2500); return; }
+      if (!name) { setBuilderStatus(draft.editingId ? '⚠️ The name can\'t be empty.' : '⚠️ Name it: /save My Sequence', 'warn', 2500); return; }
 
       const sequences = core.getSequences();
       const steps = draft.steps.map(s => Object.assign({}, s));
       const now = Date.now();
-      let savedName = name;
+      const savedName = name;
 
       const existing = draft.editingId ? sequences.find(s => s.id === draft.editingId) : null;
       if (existing) {
-        existing.name = name; existing.steps = steps; existing.updatedAt = now;
+        existing.name = name; existing.steps = steps; existing.updatedAt = now; // folder untouched
       } else {
-        sequences.push({ id: draft.editingId || ('seq_' + now), name, steps, createdAt: now, updatedAt: now });
+        const seq = { id: draft.editingId || ('seq_' + now), name, steps, createdAt: now, updatedAt: now };
+        if (draft.folder) seq.folder = draft.folder;
+        sequences.push(seq);
       }
+      const stillMissing = lastInventory ? steps.filter(st => !core.resolveStep(st, lastInventory)).length : 0;
       core.saveSequences(sequences); // emits 'sequences:updated' -> renderList()
       const wasEditing = !!existing;
       resetDraft();
-      setBuilderStatus(wasEditing ? `✅ Updated "${savedName}"` : `✅ Saved "${savedName}"`, 'ok', 2200);
+      if (stillMissing) setBuilderStatus(`💾 Saved "${savedName}" — ${stillMissing} step(s) still ⚠️ (they'll be skipped)`, 'warn', 3500);
+      else setBuilderStatus(wasEditing ? `✅ Updated "${savedName}"` : `✅ Saved "${savedName}"`, 'ok', 2200);
     }
 
     /* ---------------------------------------------------------
@@ -8825,7 +9801,7 @@ LegoCore.registerBlock({
         else setBuilderStatus(draft.editingId ? `💾 Enter to update as "${name}"` : `💾 Enter to save as "${name}"`, 'info');
         return;
       }
-      if (!val.trim() && !forceAll) { closeDropdown(); setBuilderStatus(DEFAULT_HINT); return; }
+      if (!val.trim() && !forceAll) { closeDropdown(); setBuilderStatus(replaceIdx !== null ? replaceHint() : DEFAULT_HINT, replaceIdx !== null ? 'info' : ''); return; }
 
       const raw = val.startsWith('/') ? val.slice(1) : val;
       const parsed = core.parseSearchPrefix(raw);
@@ -8850,6 +9826,13 @@ LegoCore.registerBlock({
         if ((e.key === 'Enter' || e.key === 'Tab') && matches.length) { e.preventDefault(); e.stopPropagation(); addStepFromMatch(matches[selectedIndex]); return; }
         if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeDropdown(); return; }
       }
+      if (e.key === 'Escape' && replaceIdx !== null) {
+        e.preventDefault(); e.stopPropagation();
+        replaceIdx = null; cmdInput.value = '';
+        renderDraft();
+        setBuilderStatus('Re-pick cancelled.', 'warn', 1500);
+        return;
+      }
       if (e.key === 'ArrowDown' && !dropdownOpen) { e.preventDefault(); recomputeMatches(true); return; }
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault(); e.stopPropagation();
@@ -8861,7 +9844,8 @@ LegoCore.registerBlock({
       if (e.key === 'Backspace' && cmdInput.value === '' && draft.steps.length) {
         e.preventDefault();
         const removed = draft.steps.pop();
-        renderDraft();
+        replaceIdx = null;
+        renderDraft({ scrollToEnd: true });
         setBuilderStatus(`⌫ Removed ${stepLabel(removed)}`, 'warn', 1500);
       }
     });
@@ -8882,15 +9866,52 @@ LegoCore.registerBlock({
     };
     findInput.addEventListener('input', () => renderList());
 
+    /* ---- New folder input ---- */
+    function setNewFolderOpen(open) {
+      newFolderInput.style.display = open ? '' : 'none';
+      folderBtn.classList.toggle('active-filter', open);
+      newFolderInput.value = '';
+      newFolderInput.classList.remove('invalid');
+      newFolderInput.title = '';
+      if (open) newFolderInput.focus();
+    }
+    function createFolder(raw) {
+      const name = String(raw || '').trim();
+      if (!name) return;
+      if (folderExists(name)) {
+        newFolderInput.classList.add('invalid');
+        newFolderInput.title = 'A folder with that name already exists';
+        return;
+      }
+      const list = getFolderList();
+      list.push(name);
+      saveFolderList(list);
+      const c = getCollapsed(); c.delete(name); saveCollapsed(c);
+      setNewFolderOpen(false);
+      renderList();
+    }
+    folderBtn.onclick = () => setNewFolderOpen(newFolderInput.style.display === 'none');
+    newFolderInput.addEventListener('input', () => { newFolderInput.classList.remove('invalid'); newFolderInput.title = ''; });
+    newFolderInput.addEventListener('keydown', (e) => {
+      if (e.isComposing) return;
+      if (e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); createFolder(newFolderInput.value); }
+      else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setNewFolderOpen(false); }
+    });
+
     /* ---------------------------------------------------------
-       SAVED LIST (Text-Library rows, own classes)
+       SAVED LIST (Text-Library rows, own classes) + FOLDERS
        --------------------------------------------------------- */
     let listToken = 0;
     let draggedSeqId = null;
+    let draggedFolder = null;
     let activeColResizer = null;
 
     function clearRowDropMarks() {
-      tree.querySelectorAll('.ig-seq-drop-top, .ig-seq-drop-bottom').forEach(r => r.classList.remove('ig-seq-drop-top', 'ig-seq-drop-bottom'));
+      tree.querySelectorAll('.ig-seq-drop-top, .ig-seq-drop-bottom, .is-drop-into, .is-over')
+        .forEach(r => r.classList.remove('ig-seq-drop-top', 'ig-seq-drop-bottom', 'is-drop-into', 'is-over'));
+    }
+    function hideUnfileDrops() {
+      tree.querySelectorAll('.ig-seq-unfile-drop').forEach(d => d.classList.remove('visible', 'is-over'));
     }
 
     function highlightRows() {
@@ -8914,35 +9935,232 @@ LegoCore.registerBlock({
       core.saveSequences(core.getSequences().filter(s => s.id !== seq.id));
     }
 
+    // Dropping on a row: reorder AND adopt that row's folder (so it works across folders)
     function reorderSequences(dragId, targetId, before) {
       const list = core.getSequences();
       const from = list.findIndex(s => s.id === dragId);
-      if (from < 0) return;
+      const target = list.find(s => s.id === targetId);
+      if (from < 0 || !target) return;
+      const targetFolder = folderOf(target);
       const moved = list.splice(from, 1)[0];
       let to = list.findIndex(s => s.id === targetId);
       if (to < 0) return;
       if (!before) to += 1;
       list.splice(to, 0, moved);
+      if (targetFolder) moved.folder = targetFolder; else delete moved.folder;
       core.saveSequences(list);
     }
 
-    function buildRow(seq, index, inventory) {
+    // Dropping on a folder header (or the unfile strip): file it at the end of that folder
+    function moveSequenceToFolder(id, folder) {
+      const list = core.getSequences();
+      const i = list.findIndex(s => s.id === id);
+      if (i < 0) return;
+      if (folderOf(list[i]) === folder) { renderList(); return; }
+      const moved = list.splice(i, 1)[0];
+      if (folder) moved.folder = folder; else delete moved.folder;
+      list.push(moved);
+      core.saveSequences(list);
+    }
+
+    function reorderFolders(dragName, targetName, before) {
+      const list = getFolderList();
+      const from = list.indexOf(dragName);
+      if (from < 0) return;
+      list.splice(from, 1);
+      let to = list.indexOf(targetName);
+      if (to < 0) return;
+      if (!before) to += 1;
+      list.splice(to, 0, dragName);
+      saveFolderList(list);
+      renderList();
+    }
+
+    function toggleCollapsed(name) {
+      const c = getCollapsed();
+      if (c.has(name)) c.delete(name); else c.add(name);
+      saveCollapsed(c);
+      renderList();
+    }
+
+    function renameFolder(oldName, raw) {
+      const newName = String(raw || '').trim();
+      if (!newName || newName === oldName) return 'same';
+      if (folderExists(newName, oldName)) return 'dup';
+      saveFolderList(getFolderList().map(n => (n === oldName ? newName : n)));
+      const c = getCollapsed();
+      if (c.delete(oldName)) c.add(newName);
+      saveCollapsed(c);
+      const seqs = core.getSequences();
+      let changed = false;
+      seqs.forEach(s => { if (folderOf(s) === oldName) { s.folder = newName; changed = true; } });
+      if (changed) core.saveSequences(seqs);
+      if (draft.folder === oldName) draft.folder = newName;
+      return 'ok';
+    }
+
+    function deleteFolder(name) {
+      const seqs = core.getSequences();
+      const inside = seqs.filter(s => folderOf(s) === name);
+      const msg = inside.length
+        ? `Delete folder "${name}"?\n\nIts ${inside.length} sequence(s) will NOT be deleted — they just move out of the folder.`
+        : `Delete empty folder "${name}"?`;
+      if (!confirm(msg)) return;
+      saveFolderList(getFolderList().filter(n => n !== name));
+      const c = getCollapsed(); c.delete(name); saveCollapsed(c);
+      if (draft.folder === name) draft.folder = '';
+      if (inside.length) { inside.forEach(s => { delete s.folder; }); core.saveSequences(seqs); }
+      else renderList();
+    }
+
+    function startFolderRename(head, oldName) {
+      const nameEl = head.querySelector('.ig-seq-folder-name');
+      if (!nameEl) return;
+      const input = el('input', 'ig-seq-folder-rename');
+      input.type = 'text';
+      input.value = oldName;
+      input.spellcheck = false;
+      input.setAttribute('data-seq-exempt', '1');
+      nameEl.replaceWith(input);
+      input.focus();
+      input.select();
+
+      let done = false;
+      const finish = (commit, fromBlur) => {
+        if (done) return;
+        if (commit && renameFolder(oldName, input.value) === 'dup' && !fromBlur) {
+          input.classList.add('invalid');
+          input.title = 'A folder with that name already exists';
+          return;
+        }
+        done = true;
+        renderList();
+      };
+      input.addEventListener('keydown', (e) => {
+        e.stopPropagation();
+        if (e.isComposing) return;
+        if (e.key === 'Enter') { e.preventDefault(); finish(true, false); }
+        else if (e.key === 'Escape') { e.preventDefault(); finish(false, false); }
+      });
+      input.addEventListener('input', () => { input.classList.remove('invalid'); input.title = ''; });
+      input.addEventListener('blur', () => finish(true, true));
+      input.addEventListener('click', (e) => e.stopPropagation());
+    }
+
+    function buildFolderHeader(name, count, isOpen) {
+      const head = el('div', 'ig-seq-folder-head');
+      head.dataset.folder = name;
+
+      const grip = el('span', 'ig-seq-drag-grip', '⠿');
+      grip.draggable = true; grip.title = 'Drag to reorder folders';
+      const nameEl = el('span', 'ig-seq-folder-name', name);
+      nameEl.title = name;
+      const actions = el('div', 'ig-seq-folder-actions');
+      const renameBtn = el('button', 'ig-seq-btn', '✏️'); renameBtn.type = 'button'; renameBtn.title = 'Rename folder';
+      const delBtn = el('button', 'ig-seq-btn', '🗑️'); delBtn.type = 'button'; delBtn.title = 'Delete folder (sequences are kept)';
+      actions.append(renameBtn, delBtn);
+
+      head.append(
+        grip,
+        el('span', 'ig-seq-folder-caret', isOpen ? '▾' : '▸'),
+        el('span', null, isOpen ? '📂' : '📁'),
+        nameEl,
+        el('span', 'ig-seq-count-pill', String(count)),
+        actions
+      );
+
+      head.onclick = (e) => {
+        if (e.target.closest('button') || e.target.closest('input') || e.target === grip) return;
+        if (findInput.value.trim()) return; // while filtering, matching folders stay open
+        toggleCollapsed(name);
+      };
+      renameBtn.onclick = (e) => { e.stopPropagation(); startFolderRename(head, name); };
+      delBtn.onclick = (e) => { e.stopPropagation(); deleteFolder(name); };
+
+      grip.addEventListener('dragstart', (e) => {
+        draggedFolder = name;
+        e.dataTransfer.effectAllowed = 'move';
+        try { e.dataTransfer.setData('text/plain', 'ig-seq-folder'); } catch (_) { /* noop */ }
+        setTimeout(() => { head.style.opacity = '0.3'; }, 0);
+      });
+      grip.addEventListener('dragend', () => { head.style.opacity = '1'; draggedFolder = null; clearRowDropMarks(); });
+
+      head.addEventListener('dragover', (e) => {
+        if (draggedSeqId) {
+          e.preventDefault(); e.stopPropagation();
+          clearRowDropMarks();
+          head.classList.add('is-drop-into');
+          return;
+        }
+        if (!draggedFolder) return;
+        e.preventDefault(); e.stopPropagation();
+        clearRowDropMarks();
+        if (draggedFolder === name) return;
+        const r = head.getBoundingClientRect();
+        head.classList.add(e.clientY - r.top < r.height / 2 ? 'ig-seq-drop-top' : 'ig-seq-drop-bottom');
+      });
+      head.addEventListener('dragleave', (e) => {
+        if (head.contains(e.relatedTarget)) return;
+        head.classList.remove('is-drop-into', 'ig-seq-drop-top', 'ig-seq-drop-bottom');
+      });
+      head.addEventListener('drop', (e) => {
+        if (draggedSeqId) {
+          e.preventDefault(); e.stopPropagation();
+          const id = draggedSeqId;
+          draggedSeqId = null;
+          clearRowDropMarks(); hideUnfileDrops();
+          moveSequenceToFolder(id, name);
+          return;
+        }
+        if (!draggedFolder) return;
+        e.preventDefault(); e.stopPropagation();
+        const r = head.getBoundingClientRect();
+        const before = e.clientY - r.top < r.height / 2;
+        const drag = draggedFolder;
+        draggedFolder = null;
+        clearRowDropMarks();
+        if (drag !== name) reorderFolders(drag, name, before);
+      });
+
+      return head;
+    }
+
+    function buildUnfileDrop() {
+      const d = el('div', 'ig-seq-unfile-drop', '📤 Drop here to take it out of its folder');
+      d.addEventListener('dragover', (e) => {
+        if (!draggedSeqId) return;
+        e.preventDefault(); e.stopPropagation();
+        d.classList.add('is-over');
+      });
+      d.addEventListener('dragleave', () => d.classList.remove('is-over'));
+      d.addEventListener('drop', (e) => {
+        if (!draggedSeqId) return;
+        e.preventDefault(); e.stopPropagation();
+        const id = draggedSeqId;
+        draggedSeqId = null;
+        hideUnfileDrops();
+        moveSequenceToFolder(id, '');
+      });
+      return d;
+    }
+
+    function buildRow(seq, index, inventory, inFolder) {
       const steps = Array.isArray(seq.steps) ? seq.steps : [];
       const missingFlags = inventory ? steps.map(s => !core.resolveStep(s, inventory)) : steps.map(() => false);
       const missingCount = missingFlags.filter(Boolean).length;
 
-      const item = el('div', 'ig-seq-row-item' + (index % 2 === 1 ? ' alt-bg' : ''));
+      const item = el('div', 'ig-seq-row-item' + (index % 2 === 1 ? ' alt-bg' : '') + (inFolder ? ' in-folder' : ''));
       item.dataset.id = seq.id;
 
       const row = el('div', 'ig-seq-row');
       const grip = el('span', 'ig-seq-drag-grip', '⠿');
-      grip.draggable = true; grip.title = 'Drag to reorder';
+      grip.draggable = true; grip.title = 'Drag to reorder, or onto a folder';
 
       const titleCol = el('div', 'ig-seq-title-col');
       titleCol.style.width = colWidths.titleWidth + '%';
       const titleText = el('span', 'ig-seq-title-text');
       titleText.innerHTML = formatTitleWithTags(seq.name || 'Untitled', []); // escaped inside
-      titleCol.append(el('span', null, '📋'), titleText);
+      titleCol.append(el('span', null, SEQ_ICON), titleText);
 
       const resizer = el('div', 'ig-seq-col-resizer');
       resizer.title = 'Drag to resize columns';
@@ -8951,7 +10169,7 @@ LegoCore.registerBlock({
       meta.appendChild(el('span', 'ig-seq-count-pill', `${steps.length} step${steps.length === 1 ? '' : 's'}`));
       if (missingCount) {
         const warn = el('span', 'ig-seq-warn-pill', `⚠️ ${missingCount}`);
-        warn.title = `${missingCount} step(s) reference deleted items and will be skipped`;
+        warn.title = `${missingCount} step(s) can't be found and will be skipped — click ✏️ to fix them (✓ / ↻)`;
         meta.appendChild(warn);
       }
       meta.appendChild(el('span', 'ig-seq-kind-icons', steps.map(s => iconFor(s.kind)).join('')));
@@ -8959,7 +10177,7 @@ LegoCore.registerBlock({
       const actions = el('div', 'ig-seq-actions');
       const playBtn = el('button', 'ig-seq-btn', '▶️'); playBtn.type = 'button'; playBtn.title = 'Load sequence (Enter sends each step)';
       const previewBtn = el('button', 'ig-seq-btn', '👁️'); previewBtn.type = 'button'; previewBtn.title = 'Toggle step list';
-      const editBtn = el('button', 'ig-seq-btn', '✏️'); editBtn.type = 'button'; editBtn.title = 'Edit sequence';
+      const editBtn = el('button', 'ig-seq-btn', '✏️'); editBtn.type = 'button'; editBtn.title = 'Edit steps or rename';
       const delBtn = el('button', 'ig-seq-btn', '🗑️'); delBtn.type = 'button'; delBtn.title = 'Delete sequence';
       actions.append(playBtn, previewBtn, editBtn, delBtn);
 
@@ -8968,7 +10186,7 @@ LegoCore.registerBlock({
       const preview = el('div', 'ig-seq-preview');
       if (!steps.length) preview.textContent = 'Empty sequence.';
       steps.forEach((s, i) => {
-        const line = el('div', 'ig-seq-preview-line' + (missingFlags[i] ? ' missing' : ''), `${i + 1}. ${stepLabel(s)}${missingFlags[i] ? '  ⚠️ missing' : ''}`);
+        const line = el('div', 'ig-seq-preview-line' + (missingFlags[i] ? ' missing' : ''), `${i + 1}. ${stepLabel(s)}${missingFlags[i] ? '  ⚠️ not found — ✏️ to fix' : ''}`);
         preview.appendChild(line);
       });
 
@@ -8987,9 +10205,13 @@ LegoCore.registerBlock({
         draggedSeqId = seq.id;
         e.dataTransfer.effectAllowed = 'move';
         try { e.dataTransfer.setData('text/plain', 'ig-seq-row'); } catch (_) { /* noop */ }
-        setTimeout(() => { item.style.opacity = '0.3'; }, 0);
+        // Deferred: changing layout inside dragstart can cancel the drag
+        setTimeout(() => {
+          item.style.opacity = '0.3';
+          if (folderOf(seq)) tree.querySelectorAll('.ig-seq-unfile-drop').forEach(d => d.classList.add('visible'));
+        }, 0);
       });
-      grip.addEventListener('dragend', () => { item.style.opacity = '1'; draggedSeqId = null; clearRowDropMarks(); });
+      grip.addEventListener('dragend', () => { item.style.opacity = '1'; draggedSeqId = null; clearRowDropMarks(); hideUnfileDrops(); });
       item.addEventListener('dragover', (e) => {
         if (!draggedSeqId) return;
         e.preventDefault(); e.stopPropagation();
@@ -9006,7 +10228,7 @@ LegoCore.registerBlock({
         const before = e.clientY - r.top < r.height / 2;
         const dragId = draggedSeqId;
         draggedSeqId = null;
-        clearRowDropMarks();
+        clearRowDropMarks(); hideUnfileDrops();
         if (dragId !== seq.id) reorderSequences(dragId, seq.id, before);
       });
 
@@ -9021,26 +10243,58 @@ LegoCore.registerBlock({
 
     async function renderList() {
       const token = ++listToken;
-      const sequences = core.getSequences();
       let inventory = null;
       try { inventory = await core.getSearchableInventory(); } catch (e) { inventory = null; }
       if (token !== listToken) return;
+      if (inventory) {
+        lastInventory = inventory;
+        if (draft.steps.length && draggedStepIdx === null) renderDraft(); // refresh names / ⚠️ in the builder
+      }
+
+      const sequences = core.getSequences();
+      const folders = getFolderList();
+      if (JSON.stringify(folders) !== JSON.stringify(getStoredFolders())) saveFolderList(folders);
+      const collapsed = getCollapsed();
 
       // keep open previews open across re-renders
       const openIds = new Set(Array.from(tree.querySelectorAll('.ig-seq-row-item')).filter(r => r.querySelector('.ig-seq-preview.visible')).map(r => r.dataset.id));
 
       tree.innerHTML = '';
       const filter = findInput.value.trim().toLowerCase();
-      const visible = sequences.filter(s => !filter || (s.name || '').toLowerCase().includes(filter));
-      if (!visible.length) {
-        tree.appendChild(el('div', 'ig-seq-list-empty', sequences.length ? 'No sequences match that filter.' : 'No saved sequences yet. Build one above and type /save Name.'));
-        return;
-      }
-      visible.forEach((seq, i) => {
-        const row = buildRow(seq, i, inventory);
+      const nameMatches = (s) => !filter || (s.name || '').toLowerCase().includes(filter);
+      const folderSet = new Set(folders);
+      let rowIndex = 0, shown = 0;
+
+      const addRow = (seq, inFolder) => {
+        const row = buildRow(seq, rowIndex++, inventory, inFolder);
         if (openIds.has(seq.id)) row.querySelector('.ig-seq-preview').classList.add('visible');
         tree.appendChild(row);
+        shown++;
+      };
+
+      tree.appendChild(buildUnfileDrop());
+
+      // 1) Unfiled sequences on top
+      sequences.filter(s => !folderSet.has(folderOf(s)) && nameMatches(s)).forEach(s => addRow(s, false));
+
+      // 2) Folders, in saved order
+      folders.forEach(name => {
+        const members = sequences.filter(s => folderOf(s) === name);
+        const folderHit = !!filter && name.toLowerCase().includes(filter);
+        const visibleMembers = (!filter || folderHit) ? members : members.filter(nameMatches);
+        if (filter && !folderHit && !visibleMembers.length) return;
+        const isOpen = filter ? true : !collapsed.has(name);
+        tree.appendChild(buildFolderHeader(name, members.length, isOpen));
+        shown++;
+        if (!isOpen) return;
+        if (!members.length) tree.appendChild(el('div', 'ig-seq-folder-empty', 'Empty — drag a sequence onto the folder name.'));
+        else visibleMembers.forEach(s => addRow(s, true));
       });
+
+      if (!shown) {
+        tree.appendChild(el('div', 'ig-seq-list-empty', filter ? 'No sequences match that filter.' : 'No saved sequences yet. Build one above and type /save Name.'));
+        return;
+      }
       highlightRows();
     }
 
@@ -9150,7 +10404,7 @@ LegoCore.registerBlock({
       const next = seq.steps[idx];
       const armed = !run.complete && run.stage === 'armed';
 
-      hudName.textContent = '📋 ' + (seq.name || 'Sequence');
+      hudName.textContent = `${SEQ_ICON} ` + (seq.name || 'Sequence');
       hudFill.style.width = (total ? Math.round((Math.min(idx, total) / total) * 100) : 100) + '%';
 
       let status;
@@ -9211,7 +10465,7 @@ LegoCore.registerBlock({
       let payload = null, step = null, skipped = 0;
       while (idx < seq.steps.length) {
         step = seq.steps[idx];
-        try { payload = await core.fetchItemData(step.kind, step.refId, step); } catch (e) { payload = null; }
+        try { payload = await core.fetchStepData(step); } catch (e) { payload = null; }
         if (myToken !== run.token) return; // cancelled/replaced while fetching
         if (payload) break;
         skipped++; idx++;
@@ -9309,7 +10563,7 @@ LegoCore.registerBlock({
        --------------------------------------------------------- */
     function mountCard(attemptsLeft = 10) {
       if (typeof core.registerMenu === 'function') {
-        core.registerMenu('left', '📋 Sequences', ui, '⠿', 'sequence-manager');
+        core.registerMenu('left', `${SEQ_ICON} Sequences`, ui, '⠿', 'sequence-manager');
         renderDraft();
         setBuilderStatus(DEFAULT_HINT);
         renderList();
@@ -9525,6 +10779,246 @@ LegoCore.registerBlock({
     mountCard();
 
     core.emit('block:ready', { id: 'tagColorSettingsModule' });
+  }
+});
+
+/* ============================================================
+   BLOCK: Audio Engine (v2)
+   ============================================================ */
+/* ============================================================
+   BLOCK: Audio WAV Engine (v2 - Single-pass trim + WAV mono)
+   ------------------------------------------------------------
+   Standalone plugin. Paste it as a NEW block.
+
+   - core.audio.toWav(blob)  → real WAV, mono, 16-bit, at the chosen
+     quality (24 kHz or 48 kHz). Already-correct WAVs are returned
+     untouched. Reads what the audio REALLY is (Ogg, m4a, WebM, MP3,
+     WAV), never trusts the file name or label.
+   - Replaces core.injectClipToChat: every audio is converted to WAV
+     right before it is sent, so old Ogg clips in the library work too.
+   - core.audio.process(blob, opts) → trims AND converts in ONE pass
+     (manual cut start in ms, auto start, auto end, end margin).
+   - core.audio.getQuickTrimOpts() → the Quick Message trim settings
+     (shared by the Quick Message recorder and the Commands menu).
+   - Settings (changed from the ⚙️ in the Audio Library):
+       quality: 24000 or 48000 Hz
+       sendAs:  'm4a' (WAV inside, .m4a name — proven) or 'wav'
+   ============================================================ */
+LegoCore.registerBlock({
+  id: 'audioWavEngine',
+  init(core) {
+    const PREFS_KEY = 'ig_audio_wav_prefs_v1';
+    const DEFAULTS = { rate: 48000, sendAs: 'm4a' };
+
+    function getPrefs() {
+      try {
+        const p = JSON.parse(localStorage.getItem(PREFS_KEY)) || {};
+        return {
+          rate: p.rate === 24000 ? 24000 : 48000,
+          sendAs: p.sendAs === 'wav' ? 'wav' : 'm4a'
+        };
+      } catch (e) { return { ...DEFAULTS }; }
+    }
+    function setPrefs(patch) {
+      const next = { ...getPrefs(), ...(patch || {}) };
+      localStorage.setItem(PREFS_KEY, JSON.stringify(next));
+      core.emit('audio:prefs', next);
+      return next;
+    }
+
+    // ---------- What is this audio really? ----------
+    async function sniff(blob) {
+      if (!blob || !blob.size) return { kind: 'empty' };
+      const head = new Uint8Array(await blob.slice(0, 64).arrayBuffer());
+      const str = (o, n) => String.fromCharCode(...head.slice(o, o + n));
+
+      if (str(0, 4) === 'RIFF' && str(8, 4) === 'WAVE') {
+        // Look for the "fmt " chunk (usually right at byte 12)
+        const big = new DataView(await blob.slice(0, 512).arrayBuffer());
+        let off = 12;
+        while (off + 8 <= big.byteLength) {
+          const id = String.fromCharCode(big.getUint8(off), big.getUint8(off + 1), big.getUint8(off + 2), big.getUint8(off + 3));
+          const size = big.getUint32(off + 4, true);
+          if (id === 'fmt ' && off + 24 <= big.byteLength) {
+            return {
+              kind: 'wav',
+              format: big.getUint16(off + 8, true),
+              channels: big.getUint16(off + 10, true),
+              rate: big.getUint32(off + 12, true),
+              bits: big.getUint16(off + 22, true)
+            };
+          }
+          off += 8 + size + (size % 2);
+        }
+        return { kind: 'wav' };
+      }
+      if (str(0, 4) === 'OggS') return { kind: 'ogg' };
+      if (str(4, 4) === 'ftyp') return { kind: 'mp4' };
+      if (head[0] === 0x1A && head[1] === 0x45 && head[2] === 0xDF && head[3] === 0xA3) return { kind: 'webm' };
+      if (str(0, 3) === 'ID3' || (head[0] === 0xFF && (head[1] & 0xE0) === 0xE0)) return { kind: 'mp3' };
+      return { kind: 'unknown' };
+    }
+
+    async function isTargetWav(blob, rate) {
+      const info = await sniff(blob);
+      return info.kind === 'wav' && info.format === 1 && info.channels === 1 &&
+             info.bits === 16 && info.rate === (rate || getPrefs().rate);
+    }
+
+    // ---------- WAV writer (mono, 16-bit PCM) ----------
+    function encodeWavMono(samples, rate) {
+      const dataLen = samples.length * 2;
+      const buf = new ArrayBuffer(44 + dataLen);
+      const v = new DataView(buf);
+      const ws = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+      ws(0, 'RIFF'); v.setUint32(4, 36 + dataLen, true); ws(8, 'WAVE');
+      ws(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+      v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+      ws(36, 'data'); v.setUint32(40, dataLen, true);
+      let o = 44;
+      for (let i = 0; i < samples.length; i++, o += 2) {
+        const s = Math.max(-1, Math.min(1, samples[i]));
+        v.setInt16(o, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      }
+      return new Blob([buf], { type: 'audio/wav' });
+    }
+
+    // ---------- ONE pass: decode once → cut → mono + quality → WAV ----------
+    // opts:
+    //   rate        24000 | 48000 (default: the ⚙️ setting)
+    //   cutStartMs  fixed cut from the start (manual — no detection, no extra work)
+    //   autoStart   detect where the voice starts (keeps startPadMs before it)
+    //   autoEnd     detect where the voice ends (keeps endPadMs after it)
+    //   threshold   detection sensitivity (Medium = 0.035)
+    //   guard       batch safety: don't cut more than half a clip
+    // Returns { blob, status, cutStartMs, cutEndMs }
+    //   status: 'ok' | 'unchanged' | 'silent' | 'too-much' | 'error'
+    // Never throws: on failure the original blob comes back with status 'error'.
+    const DECODE_RATE = 48000;
+    const NO_CUT_MS = 10; // cuts smaller than this count as "nothing to cut"
+
+    async function process(blob, opts = {}) {
+      const rate = opts.rate || getPrefs().rate;
+      const result = (b, status, cs = 0, ce = 0) => ({ blob: b, status, cutStartMs: Math.round(cs), cutEndMs: Math.round(ce) });
+      if (!blob) return result(blob, 'error');
+
+      const wantsCut = (opts.cutStartMs > 0) || opts.autoStart || opts.autoEnd;
+      try {
+        // Fast path: nothing to cut and already the right format → no work at all
+        if (!wantsCut && await isTargetWav(blob, rate)) {
+          return result(blob.type === 'audio/wav' ? blob : new Blob([blob], { type: 'audio/wav' }), 'unchanged');
+        }
+
+        const decoder = new OfflineAudioContext(1, 1, DECODE_RATE);
+        const decoded = await decoder.decodeAudioData(await blob.arrayBuffer());
+        const len = decoded.length;
+        const sr = decoded.sampleRate;
+        const msToS = ms => Math.floor((ms / 1000) * sr);
+
+        let startIdx = 0, endIdx = len, status = 'ok';
+
+        // 1) Manual cut (pure arithmetic — essentially free)
+        const manual = Math.max(0, Number(opts.cutStartMs) || 0);
+        if (manual > 0 && msToS(manual) < len) startIdx = msToS(manual);
+
+        // 2) Auto detection (only when asked)
+        if (opts.autoStart || opts.autoEnd) {
+          const ch = decoded.getChannelData(0);
+          const th = Number(opts.threshold) || 0.035;
+          let first = -1, last = -1;
+          for (let i = startIdx; i < len; i++) { if (Math.abs(ch[i]) > th) { first = i; break; } }
+          if (first === -1) {
+            status = 'silent'; // nothing above the threshold — don't auto-cut anything
+          } else {
+            for (let i = len - 1; i >= first; i--) { if (Math.abs(ch[i]) > th) { last = i; break; } }
+            if (opts.autoStart) startIdx = Math.max(startIdx, first - msToS(opts.startPadMs ?? 50));
+            if (opts.autoEnd) endIdx = Math.min(len, last + msToS(opts.endPadMs ?? 150));
+          }
+        }
+
+        // Ignore tiny cuts so running the batch twice changes nothing
+        if (startIdx < msToS(NO_CUT_MS)) startIdx = 0;
+        if (len - endIdx < msToS(NO_CUT_MS)) endIdx = len;
+        if (endIdx <= startIdx) { startIdx = 0; endIdx = len; }
+
+        if (opts.guard) {
+          if (status === 'silent') return result(blob, 'silent');
+          if ((endIdx - startIdx) < len * 0.5) return result(blob, 'too-much', startIdx / sr * 1000, (len - endIdx) / sr * 1000);
+        }
+        if (startIdx === 0 && endIdx === len && await isTargetWav(blob, rate)) {
+          return result(blob, status === 'silent' ? 'silent' : 'unchanged');
+        }
+
+        // 3) Render: a 1-channel offline context mixes to mono + resamples in the same pass
+        const durS = (endIdx - startIdx) / sr;
+        const ctx = new OfflineAudioContext(1, Math.max(1, Math.ceil(durS * rate)), rate);
+        const src = ctx.createBufferSource();
+        src.buffer = decoded;
+        src.connect(ctx.destination);
+        src.start(0, startIdx / sr, durS);
+        const rendered = await ctx.startRendering();
+        return result(encodeWavMono(rendered.getChannelData(0), rate), status, startIdx / sr * 1000, (len - endIdx) / sr * 1000);
+      } catch (e) {
+        console.warn('[AudioWavEngine] Could not process audio, keeping original:', e);
+        return result(blob, 'error');
+      }
+    }
+
+    // Convert anything → WAV mono at the chosen quality (no trimming)
+    async function toWav(blob, opts = {}) {
+      return (await process(blob, { rate: opts.rate })).blob;
+    }
+
+    // ---------- Quick Message trim settings (also used by the Commands menu) ----------
+    //   Cut start: 'off' | 'auto' | 'manual' (+ ms). Trim end: auto on/off.
+    function getQuickTrimOpts() {
+      const ls = k => { try { return localStorage.getItem(k); } catch (e) { return null; } };
+      let startMode = ls('sb_quick_cutstart_mode');
+      if (!['off', 'auto', 'manual'].includes(startMode)) {
+        startMode = ls('sb_quick_autotrim_start') === 'true' ? 'auto' : 'off'; // older setting
+      }
+      const msRaw = parseInt(ls('sb_quick_cutstart_ms'), 10);
+      return {
+        startMode,
+        cutStartMs: startMode === 'manual' ? (Number.isFinite(msRaw) ? Math.max(0, msRaw) : 300) : 0,
+        autoStart: startMode === 'auto',
+        autoEnd: ls('sb_quick_autotrim_end') === 'true',
+        threshold: parseFloat(ls('sb_quick_silence_threshold')) || 0.035
+      };
+    }
+
+    // ---------- Sending: always WAV ----------
+    function dropIntoChat(chatZone, file) {
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      ['dragenter', 'dragover', 'drop'].forEach(type => {
+        chatZone.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, dataTransfer: dt }));
+      });
+    }
+
+    function injectClipToChat(blob, name, opts = {}) {
+      if (!blob) return false;
+      const chatZone = core.getActiveChatZone();
+      if (!chatZone) {
+        if (!opts || !opts.silent) alert("Open an active Instagram chat window first.");
+        return false;
+      }
+      const baseName = String(name || 'clip').replace(/\.(m4a|wav|ogg|mp3|webm)$/i, '');
+      toWav(blob).then(wav => {
+        const { sendAs } = getPrefs();
+        const file = sendAs === 'wav'
+          ? new File([wav], `${baseName}.wav`, { type: 'audio/wav' })
+          : new File([wav], `${baseName}.m4a`, { type: 'audio/mp4' });
+        // Re-check the chat in case it changed during the (very short) conversion
+        dropIntoChat(core.getActiveChatZone() || chatZone, file);
+      });
+      return true;
+    }
+
+    core.audio = { toWav, process, getQuickTrimOpts, sniff, isTargetWav, getPrefs, setPrefs, encodeWavMono };
+    core.injectClipToChat = injectClipToChat;
+
+    core.emit('block:ready', { id: 'audioWavEngine' });
   }
 });
 
