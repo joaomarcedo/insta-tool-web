@@ -2,7 +2,7 @@
 // @name         Instagram Lego Toolkit
 // @namespace    https://node-builder.local/
 // @version      1.0.0
-// @description  Compiled by Node Builder -- 29 block(s): Quick Message Recorder, Sidebar Plugin Manager, Recorder Studio, Audio Library, Dual Sidebar UI Shell, menuCollapseModule, Menu Panel Switcher Module, Menu Card Pop-out Module, Header Toolbar Organizer Module, Workspace Profile & Visibility Manager, Instagram Resizer Feature, Sidebar-to-Resizer Sync, Quick Chat Box, Text Library Module (Saved Snippets), image manager, Highlighter, Commands, Reorder Module, Text Library Height Fix (v1), Reset menus, Image Library, Emoji Module, Mobile Core, Mobile Bottom Sheet UI, Master Config Bunny Sync, native emoji picker, Sequence Manager, Tag Colors, Audio Engine
+// @description  Compiled by Node Builder -- 29 block(s): Quick Message Recorder, Sidebar Plugin Manager, Recorder Studio, Audio Library, Dual Sidebar UI Shell, menuCollapseModule, Menu Panel Switcher Module, Menu Card Pop-out Module, Header Toolbar Organizer Module, Workspace Profile & Visibility Manager, Instagram Resizer Feature, Sidebar-to-Resizer Sync, Quick Chat Box, Text Library Module (Saved Snippets), Highlighter, Commands, Reorder Module, Text Library Height Fix (v1), Reset menus, Image Library, Emoji Module, Mobile Core, Mobile Bottom Sheet UI, Master Config Bunny Sync, native emoji picker, Sequence Manager, Tag Colors, Audio Engine, Launchpad
 // @author       You
 // @match        https://www.instagram.com/*
 // @grant        GM_xmlhttpRequest
@@ -21,6 +21,28 @@
    ============================================================ */
 /* ================================================================
    CORE ENGINE: Instagram Soundboard & Chat Infrastructure (Safe & Clean)
+   v8 — 🪶 Lighter
+        - Sleeps until you open your DMs (nothing runs on the feed / Reels).
+        - Search, Commands and Sequences keep only image-set titles and image
+          counts; the pictures are read only when a set is sent.
+          New: core.getImageSetFull(id).
+   v7 — 📝 Text Library read once
+        - Searching (Commands, Sequences) uses one ready copy of your snippets,
+          without their pictures, refreshed only when the library changes.
+          Sending a snippet still reads it fresh.
+   v6 — 🎙️ Microphone only when recording
+        - core.mic: one shared mic for every recorder, opened when you press
+          Record, auto-off after an idle time (default 30 s, set in 💬 Quick
+          Message; 0 = off right after each recording). Off when you switch tabs.
+   v5 — 📦 Audio stored apart from its name
+        - Each clip is now TWO records with the same id:
+            'clips'     → name, folder, color, order, transcript, command…  (tiny)
+            'clipBlobs' → { id, blob }                                       (the sound)
+        - Lists, search, Commands and Sequences read only the tiny records.
+          The sound is opened only to play, send, edit, convert or sync.
+        - One-time automatic move on first load (database v2 → v3). It runs in a
+          single transaction: if anything fails, nothing changes and you stay on v2.
+        - New shared helpers for every block: core.clipStore (see section 5b).
    v4 — 🧠 Memory fix
         - Audio clips + image sets are loaded ONCE and shared by every block
           (search, Commands, Sequences, sequence repair). Before, each of them
@@ -62,7 +84,9 @@ const LegoCore = (function () {
     let isQuickRecording = false;
 
     const DB_NAME = 'IG_Soundboard_Fresh_Core_DB';
-    const DB_VERSION = 2;
+    const DB_VERSION = 3;
+    const CLIP_BLOB_STORE = 'clipBlobs';           // v3: the sound lives here, keyed by clip id
+    const CLIP_STORES = ['clips', CLIP_BLOB_STORE];
 
     // Shared storage keys (read-only for core, except sequences)
     const IMAGE_DB_NAME = 'IG_ImageSets_Core_DB';
@@ -92,9 +116,42 @@ const LegoCore = (function () {
             const folderStore = db.createObjectStore('folders', { keyPath: 'name' });
             folderStore.put({ name: "General" });
         }
+        // v3 — move every clip's sound into its own store (one-time, all-or-nothing:
+        // this runs inside the upgrade transaction, so a failure rolls everything back)
+        if (!db.objectStoreNames.contains(CLIP_BLOB_STORE)) {
+            const blobStore = db.createObjectStore(CLIP_BLOB_STORE, { keyPath: 'id' });
+            const clipStore = e.target.transaction.objectStore('clips');
+            let moved = 0;
+            clipStore.openCursor().onsuccess = ev => {
+                const cursor = ev.target.result;
+                if (!cursor) { if (moved) console.log(`[LegoCore] Moved ${moved} audio file(s) to their own store.`); return; }
+                const rec = cursor.value;
+                if (rec && rec.blob) {
+                    blobStore.put({ id: rec.id, blob: rec.blob });
+                    delete rec.blob;
+                    cursor.update(rec);
+                    moved++;
+                }
+                cursor.continue();
+            };
+        }
+    };
+    // Another Instagram tab still has the old version open → the move waits for it
+    request.onblocked = () => {
+        console.warn('[LegoCore] Audio update is waiting: close or reload your other Instagram tabs.');
+        try {
+            if (document.getElementById('ig-core-db-blocked')) return;
+            const note = document.createElement('div');
+            note.id = 'ig-core-db-blocked';
+            note.textContent = '⏳ Toolkit audio update: close or reload your other Instagram tabs to finish.';
+            note.style.cssText = 'position:fixed;bottom:12px;left:50%;transform:translateX(-50%);z-index:2147483647;background:#1e293b;color:#fff;font:12px sans-serif;padding:8px 12px;border-radius:6px;border:1px solid #f59e0b;';
+            (document.body || document.documentElement).appendChild(note);
+        } catch (err) { /* noop */ }
     };
 
     request.onsuccess = e => {
+        const blockedNote = document.getElementById('ig-core-db-blocked');
+        if (blockedNote) blockedNote.remove();
         db = e.target.result;
         db.onversionchange = () => { db.close(); window.location.reload(); };
         emit('db:ready', db);
@@ -326,14 +383,142 @@ const LegoCore = (function () {
         });
     }
 
-    function getClips() {
+    // 5b. Clip storage helpers (v3: info and sound are stored apart)
+    //   Info records never hold the sound. In memory they carry hasAudio: true/false
+    //   (never saved). Anything that writes a clip goes through putInTx/addInTx,
+    //   which splits a { ...info, blob } object into the two stores.
+    function txDonePromise(tx) {
+        return new Promise(resolve => {
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => resolve(false);
+            tx.onabort = () => resolve(false);
+        });
+    }
+    function splitClip(rec) {
+        const meta = Object.assign({}, rec);
+        const blob = meta.blob || null;
+        delete meta.blob;
+        delete meta.hasAudio;
+        return { meta, blob };
+    }
+    // tx must include CLIP_STORES. Returns the request of the info write.
+    function putClipInTx(tx, rec) {
+        const { meta, blob } = splitClip(rec);
+        const store = tx.objectStore('clips');
+        const isNew = meta.id === undefined || meta.id === null;
+        if (isNew) delete meta.id;
+        const req = isNew ? store.add(meta) : store.put(meta);
+        if (blob) req.addEventListener('success', () => { tx.objectStore(CLIP_BLOB_STORE).put({ id: req.result, blob }); });
+        return req;
+    }
+    function addClipInTx(tx, rec) {
+        const copy = Object.assign({}, rec);
+        delete copy.id;
+        return putClipInTx(tx, copy);
+    }
+    // All clip info, no sound. Fast even with hundreds of clips.
+    function listClipMeta() {
         return whenDbReady().then(readyDb => new Promise(resolve => {
             try {
-                const req = readyDb.transaction(['clips'], 'readonly').objectStore('clips').getAll();
-                req.onsuccess = e => resolve(e.target.result || []);
-                req.onerror = () => resolve([]);
+                const tx = readyDb.transaction(CLIP_STORES, 'readonly');
+                let metas = null, keys = null;
+                const done = () => {
+                    if (!metas || !keys) return;
+                    const withSound = new Set(keys);
+                    resolve(metas.map(c => {
+                        const hadOldBlob = !!c.blob;           // safety: a record not moved yet
+                        const m = Object.assign({}, c);
+                        delete m.blob;
+                        m.hasAudio = hadOldBlob || withSound.has(c.id);
+                        return m;
+                    }));
+                };
+                const r1 = tx.objectStore('clips').getAll();
+                r1.onsuccess = e => { metas = e.target.result || []; done(); };
+                r1.onerror = () => resolve([]);
+                const r2 = tx.objectStore(CLIP_BLOB_STORE).getAllKeys();
+                r2.onsuccess = e => { keys = e.target.result || []; done(); };
+                r2.onerror = () => { keys = []; done(); };
             } catch (e) { resolve([]); }
-        }).then(clips => ensureClipSyncIds(readyDb, clips)));
+        }));
+    }
+    // The sound of ONE clip (or null)
+    function getClipBlob(id) {
+        return whenDbReady().then(readyDb => new Promise(resolve => {
+            try {
+                const tx = readyDb.transaction(CLIP_STORES, 'readonly');
+                const req = tx.objectStore(CLIP_BLOB_STORE).get(id);
+                req.onsuccess = () => {
+                    if (req.result && req.result.blob) return resolve(req.result.blob);
+                    // fallback: a record still holding its sound the old way
+                    const old = tx.objectStore('clips').get(id);
+                    old.onsuccess = () => resolve(old.result && old.result.blob ? old.result.blob : null);
+                    old.onerror = () => resolve(null);
+                };
+                req.onerror = () => resolve(null);
+            } catch (e) { resolve(null); }
+        }));
+    }
+    // Info + sound of ONE clip, as one object { ...info, blob } (or null)
+    function getClipFull(id) {
+        return whenDbReady().then(readyDb => new Promise(resolve => {
+            try {
+                const tx = readyDb.transaction(CLIP_STORES, 'readonly');
+                let meta, blobRec, got = 0;
+                const done = () => {
+                    if (++got < 2) return;
+                    if (!meta) return resolve(null);
+                    const full = Object.assign({}, meta);
+                    full.blob = (blobRec && blobRec.blob) || meta.blob || null;
+                    full.hasAudio = !!full.blob;
+                    resolve(full);
+                };
+                const r1 = tx.objectStore('clips').get(id);
+                r1.onsuccess = () => { meta = r1.result || null; done(); };
+                r1.onerror = () => { meta = null; done(); };
+                const r2 = tx.objectStore(CLIP_BLOB_STORE).get(id);
+                r2.onsuccess = () => { blobRec = r2.result || null; done(); };
+                r2.onerror = () => { blobRec = null; done(); };
+            } catch (e) { resolve(null); }
+        }));
+    }
+    // Save a clip ({ ...info, blob? }). New clip (no id) → returns its new id.
+    function saveClip(rec) {
+        return whenDbReady().then(readyDb => {
+            const tx = readyDb.transaction(CLIP_STORES, 'readwrite');
+            const req = putClipInTx(tx, rec);
+            return txDonePromise(tx).then(ok => (ok ? req.result : null));
+        });
+    }
+    // Replace only the sound; name, folder, color, order, command and transcript stay
+    function setClipBlob(id, blob) {
+        return whenDbReady().then(readyDb => {
+            const tx = readyDb.transaction(CLIP_STORES, 'readwrite');
+            tx.objectStore(CLIP_BLOB_STORE).put({ id, blob });
+            // if this clip still held its sound the old way, drop that copy
+            const store = tx.objectStore('clips');
+            const g = store.get(id);
+            g.onsuccess = () => { const c = g.result; if (c && c.blob) { delete c.blob; store.put(c); } };
+            return txDonePromise(tx);
+        });
+    }
+    function deleteClip(id) {
+        return whenDbReady().then(readyDb => {
+            const tx = readyDb.transaction(CLIP_STORES, 'readwrite');
+            tx.objectStore('clips').delete(id);
+            tx.objectStore(CLIP_BLOB_STORE).delete(id);
+            return txDonePromise(tx);
+        });
+    }
+    const clipStore = {
+        STORES: CLIP_STORES, BLOB_STORE: CLIP_BLOB_STORE,
+        list: listClipMeta, getBlob: getClipBlob, getFull: getClipFull,
+        save: saveClip, setBlob: setClipBlob, remove: deleteClip,
+        putInTx: putClipInTx, addInTx: addClipInTx
+    };
+
+    function getClips() {
+        return whenDbReady().then(readyDb => listClipMeta().then(clips => ensureClipSyncIds(readyDb, clips)));
     }
 
     // Opens the Image Sets DB WITHOUT ever creating it: if it doesn't exist yet,
@@ -375,15 +560,32 @@ const LegoCore = (function () {
         });
     }
 
+    // v8: titles only. Sets are read ONE at a time and only their title, id and
+    // image count are kept — the previews and pictures are let go right away.
+    // The full set (with pictures) is read only when it's sent (getImageSetById).
+    function liteSet(rec) {
+        const lite = Object.assign({}, rec);
+        lite.images = (Array.isArray(rec.images) ? rec.images : [])
+            .filter(Boolean)
+            .map(i => ({ id: i.id, type: i.type || (i.blob && i.blob.type) || 'image/jpeg', hasBlob: !!i.blob }));
+        lite.lite = true;
+        return lite;
+    }
     async function getImageSets() {
         const idb = await openImageDb();
         if (!idb) return [];
         if (!idb.objectStoreNames.contains('sets')) { idb.close(); return []; }
         const sets = await new Promise(resolve => {
             try {
-                const req = idb.transaction(['sets'], 'readonly').objectStore('sets').getAll();
-                req.onsuccess = ev => resolve(ev.target.result || []);
-                req.onerror = () => resolve([]);
+                const out = [];
+                const req = idb.transaction(['sets'], 'readonly').objectStore('sets').openCursor();
+                req.onsuccess = ev => {
+                    const cursor = ev.target.result;
+                    if (!cursor) return resolve(out);
+                    out.push(liteSet(cursor.value));
+                    cursor.continue();
+                };
+                req.onerror = () => resolve(out);
             } catch (e) { resolve([]); }
         });
         await ensureSetSyncIds(idb, sets);
@@ -391,10 +593,34 @@ const LegoCore = (function () {
         return sets;
     }
 
-    function getTextSnippets() {
+    // v7: ONE ready copy of the snippets for searching (pictures left out).
+    // Re-read only when the library changes (save / edit / sync / another tab),
+    // or after 60 s at most as a safety net. Before, every letter typed in a
+    // search re-read and rebuilt the whole library, pictures included.
+    const TEXT_CACHE_MAX_AGE_MS = 60000;
+    const textCache = { items: null, at: 0 };
+    function invalidateTextSnippets() { textCache.items = null; }
+    function readTextSnippetsFresh() {
         const data = readJson(TEXT_LIB_KEY, { items: [], tags: [] });
         return (Array.isArray(data.items) ? data.items : []).filter(i => i && i.type === 'snippet');
     }
+    function getTextSnippets(opts) {
+        if (opts && opts.fresh) return readTextSnippetsFresh();            // full items (sending)
+        const fresh = textCache.items && (Date.now() - textCache.at) < TEXT_CACHE_MAX_AGE_MS;
+        if (!fresh) {
+            textCache.items = readTextSnippetsFresh().map(i => {
+                if (!i.thumbnail) return i;
+                const lite = Object.assign({}, i);
+                delete lite.thumbnail;                                    // the picture isn't needed to search
+                lite.hasThumbnail = true;
+                return lite;
+            });
+            textCache.at = Date.now();
+        }
+        return textCache.items.slice();
+    }
+    ['textlib:updated', 'textlib:external-refresh'].forEach(evt => on(evt, invalidateTextSnippets));
+    window.addEventListener('storage', e => { if (!e.key || e.key === TEXT_LIB_KEY) invalidateTextSnippets(); });
 
     function getMcFlows() {
         const flows = readJson(MC_FLOWS_KEY, []);
@@ -610,8 +836,8 @@ const LegoCore = (function () {
     }
     function isUsable(kind, item) {
         if (!item) return false;
-        if (kind === 'audio') return !!item.blob;
-        if (kind === 'set') return Array.isArray(item.images) && item.images.some(i => i && i.blob);
+        if (kind === 'audio') return !!(item.blob || item.hasAudio); // list copies carry hasAudio, fresh reads carry blob
+        if (kind === 'set') return Array.isArray(item.images) && item.images.some(i => i && (i.blob || i.hasBlob)); // list copies carry hasBlob
         if (kind === 'text') return !!item.text;
         return false;
     }
@@ -792,13 +1018,7 @@ const LegoCore = (function () {
     //   text  -> { kind, id, title, text }
     // Re-reads ONE record fresh from its database (so we never send a stale copy)
     function getClipById(id) {
-        return whenDbReady().then(readyDb => new Promise(resolve => {
-            try {
-                const req = readyDb.transaction(['clips'], 'readonly').objectStore('clips').get(id);
-                req.onsuccess = () => resolve(req.result || null);
-                req.onerror = () => resolve(null);
-            } catch (e) { resolve(null); }
-        }));
+        return getClipFull(id); // info + sound, fresh from the database
     }
     async function getImageSetById(id) {
         const idb = await openImageDb();
@@ -819,7 +1039,7 @@ const LegoCore = (function () {
     // If the shared copy was out of date, it is reloaded once and tried again.
     async function lookupFreshItem(step, retried) {
         const kind = step.kind;
-        if (kind === 'text') return resolveStep(step, { textItems: getTextSnippets() });
+        if (kind === 'text') return resolveStep(step, { textItems: getTextSnippets({ fresh: true }) }); // sending: read it fresh
         const inv = await getSearchableInventory();
         const hit = findStepItem(step, inv);
         const fresh = hit ? (kind === 'audio' ? await getClipById(hit.id) : await getImageSetById(hit.id)) : null;
@@ -906,32 +1126,137 @@ const LegoCore = (function () {
         emit('sequence:ended', { reason, sequence: ended });
     }
 
+    // 9b. Shared microphone (v6)
+    //   Nothing touches the mic until a recorder calls core.mic.open().
+    //   All recorders share ONE stream. After the last recording ends, the mic
+    //   stays ready for a short idle time (default 30 s, 0 = close right away),
+    //   so quick back-to-back messages start instantly. Then every track is
+    //   stopped and the browser's "mic in use" light goes off.
+    //   It also closes as soon as you switch to another tab (when not recording).
+    const MIC_IDLE_KEY = 'ig_mic_idle_seconds_v1';
+    const MIC_IDLE_DEFAULT_S = 30;
+    const micState = { stream: null, opening: null, users: 0, idleTimer: null };
+
+    function getMicIdleSeconds() {
+        const n = parseInt(localStorage.getItem(MIC_IDLE_KEY), 10);
+        return Number.isFinite(n) ? Math.max(0, n) : MIC_IDLE_DEFAULT_S;
+    }
+    function setMicIdleSeconds(sec) {
+        const n = Math.max(0, parseInt(sec, 10) || 0);
+        localStorage.setItem(MIC_IDLE_KEY, String(n));
+        emit('mic:settings', { idleSeconds: n });
+        return n;
+    }
+    function micIsLive() {
+        return !!(micState.stream && micState.stream.getAudioTracks().some(t => t.readyState === 'live'));
+    }
+    function closeMicNow() {
+        clearTimeout(micState.idleTimer); micState.idleTimer = null;
+        if (micState.users > 0) return;               // someone is recording — never cut them off
+        if (micState.stream) {
+            try { micState.stream.getTracks().forEach(t => t.stop()); } catch (e) { /* noop */ }
+            micState.stream = null;
+            emit('mic:state', { open: false });
+        }
+    }
+    // Resolves with the shared stream. Every open() must be matched by ONE release().
+    function openMic() {
+        clearTimeout(micState.idleTimer); micState.idleTimer = null;
+        micState.users++;
+        if (micIsLive()) return Promise.resolve(micState.stream);
+        if (!micState.opening) {
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                micState.users = Math.max(0, micState.users - 1);
+                return Promise.reject(new Error('NoMicSupport'));
+            }
+            micState.opening = navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
+                micState.stream = stream;
+                emit('mic:state', { open: true });
+                return stream;
+            }).finally(() => { micState.opening = null; });
+        }
+        return micState.opening.then(stream => {
+            if (micState.users === 0) closeMicNow();  // everyone gave up while it was opening
+            return stream;
+        }, err => {
+            micState.users = Math.max(0, micState.users - 1);
+            throw err;
+        });
+    }
+    function releaseMic() {
+        micState.users = Math.max(0, micState.users - 1);
+        if (micState.users > 0) return;
+        clearTimeout(micState.idleTimer);
+        const ms = getMicIdleSeconds() * 1000;
+        if (ms === 0) closeMicNow();
+        else micState.idleTimer = setTimeout(closeMicNow, ms);
+    }
+    function micErrorText(err) {
+        const name = err && err.name;
+        if (name === 'NotAllowedError' || name === 'SecurityError') return '⚠️ Microphone blocked — allow it for instagram.com (🎙️ icon in the address bar)';
+        if (name === 'NotFoundError') return '⚠️ No microphone found';
+        if (name === 'NotReadableError') return '⚠️ Microphone is busy in another app';
+        return '⚠️ Microphone could not open';
+    }
+    document.addEventListener('visibilitychange', () => { if (document.hidden && micState.users === 0) closeMicNow(); });
+    window.addEventListener('pagehide', () => { micState.users = 0; closeMicNow(); });
+
+    const mic = {
+        open: openMic, release: releaseMic, closeNow: closeMicNow,
+        isOpen: micIsLive, errorText: micErrorText,
+        getIdleSeconds: getMicIdleSeconds, setIdleSeconds: setMicIdleSeconds
+    };
+
     // 10. Block Registry
     const registeredBlocks = [];
     function registerBlock(block) { registeredBlocks.push(block); }
-    function boot() {
+    // v8: the toolkit sleeps until you open your DMs. On the feed, Reels,
+    // profiles… no block is started at all (they were hidden there anyway).
+    // Once started it stays on (hidden outside DMs, like before).
+    let booted = false;
+    const inDms = () => location.pathname.indexOf('/direct') === 0;
+    function startBlocks() {
+        if (booted) return;
+        booted = true;
         registeredBlocks.forEach(b => {
             try { b.init(api); } catch (e) { console.error('[LegoCore] Block init error:', b.id, e); }
         });
         // First repair pass once everything has loaded
         setTimeout(() => scheduleSequenceRepair(0), 1500);
     }
+    function boot() {
+        if (inDms()) { startBlocks(); return; }
+        // Instagram changes pages without reloading → check the address once a second (a tiny string check)
+        const wait = setInterval(() => {
+            if (!inDms()) return;
+            clearInterval(wait);
+            window.removeEventListener('popstate', onPop);
+            startBlocks();
+        }, 1000);
+        const onPop = () => { if (inDms()) { clearInterval(wait); window.removeEventListener('popstate', onPop); startBlocks(); } };
+        window.addEventListener('popstate', onPop);
+        console.log('[LegoCore] Sleeping until you open your DMs.');
+    }
 
     const api = {
         on, off, emit, registerBlock, boot,
         getDb: () => db, whenDbReady, getShortcutConfig, escapeHtml, newSyncId,
+        // clip storage (v3: info and sound stored apart)
+        clipStore,
+        // shared microphone (v6: opens on demand, auto-off)
+        mic,
         // injection bridges
         injectClipToChat, injectImageToChat, injectImageSetToChat, injectTextToChat, getActiveChatZone,
         // drag helpers
         makeDraggable, makeIsolatedDraggable,
         // shared inventory + search
-        getSearchableInventory, invalidateInventory, searchInventory, scoreInventory, parseSearchPrefix,
+        getSearchableInventory, invalidateInventory, getTextSnippets, invalidateTextSnippets, searchInventory, scoreInventory, parseSearchPrefix,
         normalizeStr, getSearchTokens, matchAllTokens, markUsed, getUsageTimestamp,
         // sequence steps (permanent references)
         makeStep, stableIdOf, findStepItem, resolveStep, suggestForStep, repairStep,
         scheduleSequenceRepair, remapSequenceRefs,
         // items + sequences data
-        fetchStepData, fetchItemData, getSequences, saveSequences,
+        fetchStepData, fetchItemData, getSequences, saveSequences, getImageSetFull: getImageSetById,
         // sequence state
         setActiveSequence, getActiveSequence, getSequenceStepIndex, setSequenceStepIndex, cancelSequence
     };
@@ -940,10 +1265,14 @@ const LegoCore = (function () {
 })();
 
 /* ============================================================
-   BLOCK: Quick Message Recorder (v3)
+   BLOCK: Quick Message Recorder (v4)
    ============================================================ */
 /* ================================================================
-   BLOCK: Audio Quick Record (Standalone Plugin) (v4 - Delay on/off)
+   BLOCK: Audio Quick Record (Standalone Plugin) (v5 - 🎙️ Mic only when recording)
+   v5: the microphone opens when you press Record (shared with the other
+       recorders, needs Core v6) and switches itself off after "Mic ready (s)"
+       seconds without recording. 0 = off right after each recording.
+       Trimming closes its audio engine when done.
    v4: Delay On/Off switch (Off = stop instantly). 0 ms now really means 0
        (before, 0 silently became 800 ms). Also applies to the Commands menu.
    Handles the mini rapid-fire recorder, auto-trim, and auto-send.
@@ -957,7 +1286,6 @@ LegoCore.registerBlock({
   id: 'audioQuickRecord',
   init(core) {
     let quickMediaRecorder;
-    let quickAudioChunks = [];
     let quickCurrentBlob = null;
     let isQuickRecording = false;
 
@@ -996,6 +1324,10 @@ LegoCore.registerBlock({
               <select id="sb-quick-threshold-select" style="background:#0f172a; color:#fff; border:1px solid #334155; border-radius:3px; padding:2px; font-size:9px;">
                   <option value="0.015">Low</option><option value="0.035" ${quickSavedThreshold === "0.035" ? 'selected' : ''}>Medium</option><option value="0.060" ${quickSavedThreshold === "0.060" ? 'selected' : ''}>High</option><option value="0.100" ${quickSavedThreshold === "0.100" ? 'selected' : ''}>Very High</option>
               </select>
+          </div>
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+              <span style="color:#94a3b8;" title="How long the mic stays ready after a recording, so the next one starts instantly. 0 = off right away.">Mic ready (s):</span>
+              <input type="number" id="sb-quick-mic-idle-input" value="${core.mic ? core.mic.getIdleSeconds() : 30}" min="0" step="5" title="0 = microphone off right after each recording" style="width:50px; background:#0f172a; color:#fff; border:1px solid #334155; border-radius:3px; padding:2px; font-size:9px; text-align:center;">
           </div>
           <div style="display:flex; justify-content:space-between; align-items:center;">
               <span style="color:#94a3b8;">Delay (ms):</span>
@@ -1038,6 +1370,12 @@ LegoCore.registerBlock({
     quickUI.querySelector('#sb-quick-trim-end-chk').onchange = e => localStorage.setItem('sb_quick_autotrim_end', e.target.checked);
     quickUI.querySelector('#sb-quick-auto-send-chk').onchange = e => localStorage.setItem('sb_quick_autosend', e.target.checked);
     quickUI.querySelector('#sb-quick-threshold-select').onchange = e => localStorage.setItem('sb_quick_silence_threshold', e.target.value);
+    const micIdleInput = quickUI.querySelector('#sb-quick-mic-idle-input');
+    micIdleInput.onchange = e => {
+        if (!core.mic) return;
+        e.target.value = core.mic.setIdleSeconds(e.target.value);
+    };
+    core.on('mic:settings', ({ idleSeconds }) => { if (document.activeElement !== micIdleInput) micIdleInput.value = idleSeconds; });
     quickUI.querySelector('#sb-quick-trailing-lag-input').onchange = e => localStorage.setItem('sb_quick_trailing_lag', e.target.value);
     quickUI.querySelector('#sb-quick-lag-on-chk').onchange = e => {
         localStorage.setItem('sb_quick_trailing_lag_on', String(e.target.checked));
@@ -1050,32 +1388,55 @@ LegoCore.registerBlock({
         return Number.isFinite(n) ? Math.max(0, n) : 800;
     }
 
-    navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
-        quickMediaRecorder = new MediaRecorder(stream);
-        quickMediaRecorder.ondataavailable = e => quickAudioChunks.push(e.data);
-        quickMediaRecorder.onstop = async () => {
-            quickCurrentBlob = new Blob(quickAudioChunks, { type: 'audio/mp4' });
-            quickAudioChunks = [];
-            if (core.audio && core.audio.process) {
-                // 🎧 Trim + WAV mono in ONE pass (Manual cut start = no detection at all)
-                quickCurrentBlob = (await core.audio.process(quickCurrentBlob, core.audio.getQuickTrimOpts())).blob;
-            } else {
-                // Fallback without the Audio WAV Engine block (old behavior)
-                const trimStart = cutModeSel.value === 'auto';
-                const trimEnd = quickUI.querySelector('#sb-quick-trim-end-chk').checked;
-                if (trimStart || trimEnd) {
-                    quickCurrentBlob = await detectAndTrimSilence(quickCurrentBlob, trimStart, trimEnd, quickUI.querySelector('#sb-quick-threshold-select').value);
-                }
+    // 🎙️ v5: no microphone until you press Record. Each recording gets its own
+    // recorder on the shared mic (core.mic), released as soon as it stops.
+    async function handleQuickStop(chunks) {
+        quickCurrentBlob = new Blob(chunks, { type: 'audio/mp4' });
+        if (core.audio && core.audio.process) {
+            // 🎧 Trim + WAV mono in ONE pass (Manual cut start = no detection at all)
+            quickCurrentBlob = (await core.audio.process(quickCurrentBlob, core.audio.getQuickTrimOpts())).blob;
+        } else {
+            // Fallback without the Audio WAV Engine block (old behavior)
+            const trimStart = cutModeSel.value === 'auto';
+            const trimEnd = quickUI.querySelector('#sb-quick-trim-end-chk').checked;
+            if (trimStart || trimEnd) {
+                quickCurrentBlob = await detectAndTrimSilence(quickCurrentBlob, trimStart, trimEnd, quickUI.querySelector('#sb-quick-threshold-select').value);
             }
-            showQuickActionControls();
-        };
-    }).catch(err => console.warn("Mic error:", err));
+        }
+        showQuickActionControls();
+    }
 
+    let quickMicStarting = false;
     const quickRecBtn = quickUI.querySelector('#sb-quick-rec-btn');
-    quickRecBtn.onclick = () => {
-        if (!quickMediaRecorder) return alert("Mic not initialized.");
+    function resetQuickRecBtn() {
+        quickRecBtn.innerText = "🔴 Quick Record";
+        quickRecBtn.style.background = "#0284c7";
+    }
+    quickRecBtn.onclick = async () => {
+        if (!core.mic) return alert("This block needs the newer Core (v6).");
+        if (quickMicStarting) return;
         if (!isQuickRecording) {
-            quickAudioChunks = [];
+            quickMicStarting = true;
+            quickRecBtn.innerText = "🎙️ Opening mic...";
+            let stream;
+            try {
+                stream = await core.mic.open();
+            } catch (err) {
+                quickMicStarting = false;
+                resetQuickRecBtn();
+                return alert(core.mic.errorText(err));
+            }
+            quickMicStarting = false;
+            const chunks = [];
+            try {
+                quickMediaRecorder = new MediaRecorder(stream);
+            } catch (err) {
+                core.mic.release();
+                resetQuickRecBtn();
+                return alert("Could not start recording.");
+            }
+            quickMediaRecorder.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+            quickMediaRecorder.onstop = () => { core.mic.release(); handleQuickStop(chunks); };
             quickUI.querySelector('#sb-quick-preview').style.display = "none";
             quickUI.querySelector('#sb-quick-action-container').style.display = "none";
             quickMediaRecorder.start();
@@ -1084,13 +1445,13 @@ LegoCore.registerBlock({
             quickRecBtn.style.background = "#dc2626";
         } else {
             const lagMs = quickLagMs();
+            const rec = quickMediaRecorder;
             quickRecBtn.innerText = "⏳ Finishing...";
             quickRecBtn.style.background = "#555";
             setTimeout(() => {
-                if (quickMediaRecorder.state === "recording") quickMediaRecorder.stop();
+                if (rec && rec.state === "recording") rec.stop();
                 isQuickRecording = false;
-                quickRecBtn.innerText = "🔴 Quick Record";
-                quickRecBtn.style.background = "#0284c7";
+                resetQuickRecBtn();
             }, lagMs);
         }
     };
@@ -1112,8 +1473,9 @@ LegoCore.registerBlock({
     };
 
     async function detectAndTrimSilence(blob, cutStart, cutEnd, customThreshold) {
+        let audioCtx = null; // closed when done (v5: no leftover audio engines)
         try {
-            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             const audioBuffer = await audioCtx.decodeAudioData(await blob.arrayBuffer());
             const channelData = audioBuffer.getChannelData(0);
             const sr = audioBuffer.sampleRate;
@@ -1125,7 +1487,7 @@ LegoCore.registerBlock({
             const trimmed = audioCtx.createBuffer(audioBuffer.numberOfChannels, endIdx - startIdx, sr);
             for (let c = 0; c < audioBuffer.numberOfChannels; c++) trimmed.getChannelData(c).set(audioBuffer.getChannelData(c).subarray(startIdx, endIdx));
             return new Blob([audioBufferToWav(trimmed)], { type: 'audio/mp4' });
-        } catch (e) { return blob; }
+        } catch (e) { return blob; } finally { if (audioCtx) audioCtx.close().catch(() => {}); }
     }
 
     function audioBufferToWav(buffer) {
@@ -1221,10 +1583,15 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Recorder Studio (v2)
+   BLOCK: Recorder Studio (v4)
    ============================================================ */
 /* ================================================================
-   BLOCK: Audio Recorder Studio (Standalone Plugin) (v3 - Delay on/off)
+   BLOCK: Audio Recorder Studio (Standalone Plugin) (v5 - 🎙️ Mic only when recording)
+   v5: the microphone opens when you press Record (shared, needs Core v6) and
+       switches itself off after the idle time set in 💬 Quick Message.
+       Trimming / stitching close their audio engine when done.
+   v4: uses the Core's database connection (Core v5 stores each clip's sound
+       apart from its name). Saving and stitching go through core.clipStore.
    v3: Delay On/Off switch (Off = stop instantly). 0 ms now really means 0.
    Handles main recording, shortcuts, stitching logic, and saves to DB.
    v2: recordings and uploads are converted to WAV mono (needs the
@@ -1238,24 +1605,17 @@ LegoCore.registerBlock({
 
     let db;
     let mediaRecorder;
-    let audioChunks = [];
     let currentBlob = null;
     let originalBlobBackup = null;
     let selectedForStitchId = null;
     let isRecording = false;
     let selectedColorTag = "#0095f6";
 
-    const request = indexedDB.open('IG_Soundboard_Fresh_Core_DB', 2);
-    request.onerror = e => console.error("DB Error:", e);
-    request.onupgradeneeded = e => {
-      db = e.target.result;
-      if (!db.objectStoreNames.contains('clips')) db.createObjectStore('clips', { keyPath: 'id', autoIncrement: true }).createIndex('order', 'order', { unique: false });
-      if (!db.objectStoreNames.contains('folders')) db.createObjectStore('folders', { keyPath: 'name' }).put({ name: "General" });
-    };
-    request.onsuccess = e => {
-      db = e.target.result;
+    // v4: share the Core's connection (its own v2 connection would block the v3 upgrade)
+    core.whenDbReady().then(readyDb => {
+      db = readyDb;
       loadFolders();
-    };
+    });
 
     const autoTrimStartPref = localStorage.getItem('sb_autotrim_start') === 'true';
     const autoTrimEndPref = localStorage.getItem('sb_autotrim_end') === 'true';
@@ -1397,28 +1757,50 @@ LegoCore.registerBlock({
         return Number.isFinite(n) ? Math.max(0, n) : 800;
     }
 
-    navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
-        mediaRecorder = new MediaRecorder(stream);
-        mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
-        mediaRecorder.onstop = async () => {
-            currentBlob = await toWav(new Blob(audioChunks)); // 🎧 always WAV mono
-            audioChunks = [];
-            originalBlobBackup = currentBlob;
-            const trimStart = recUI.querySelector('#sb-auto-trim-start-chk').checked;
-            const trimEnd = recUI.querySelector('#sb-auto-trim-end-chk').checked;
-            if (trimStart || trimEnd) {
-                currentBlob = await toWav(await detectAndTrimSilence(currentBlob, trimStart, trimEnd, recUI.querySelector('#sb-threshold-select').value));
-                recUI.querySelector('#sb-undo-trim-btn').style.display = "inline-block";
-            }
-            await showActionControls("voice_note");
-        };
-    }).catch(err => console.warn("Mic error:", err));
+    // 🎙️ v5: no microphone until you press Record (shared mic via core.mic)
+    async function handleStudioStop(chunks) {
+        currentBlob = await toWav(new Blob(chunks)); // 🎧 always WAV mono
+        originalBlobBackup = currentBlob;
+        const trimStart = recUI.querySelector('#sb-auto-trim-start-chk').checked;
+        const trimEnd = recUI.querySelector('#sb-auto-trim-end-chk').checked;
+        if (trimStart || trimEnd) {
+            currentBlob = await toWav(await detectAndTrimSilence(currentBlob, trimStart, trimEnd, recUI.querySelector('#sb-threshold-select').value));
+            recUI.querySelector('#sb-undo-trim-btn').style.display = "inline-block";
+        }
+        await showActionControls("voice_note");
+    }
 
     const recBtn = recUI.querySelector('#sb-rec-btn');
-    function triggerRecordingToggle() {
-        if (!mediaRecorder) return alert("Mic not initialized.");
+    let studioMicStarting = false;
+    function resetStudioRecBtn() {
+        recBtn.innerText = "🔴 Record Intro";
+        recBtn.style.background = "#0284c7";
+    }
+    async function triggerRecordingToggle() {
+        if (!core.mic) return alert("This block needs the newer Core (v6).");
+        if (studioMicStarting) return;
         if (!isRecording) {
-            audioChunks = [];
+            studioMicStarting = true;
+            recBtn.innerText = "🎙️ Opening mic...";
+            let stream;
+            try {
+                stream = await core.mic.open();
+            } catch (err) {
+                studioMicStarting = false;
+                resetStudioRecBtn();
+                return alert(core.mic.errorText(err));
+            }
+            studioMicStarting = false;
+            const chunks = [];
+            try {
+                mediaRecorder = new MediaRecorder(stream);
+            } catch (err) {
+                core.mic.release();
+                resetStudioRecBtn();
+                return alert("Could not start recording.");
+            }
+            mediaRecorder.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+            mediaRecorder.onstop = () => { core.mic.release(); handleStudioStop(chunks); };
             recUI.querySelector('#sb-preview').style.display = "none";
             recUI.querySelector('#sb-action-container').style.display = "none";
             mediaRecorder.start();
@@ -1427,13 +1809,13 @@ LegoCore.registerBlock({
             recBtn.style.background = "#dc2626";
         } else {
             const lagMs = studioLagMs();
+            const rec = mediaRecorder;
             recBtn.innerText = "⏳ Finishing...";
             recBtn.style.background = "#555";
             setTimeout(() => {
-                if (mediaRecorder.state === "recording") mediaRecorder.stop();
+                if (rec && rec.state === "recording") rec.stop();
                 isRecording = false;
-                recBtn.innerText = "🔴 Record Intro";
-                recBtn.style.background = "#0284c7";
+                resetStudioRecBtn();
             }, lagMs);
         }
     }
@@ -1469,12 +1851,7 @@ LegoCore.registerBlock({
     }
 
     async function getPitchClip(id) {
-        return new Promise(resolve => {
-            const tx = db.transaction(['clips'], 'readonly');
-            const req = tx.objectStore('clips').get(id);
-            req.onsuccess = () => resolve(req.result || null);
-            req.onerror = () => resolve(null);
-        });
+        return core.clipStore.getFull(id); // { ...info, blob } or null
     }
 
     recUI.querySelector('#sb-undo-trim-btn').onclick = async () => {
@@ -1491,6 +1868,7 @@ LegoCore.registerBlock({
     recUI.querySelector('#sb-send-stitched-btn').onclick = async () => {
         if (!currentBlob || !selectedForStitchId) return;
         const pitchObj = await getPitchClip(selectedForStitchId);
+        if (!pitchObj || !pitchObj.blob) return alert("Chained audio not found in DB.");
         let trimmedPitch = pitchObj.blob;
         if (pitchObj.trimStart || pitchObj.trimEnd) {
             trimmedPitch = await trimAudioBlobByMs(pitchObj.blob, pitchObj.trimStart || 0, pitchObj.trimEnd || 0);
@@ -1512,8 +1890,9 @@ LegoCore.registerBlock({
 
     // Audio Processors
     async function detectAndTrimSilence(blob, cutStart, cutEnd, customThreshold) {
+        let audioCtx = null; // closed when done (v5: no leftover audio engines)
         try {
-            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             const audioBuffer = await audioCtx.decodeAudioData(await blob.arrayBuffer());
             const channelData = audioBuffer.getChannelData(0);
             const sr = audioBuffer.sampleRate;
@@ -1526,12 +1905,13 @@ LegoCore.registerBlock({
             const trimmed = audioCtx.createBuffer(audioBuffer.numberOfChannels, endIdx - startIdx, sr);
             for (let c = 0; c < audioBuffer.numberOfChannels; c++) trimmed.getChannelData(c).set(audioBuffer.getChannelData(c).subarray(startIdx, endIdx));
             return new Blob([audioBufferToWav(trimmed)], { type: 'audio/mp4' });
-        } catch (e) { return blob; }
+        } catch (e) { return blob; } finally { if (audioCtx) audioCtx.close().catch(() => {}); }
     }
 
     async function trimAudioBlobByMs(blob, startMs, endMs) {
+        let audioCtx = null; // closed when done (v5: no leftover audio engines)
         try {
-            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             const audioBuffer = await audioCtx.decodeAudioData(await blob.arrayBuffer());
             const sr = audioBuffer.sampleRate;
             const start = Math.max(0, Math.floor((startMs / 1000) * sr));
@@ -1539,12 +1919,13 @@ LegoCore.registerBlock({
             const trimmed = audioCtx.createBuffer(audioBuffer.numberOfChannels, end - start, sr);
             for (let c = 0; c < audioBuffer.numberOfChannels; c++) trimmed.getChannelData(c).set(audioBuffer.getChannelData(c).subarray(start, end));
             return new Blob([audioBufferToWav(trimmed)], { type: 'audio/mp4' });
-        } catch (e) { return blob; }
+        } catch (e) { return blob; } finally { if (audioCtx) audioCtx.close().catch(() => {}); }
     }
 
     async function mergeAudioBlobs(b1, b2) {
+        let audioCtx = null; // closed when done (v5: no leftover audio engines)
         try {
-            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
             const buf1 = await audioCtx.decodeAudioData(await b1.arrayBuffer());
             const buf2 = await audioCtx.decodeAudioData(await b2.arrayBuffer());
             const sr = buf1.sampleRate;
@@ -1561,7 +1942,7 @@ LegoCore.registerBlock({
             console.warn('[RecorderStudio] Could not join clips:', e);
             alert("Couldn't join the recording with the pitch clip. Only your recording will be used.");
             return b1;
-        }
+        } finally { if (audioCtx) audioCtx.close().catch(() => {}); }
     }
 
     function audioBufferToWav(buffer) {
@@ -1637,10 +2018,11 @@ LegoCore.registerBlock({
         const name = recUI.querySelector('#sb-name-input').value.trim() || `clip_${Date.now()}`;
         const folder = recUI.querySelector('#sb-folder-select').value || "General";
         if (!currentBlob) return;
-        const tx = db.transaction(['clips'], 'readwrite');
+        const tx = db.transaction(core.clipStore.STORES, 'readwrite');
         const store = tx.objectStore('clips');
         const countReq = store.count();
-        countReq.onsuccess = () => { store.add({ name, folder, color: selectedColorTag, order: countReq.result, blob: currentBlob }); };
+        const blobToSave = currentBlob;
+        countReq.onsuccess = () => { core.clipStore.addInTx(tx, { name, folder, color: selectedColorTag, order: countReq.result, blob: blobToSave }); };
         tx.oncomplete = () => {
             recUI.querySelector('#sb-name-input').value = "";
             recUI.querySelector('#sb-action-container').style.display = "none";
@@ -1671,11 +2053,15 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Audio Library (v5)
+   BLOCK: Audio Library (v7)
    ============================================================ */
 /* ============================================================
-   BLOCK: Audio Library (v16 - 🔗 Renames reach sequences)
+   BLOCK: Audio Library (v17 - 📦 List reads names only)
    ------------------------------------------------------------
+   v17.1: a played clip lets go of its audio when it ends or is stopped.
+   v17: needs Core v5. The list reads only names/folders/colors — the sound
+        is opened only when you play, send, edit, download, convert or trim.
+        Delete removes both the info and the sound.
    v16: Saving or deleting a clip in the ✏️ window now announces it
         ('library:refresh'), so sequences pick up the new name right away.
    v15: ⚙️ panel → "✂️ Trim + convert" (Start / End, keep-after-voice ms,
@@ -1712,16 +2098,17 @@ LegoCore.registerBlock({
       renderClips();
     });
 
-    // --- RAM-Safe Fetcher: Only pull heavy Blobs when explicitly needed ---
+    // --- Opens ONE clip's sound, only when it's needed (Core v5) ---
     function getClipBlob(id) {
-        return new Promise(resolve => {
-            withDb(d => {
-                const tx = d.transaction(['clips'], 'readonly');
-                tx.objectStore('clips').get(id).onsuccess = e => {
-                    resolve(e.target.result ? e.target.result.blob : null);
-                };
-            });
-        });
+        return core.clipStore.getBlob(id);
+    }
+    let renderSeq = 0; // a newer render cancels an older one still loading
+    // v17.1: a finished/stopped player lets go of its audio (no leftovers in memory)
+    function playClip(blob) { const url = URL.createObjectURL(blob); const p = new Audio(url); p._url = url; return p; }
+    function disposePlayer(p) {
+      if (!p) return;
+      try { p.pause(); p.removeAttribute('src'); p.load(); } catch (e) { /* noop */ }
+      if (p._url) { URL.revokeObjectURL(p._url); p._url = null; }
     }
 
     // --- Global Transcript Tooltip ---
@@ -2069,7 +2456,7 @@ LegoCore.registerBlock({
       const modalPlayers = new Set();   // every <audio> started from this window
       const modalUrls = [];
       function closeModal() {
-        modalPlayers.forEach(p => { try { p.pause(); } catch (e) {} });
+        modalPlayers.forEach(p => disposePlayer(p));
         modalUrls.forEach(u => URL.revokeObjectURL(u));
         overlay.remove();
       }
@@ -2094,13 +2481,14 @@ LegoCore.registerBlock({
           const blob = await getClipBlob(clip.id);
           if (!blob) return alert("Audio file not found in DB.");
           stopAB();
-          previewPlayer = new Audio(URL.createObjectURL(blob));
+          previewPlayer = playClip(blob);
           modalPlayers.add(previewPlayer);
           btn.innerText = '⏹️ Stop';
           previewPlayer.play();
-          previewPlayer.onended = () => { btn.innerText = '▶️ Preview'; previewPlayer = null; };
+          previewPlayer.onended = () => { btn.innerText = '▶️ Preview'; modalPlayers.delete(previewPlayer); disposePlayer(previewPlayer); previewPlayer = null; };
         } else {
-          previewPlayer.pause();
+          modalPlayers.delete(previewPlayer);
+          disposePlayer(previewPlayer);
           btn.innerText = '▶️ Preview';
           previewPlayer = null;
         }
@@ -2120,9 +2508,7 @@ LegoCore.registerBlock({
 
       overlay.querySelector('#ig-audio-modal-del').onclick = () => {
         if (!confirm('Permanently delete this clip?')) return;
-        const tx = db.transaction(['clips'], 'readwrite');
-        tx.objectStore('clips').delete(clip.id);
-        tx.oncomplete = () => { core.emit('library:refresh'); closeModal(); }; // re-renders this list + updates sequences
+        core.clipStore.remove(clip.id).then(() => { core.emit('library:refresh'); closeModal(); }); // re-renders this list + updates sequences
       };
 
       overlay.querySelector('#ig-audio-modal-cancel').onclick = () => closeModal();
@@ -2250,17 +2636,13 @@ LegoCore.registerBlock({
         return;
       }
 
-      tree.innerHTML = '';
-      const tx = db.transaction(['clips'], 'readonly');
-      tx.objectStore('clips').getAll().onsuccess = e => {
-        const allClipsRaw = e.target.result || [];
+      const myRender = ++renderSeq;
+      core.clipStore.list().then(allClipsRaw => {
+        if (myRender !== renderSeq) return;
+        tree.innerHTML = '';
 
-        // RAM-SAFE STRIPPING: Remove bloated Blobs from memory immediately
-        const allClips = allClipsRaw.map(c => {
-            const clone = { ...c };
-            delete clone.blob; // Stop closures from trapping megabytes of audio
-            return clone;
-        }).sort((a, b) => (a.order || 0) - (b.order || 0));
+        // Names, folders, colors only — no sound is loaded here
+        const allClips = allClipsRaw.sort((a, b) => (a.order || 0) - (b.order || 0));
 
         if (!allClips.length) {
           tree.innerHTML = '<div style="padding:12px; color:#94a3b8; font-size:10px;">No audio clips yet.</div>';
@@ -2295,6 +2677,7 @@ LegoCore.registerBlock({
         };
 
         function renderFolderGroups(sortedFolderNames) {
+          if (myRender !== renderSeq) return;
           let clipCounter = 0;
           sortedFolderNames.forEach(folderName => {
             if (folderFilter !== 'All' && folderFilter !== folderName) return;
@@ -2424,12 +2807,12 @@ LegoCore.registerBlock({
                 if (!rowPlayer) {
                   const blob = await getClipBlob(clip.id);
                   if (!blob) return alert("Audio not found in DB.");
-                  rowPlayer = new Audio(URL.createObjectURL(blob));
+                  rowPlayer = playClip(blob);
                   btn.innerText = '⏹️';
                   rowPlayer.play();
-                  rowPlayer.onended = () => { btn.innerText = '▶️'; rowPlayer = null; };
+                  rowPlayer.onended = () => { btn.innerText = '▶️'; disposePlayer(rowPlayer); rowPlayer = null; };
                 } else {
-                  rowPlayer.pause(); rowPlayer = null; btn.innerText = '▶️';
+                  disposePlayer(rowPlayer); rowPlayer = null; btn.innerText = '▶️';
                 }
               };
 
@@ -2455,18 +2838,18 @@ LegoCore.registerBlock({
             tree.appendChild(folderEl);
           });
         }
-      };
+      });
     }
 
     libUI.querySelector('#ig-audio-dl-btn').onclick = async () => {
       const btn = libUI.querySelector('#ig-audio-dl-btn');
       btn.innerText = '⏳ Wait...';
-      const tx = db.transaction(['clips'], 'readonly');
-      tx.objectStore('clips').getAll().onsuccess = async e => {
-        const clips = e.target.result || [];
+      core.clipStore.list().then(async clips => {
+        clips.sort((a, b) => (a.order || 0) - (b.order || 0));
         for (let clip of clips) {
-          if (!clip.blob) continue;
-          const url = URL.createObjectURL(await toWav(clip.blob));
+          const raw = clip.hasAudio ? await getClipBlob(clip.id) : null; // one sound at a time
+          if (!raw) continue;
+          const url = URL.createObjectURL(await toWav(raw));
           const a = document.createElement('a');
           a.href = url;
           a.download = downloadName(clip);
@@ -2475,7 +2858,7 @@ LegoCore.registerBlock({
           URL.revokeObjectURL(url);
         }
         btn.innerText = '📥 DL';
-      };
+      });
     };
 
     const batchBtn = libUI.querySelector('#ig-audio-ul-btn');
@@ -2494,8 +2877,8 @@ LegoCore.registerBlock({
       }
       batchBtn.innerText = '⏳ Sorting...';
 
-      const tx = db.transaction(['folders', 'clips'], 'readwrite');
-      const fStore = tx.objectStore('folders'), cStore = tx.objectStore('clips');
+      const tx = db.transaction(['folders'].concat(core.clipStore.STORES), 'readwrite');
+      const fStore = tx.objectStore('folders');
       const folders = new Set(['General']);
 
       for (let i = 0; i < files.length; i++) {
@@ -2508,7 +2891,7 @@ LegoCore.registerBlock({
           folder = parts[0].trim(); name = parts.slice(1).join('.').trim();
         }
         folders.add(folder);
-        cStore.add({ name, folder, color, order: i, blob: converted[i] });
+        core.clipStore.addInTx(tx, { name, folder, color, order: i, blob: converted[i] });
       }
       folders.forEach(f => fStore.put({ name: f }));
       tx.oncomplete = () => {
@@ -2586,16 +2969,7 @@ LegoCore.registerBlock({
         if (!(await core.audio.isTargetWav(wav, rate))) { failed++; continue; }
 
         // Replace only the audio — name, folder, color, order, command and transcript stay
-        const ok = await new Promise(res => {
-          const tx = db.transaction(['clips'], 'readwrite');
-          const store = tx.objectStore('clips');
-          store.get(ids[i]).onsuccess = ev => {
-            const c = ev.target.result;
-            if (c) { c.blob = wav; store.put(c); }
-          };
-          tx.oncomplete = () => res(true);
-          tx.onerror = () => res(false);
-        });
+        const ok = await core.clipStore.setBlob(ids[i], wav);
         ok ? converted++ : failed++;
       }
 
@@ -2673,16 +3047,7 @@ LegoCore.registerBlock({
         if (r.status === 'error') { failed++; continue; }
 
         // Replace only the audio — name, folder, color, order, command and transcript stay
-        const ok = await new Promise(res => {
-          const tx = db.transaction(['clips'], 'readwrite');
-          const store = tx.objectStore('clips');
-          store.get(targets[i].id).onsuccess = ev => {
-            const c = ev.target.result;
-            if (c) { c.blob = r.blob; store.put(c); }
-          };
-          tx.oncomplete = () => res(true);
-          tx.onerror = () => res(false);
-        });
+        const ok = await core.clipStore.setBlob(targets[i].id, r.blob);
         if (!ok) { failed++; continue; }
         const cut = r.cutStartMs + r.cutEndMs;
         if (cut > 0) { trimmed++; totalCutMs += cut; } else convertedOnly++;
@@ -4667,7 +5032,7 @@ LegoCore.registerBlock({
 
     // SAFE PASTE (NO SYNTHETIC ENTER)
     function injectText(text) {
-      const chatZone = core.getActiveChatZone(); 
+      const chatZone = core.getActiveChatZone();
       if (!chatZone) { alert("Open an active Instagram chat window first."); return; }
 
       chatZone.focus();
@@ -5052,181 +5417,64 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: image manager (v1)
+   BLOCK: Highlighter (v2)
    ============================================================ */
 /* ============================================================
-   BLOCK: Text Library Image Manager (Right-Side Icon & Viewer)
-   - Completely separate extension.
-   - Handles file uploading, compression, and hover viewing.
-   ============================================================ */
-LegoCore.registerBlock({
-  id: 'textLibraryImageManager',
-  init(core) {
-    const PRO_KEY = 'ig_text_library_pro_v1';
-
-    const style = document.createElement('style');
-    style.innerHTML = `
-      .ig-tln-thumb-btn {
-        background: transparent; border: none; font-size: 11px; cursor: pointer;
-        padding: 4px; border-radius: 4px; transition: 0.1s; margin-right: 2px;
-      }
-      .ig-tln-thumb-btn:hover { background: rgba(255,255,255,0.1); }
-      .ig-tln-thumb-btn:active { transform: scale(0.9); }
-    `;
-    document.head.appendChild(style);
-
-    const thumbViewer = document.createElement('div');
-    thumbViewer.style.cssText = 'position:fixed; z-index:2147483647; max-width:250px; max-height:250px; border-radius:8px; box-shadow:0 10px 30px rgba(0,0,0,0.8); pointer-events:none; display:none; background:#0f172a; padding:6px; border:1px solid #334155;';
-    const thumbViewerImg = document.createElement('img');
-    thumbViewerImg.style.cssText = 'max-width:100%; max-height:100%; border-radius:4px; object-fit:contain; display:block;';
-    thumbViewer.appendChild(thumbViewerImg);
-    document.body.appendChild(thumbViewer);
-
-    function compressImage(file, maxSize, callback) {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        const img = new Image();
-        img.onload = () => {
-          const canvas = document.createElement('canvas');
-          let w = img.width; let h = img.height;
-          if (w > maxSize || h > maxSize) {
-            const ratio = Math.min(maxSize / w, maxSize / h);
-            w *= ratio; h *= ratio;
-          }
-          canvas.width = w; canvas.height = h;
-          const ctx = canvas.getContext('2d');
-          ctx.drawImage(img, 0, 0, w, h);
-          callback(canvas.toDataURL('image/jpeg', 0.8));
-        };
-        img.src = e.target.result;
-      };
-      reader.readAsDataURL(file);
-    }
-
-    core.on('tl:tree-rendered', (contentArea) => {
-      const libraryData = JSON.parse(localStorage.getItem(PRO_KEY));
-      if (!libraryData) return;
-
-      contentArea.querySelectorAll('.ig-tln-snippet').forEach(row => {
-        const id = row.dataset.id;
-        const item = libraryData.items.find(i => i.id === id);
-
-        if (item && item.thumbnail && !row.querySelector('.ig-tln-thumb-btn')) {
-          const actionsDiv = row.querySelector('.ig-tln-actions');
-          const btn = document.createElement('button');
-          btn.className = 'ig-tln-thumb-btn ig-tln-thumb-icon';
-          btn.title = 'Hold to view thumbnail';
-          btn.innerText = '🖼️';
-
-          btn.onmousedown = (e) => {
-            e.stopPropagation();
-            thumbViewerImg.src = item.thumbnail;
-            thumbViewer.style.left = (e.clientX - 265) + 'px';
-            thumbViewer.style.top = (e.clientY + 10) + 'px';
-            thumbViewer.style.display = 'block';
-          };
-          const hide = () => thumbViewer.style.display = 'none';
-          btn.onmouseup = hide; btn.onmouseleave = hide; btn.onclick = e => e.stopPropagation();
-
-          actionsDiv.insertBefore(btn, actionsDiv.firstChild);
-        }
-      });
-    });
-
-    const observer = new MutationObserver((mutations) => {
-      mutations.forEach(m => {
-        m.addedNodes.forEach(node => {
-          if (node.nodeType === 1 && node.querySelector('#ig-tlp-modal-box')) {
-            const overlay = node;
-            const modal = overlay.querySelector('#ig-tlp-modal-box');
-            const tagSection = Array.from(modal.querySelectorAll('div')).find(d => d.innerText.includes('Assign Tags:'));
-
-            if (!tagSection || modal.querySelector('#ig-tlc-thumb-upload')) return;
-
-            const currentThumb = overlay.dataset.thumbnail || '';
-
-            const thumbUI = document.createElement('div');
-            thumbUI.innerHTML = `
-              <div style="font-size:11px; font-weight:bold; color:#94a3b8; margin-top:4px;">Thumbnail Image (Optional):</div>
-              <div style="display:flex; gap:8px; align-items:center;">
-                <input type="file" id="ig-tlc-thumb-upload" accept="image/*" style="font-size:10px; color:#fff; width:180px;">
-                <button id="ig-tlc-thumb-clear" style="background:transparent; color:#f43f5e; border:none; cursor:pointer; font-size:10px; display:${currentThumb ? 'block' : 'none'};">Clear Image</button>
-              </div>
-              <img id="ig-tlc-thumb-preview" src="${currentThumb}" style="max-height:40px; border-radius:4px; display:${currentThumb ? 'block' : 'none'}; object-fit:contain; margin-top:4px;">
-            `;
-
-            modal.insertBefore(thumbUI, tagSection);
-
-            const upload = thumbUI.querySelector('#ig-tlc-thumb-upload');
-            const clear = thumbUI.querySelector('#ig-tlc-thumb-clear');
-            const preview = thumbUI.querySelector('#ig-tlc-thumb-preview');
-
-            upload.onchange = (e) => {
-              const file = e.target.files[0];
-              if (file) {
-                compressImage(file, 400, (base64) => {
-                  overlay.dataset.thumbnail = base64;
-                  preview.src = base64;
-                  preview.style.display = 'block';
-                  clear.style.display = 'block';
-                });
-              }
-            };
-
-            clear.onclick = () => {
-              overlay.dataset.thumbnail = 'CLEAR';
-              preview.style.display = 'none';
-              clear.style.display = 'none';
-              upload.value = '';
-            };
-          }
-        });
-      });
-    });
-
-    observer.observe(document.body, { childList: true, subtree: true });
-    console.log('[TextLibraryImageManager] Loaded: Image Logic successfully decoupled.');
-    core.emit('block:ready', { id: 'textLibraryImageManager' });
-  }
-});
-
-/* ============================================================
-   BLOCK: Highlighter (v1)
-   ============================================================ */
-/* ============================================================
-   BLOCK: Text Highlighter (v1)
+   BLOCK: Text Highlighter (v2 - Doorbell edition)
    ------------------------------------------------------------
-   Standalone plugin -- no dependency on any other block. Mounts
-   its own card into the Dual Sidebar via core.registerMenu, same
-   as your other cards.
+   Drop-in replacement for the old Highlighter block.
+   Same block id and same saved rules (your rules and colors are kept).
 
-   Replaces your bookmarklet with:
-   - A saved list of highlight rules (term + color + on/off),
-     persisted across sessions
-   - Each rule gets its own color, chosen via a native color
-     swatch, from a rotating default palette when you add one
-   - A live match count per rule (how many currently-visible
-     elements match it right now)
-   - A master pause toggle
-   - Clean un-highlighting: turning a rule off or deleting it
-     removes exactly the styling it applied (tracked per element
-     via a data attribute), rather than just piling more styles
-     on top like the bookmarklet did
+   What changed (same look, far less work):
+   - No more "scan the whole page every 0.5 s". It finds the chat-list
+     box on the left by itself and only watches that box.
+   - A MutationObserver ("doorbell") rings when rows appear or change,
+     and only those rows are checked, once per screen refresh.
+   - Scrolling also triggers a quick check (backup).
+   - Reads text with textContent (no layout work) and remembers rows it
+     already checked.
+   - Colors come from ONE stylesheet via a data-ig-hl="rule id" label,
+     instead of painting styles on every row.
+   - Count badges only change when a number really changes.
+   - Safety net: every 3 s (when the browser is idle) one cheap re-check.
+   - Only active inside /direct/ (messages).
+   - ⚙️ (tucked away): "Use old mode" switch + last-pass counter.
    ============================================================ */
 LegoCore.registerBlock({
   id: 'textHighlighterPlugin',
   init(core) {
     const RULES_KEY = 'ig_text_highlighter_rules_v1';
     const MASTER_KEY = 'ig_text_highlighter_master_v1';
+    const LEGACY_KEY = 'ig_text_highlighter_legacy_v1'; // this device only
     const PALETTE = ['#f6c344', '#7ee787', '#ff8fa3', '#8ecae6', '#c9a876', '#ff9770', '#c792ea', '#94e2c4'];
+
+    const SPAN_SEL = 'div[role="link"] span, div[role="button"] span';
+    const ROW_SEL = 'div[role="button"], div[role="link"], a[role="link"]';
+    // Never look inside the toolkit's own panels / floating windows
+    const IGNORE_SEL = '#ig-modular-left-panel, #ig-modular-right-panel, .ig-floating-modal, .ig-qcx-float, .ig-draggable-menu';
+    // The chat list counts as "left" if its rows are centered in the left 40% of the window.
+    // If it is not found on your screen, raise this number (e.g. 0.5).
+    const LEFT_FRACTION = 0.4;
+    const IDLE_CHECK_MS = 3000;
 
     let rules = [];
     try { rules = JSON.parse(localStorage.getItem(RULES_KEY)) || []; } catch (e) { rules = []; }
-
     let masterEnabled = localStorage.getItem(MASTER_KEY) !== 'false';
+    let legacyMode = localStorage.getItem(LEGACY_KEY) === 'true';
+
+    let compiled = [];      // [{ id, term }] enabled rules, lowercased
+    let rulesVersion = 1;   // bump = every row must be re-checked
 
     function saveRules() { localStorage.setItem(RULES_KEY, JSON.stringify(rules)); }
     function saveMaster() { localStorage.setItem(MASTER_KEY, String(masterEnabled)); }
+
+    function compileRules() {
+      compiled = rules
+        .filter(r => r.enabled && r.term && r.term.trim())
+        .map(r => ({ id: r.id, term: r.term.trim().toLowerCase() }));
+      rulesVersion++;
+    }
+    compileRules();
 
     function nextPaletteColor() {
       const used = rules.map(r => r.color);
@@ -5242,7 +5490,7 @@ LegoCore.registerBlock({
 
     function uid() { return 'hlrule_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6); }
 
-    // ---------------- Styles ----------------
+    /* ---------------- Styles ---------------- */
     function injectStyles() {
       if (document.getElementById('ig-hl-styles')) return;
       const style = document.createElement('style');
@@ -5251,6 +5499,12 @@ LegoCore.registerBlock({
         .ig-hl-wrap { display:flex; flex-direction:column; gap:8px; font-family:-apple-system,sans-serif; font-size:11px; }
         .ig-hl-master { display:flex; align-items:center; justify-content:space-between; background:var(--igls-surface-2,#1c1c23); border:1px solid var(--igls-border,rgba(255,255,255,.07)); border-radius:6px; padding:6px 8px; }
         .ig-hl-master label { display:flex; align-items:center; gap:6px; cursor:pointer; font-size:10.5px; color:var(--igls-text-dim,#96949c); }
+        .ig-hl-gear { background:transparent; border:none; color:var(--igls-text-dim,#96949c); cursor:pointer; font-size:12px; padding:2px 4px; border-radius:4px; }
+        .ig-hl-gear:hover, .ig-hl-gear.on { color:var(--igls-accent,#c9a876); background:rgba(255,255,255,.08); }
+        .ig-hl-settings { display:none; flex-direction:column; gap:6px; background:rgba(0,0,0,.2); border:1px solid var(--igls-border,rgba(255,255,255,.07)); border-radius:6px; padding:8px; font-size:10px; color:var(--igls-text-dim,#96949c); }
+        .ig-hl-settings.open { display:flex; }
+        .ig-hl-settings label { display:flex; align-items:center; gap:6px; cursor:pointer; }
+        .ig-hl-stats { color:var(--igls-text-dim,#96949c); font-size:10px; }
         .ig-hl-add-row { display:flex; gap:4px; align-items:center; }
         .ig-hl-input { flex:1; background:var(--igls-surface-2,#1c1c23); color:var(--igls-text,#ece9e4); border:1px solid var(--igls-border,rgba(255,255,255,.08)); border-radius:6px; padding:6px 8px; font-size:11px; outline:none; }
         .ig-hl-input:focus { border-color:var(--igls-accent,#c9a876); }
@@ -5271,12 +5525,30 @@ LegoCore.registerBlock({
       document.head.appendChild(style);
     }
 
-    // ---------------- UI ----------------
+    // One stylesheet colors every labelled row (rewritten only when rules/colors change)
+    function updateHighlightCss() {
+      let tag = document.getElementById('ig-hl-dyn-styles');
+      if (!tag) {
+        tag = document.createElement('style');
+        tag.id = 'ig-hl-dyn-styles';
+        document.head.appendChild(tag);
+      }
+      tag.textContent = rules.map(r =>
+        `[data-ig-hl="${r.id}"]{background-color:${r.color}!important;color:${contrastColor(r.color)}!important;font-weight:bold!important;border-radius:3px;padding:0 2px;}`
+      ).join('\n');
+    }
+
+    /* ---------------- UI ---------------- */
     const wrap = document.createElement('div');
     wrap.className = 'ig-hl-wrap';
     wrap.innerHTML = `
       <div class="ig-hl-master">
         <label><input type="checkbox" id="ig-hl-master-chk" ${masterEnabled ? 'checked' : ''}> Highlighting active</label>
+        <button type="button" class="ig-hl-gear" title="Settings">⚙️</button>
+      </div>
+      <div class="ig-hl-settings">
+        <label><input type="checkbox" id="ig-hl-legacy-chk" ${legacyMode ? 'checked' : ''}> Use old mode (slower: scans the whole page every 0.5 s)</label>
+        <div class="ig-hl-stats">Not run yet</div>
       </div>
       <div class="ig-hl-add-row">
         <input type="text" id="ig-hl-new-term" class="ig-hl-input" placeholder="Name or word to highlight...">
@@ -5286,9 +5558,31 @@ LegoCore.registerBlock({
       <div id="ig-hl-list" class="ig-hl-list"></div>
     `;
 
+    const gearBtn = wrap.querySelector('.ig-hl-gear');
+    const settingsEl = wrap.querySelector('.ig-hl-settings');
+    const statsEl = wrap.querySelector('.ig-hl-stats');
+    const statsText = statsEl.firstChild; // we only ever change this text node's value (no DOM churn)
+
+    let badgeById = new Map();
+
+    // Changing a text node's value does not count as a "child added" change,
+    // so it can't wake the sidebar watchers.
+    function setBadges(counts) {
+      badgeById.forEach((badge, id) => {
+        const v = String(counts[id] || 0);
+        const node = badge.firstChild;
+        if (node && node.nodeValue !== v) node.nodeValue = v;
+      });
+    }
+
+    function setStats(msg) {
+      if (statsText.nodeValue !== msg) statsText.nodeValue = msg;
+    }
+
     function renderList() {
       const list = wrap.querySelector('#ig-hl-list');
       list.innerHTML = '';
+      badgeById = new Map();
       if (!rules.length) {
         list.innerHTML = '<div class="ig-hl-empty">No highlights yet. Add a name or word above.</div>';
         return;
@@ -5296,58 +5590,312 @@ LegoCore.registerBlock({
       rules.forEach(rule => {
         const row = document.createElement('div');
         row.className = 'ig-hl-row' + (rule.enabled ? '' : ' disabled');
-        row.dataset.ruleId = rule.id;
-        row.innerHTML = `
-          <input type="checkbox" class="ig-hl-toggle" ${rule.enabled ? 'checked' : ''} title="On/off">
-          <input type="color" class="ig-hl-color-input ig-hl-row-color" value="${rule.color}">
-          <span class="ig-hl-term" title="Click to rename">${rule.term}</span>
-          <span class="ig-hl-count" data-count-for="${rule.id}">0</span>
-          <button class="ig-hl-btn ig-hl-del" title="Delete">❌</button>
-        `;
 
-        row.querySelector('.ig-hl-toggle').onchange = e => {
-          rule.enabled = e.target.checked;
+        const toggle = document.createElement('input');
+        toggle.type = 'checkbox'; toggle.className = 'ig-hl-toggle'; toggle.checked = !!rule.enabled; toggle.title = 'On/off';
+
+        const color = document.createElement('input');
+        color.type = 'color'; color.className = 'ig-hl-color-input ig-hl-row-color'; color.value = rule.color;
+
+        const term = document.createElement('span');
+        term.className = 'ig-hl-term'; term.title = 'Click to rename'; term.textContent = rule.term;
+
+        const count = document.createElement('span');
+        count.className = 'ig-hl-count'; count.textContent = '0';
+        badgeById.set(rule.id, count);
+
+        const del = document.createElement('button');
+        del.className = 'ig-hl-btn ig-hl-del'; del.title = 'Delete'; del.textContent = '❌';
+
+        row.append(toggle, color, term, count, del);
+
+        toggle.onchange = () => {
+          rule.enabled = toggle.checked;
           row.classList.toggle('disabled', !rule.enabled);
-          saveRules();
-          scanAndHighlight();
+          saveRules(); rulesChanged();
         };
-
-        row.querySelector('.ig-hl-row-color').onchange = e => {
-          rule.color = e.target.value;
+        color.onchange = () => {
+          rule.color = color.value;
           saveRules();
-          // Force a fresh pass so already-highlighted elements pick up the new color
-          document.querySelectorAll(`[data-ig-hl-id="${rule.id}"]`).forEach(el => {
-            el.style.backgroundColor = rule.color;
-            el.style.color = contrastColor(rule.color);
-          });
+          updateHighlightCss(); // new mode: the stylesheet does the recoloring
+          if (legacyMode) {
+            document.querySelectorAll(`[data-ig-hl-id="${rule.id}"]`).forEach(el => {
+              el.style.backgroundColor = rule.color;
+              el.style.color = contrastColor(rule.color);
+            });
+          }
         };
-
-        row.querySelector('.ig-hl-term').onclick = () => {
+        term.onclick = () => {
           const name = prompt('Rename highlight:', rule.term);
           if (!name || !name.trim()) return;
           rule.term = name.trim();
-          saveRules();
-          renderList();
+          saveRules(); renderList(); rulesChanged();
         };
-
-        row.querySelector('.ig-hl-del').onclick = () => {
+        del.onclick = () => {
           if (!confirm(`Remove highlight "${rule.term}"?`)) return;
-          document.querySelectorAll(`[data-ig-hl-id="${rule.id}"]`).forEach(el => clearHighlight(el));
           rules = rules.filter(r => r.id !== rule.id);
-          saveRules();
-          renderList();
+          saveRules(); renderList(); rulesChanged();
         };
 
         list.appendChild(row);
       });
+      updateCounts();
     }
 
-    wrap.querySelector('#ig-hl-master-chk').onchange = e => {
+    /* ---------------- New mode: doorbell ---------------- */
+    let seen = new WeakMap();      // span -> { t: text, v: rulesVersion }
+    const pending = new Set();     // rows/nodes the doorbell told us about
+    let container = null;          // the chat-list box
+    let raf = 0;
+    let needFull = false;
+    let lastChecked = 0;
+
+    function findMatch(lower) {
+      for (let i = 0; i < compiled.length; i++) {
+        if (lower.includes(compiled[i].term)) return compiled[i].id;
+      }
+      return null;
+    }
+
+    // Returns true if the row's label changed
+    function processSpan(s) {
+      const text = s.textContent || '';
+      const rec = seen.get(s);
+      if (rec && rec.v === rulesVersion && rec.t === text) return false; // already checked
+      const id = text ? findMatch(text.toLowerCase()) : null;
+      const cur = s.getAttribute('data-ig-hl');
+      let changed = false;
+      if (id) {
+        if (cur !== id) { s.setAttribute('data-ig-hl', id); changed = true; }
+      } else if (cur) {
+        s.removeAttribute('data-ig-hl'); changed = true;
+      }
+      seen.set(s, { t: text, v: rulesVersion });
+      return changed;
+    }
+
+    function runPass(full) {
+      const root = (container && container.isConnected) ? container : document;
+      let changed = false, checked = 0;
+      const handle = (s) => { checked++; if (processSpan(s)) changed = true; };
+
+      if (full || root === document) {
+        root.querySelectorAll(SPAN_SEL).forEach(handle);
+      } else {
+        pending.forEach(n => {
+          if (n.nodeType === 3) n = n.parentElement;
+          if (!n || !n.isConnected || !root.contains(n)) return;
+          if (n.tagName === 'SPAN' && n.closest('div[role="link"], div[role="button"]')) handle(n);
+          if (n.querySelectorAll) n.querySelectorAll(SPAN_SEL).forEach(handle);
+        });
+      }
+      pending.clear();
+      lastChecked = checked;
+      if (changed) updateCounts(); else refreshStats();
+    }
+
+    function schedule(full) {
+      if (full) needFull = true;
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        const f = needFull; needFull = false;
+        runPass(f);
+      });
+    }
+
+    function updateCounts() {
+      const root = (container && container.isConnected) ? container : document;
+      const counts = {};
+      let total = 0;
+      if (!legacyMode) {
+        root.querySelectorAll('[data-ig-hl]').forEach(el => {
+          const id = el.getAttribute('data-ig-hl');
+          counts[id] = (counts[id] || 0) + 1;
+          total++;
+        });
+        setBadges(counts);
+        refreshStats(total);
+      }
+    }
+
+    function refreshStats(totalColored) {
+      if (legacyMode) { setStats('Old mode: scanning the whole page every 0.5 s'); return; }
+      let colored = totalColored;
+      if (colored === undefined) {
+        const root = (container && container.isConnected) ? container : document;
+        colored = root.querySelectorAll('[data-ig-hl]').length;
+      }
+      const where = (container && container.isConnected) ? 'chat list found' : 'chat list NOT found (checking whole page)';
+      setStats(`${where} · last pass checked ${lastChecked} · ${colored} highlighted`);
+    }
+
+    function onScroll() { schedule(true); } // backup; the cache makes this cheap
+
+    const observer = new MutationObserver((muts) => {
+      for (const m of muts) {
+        if (m.type === 'characterData') { pending.add(m.target); continue; }
+        m.addedNodes.forEach(n => { if (n.nodeType === 1 || n.nodeType === 3) pending.add(n); });
+      }
+      if (pending.size) schedule(false);
+    });
+
+    function stopObserver() {
+      observer.disconnect();
+      if (container) container.removeEventListener('scroll', onScroll);
+      container = null;
+      pending.clear();
+    }
+
+    function attach(c) {
+      stopObserver();
+      container = c;
+      if (!c) return;
+      observer.observe(c, { childList: true, subtree: true, characterData: true });
+      c.addEventListener('scroll', onScroll, { passive: true });
+    }
+
+    // Finds the scrolling chat-list box by looking at the visible rows on the left
+    function findContainer() {
+      const limit = window.innerWidth * LEFT_FRACTION;
+      const tally = new Map();
+      let looked = 0;
+      const rows = document.querySelectorAll(ROW_SEL);
+      for (let i = 0; i < rows.length && looked < 60; i++) {
+        const el = rows[i];
+        if (el.closest(IGNORE_SEL)) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) continue;
+        if (r.left + r.width / 2 > limit) continue;
+        looked++;
+        let p = el.parentElement;
+        while (p && p !== document.body && p !== document.documentElement) {
+          if (p.scrollHeight > p.clientHeight + 20) {
+            const oy = getComputedStyle(p).overflowY;
+            if (oy === 'auto' || oy === 'scroll') { tally.set(p, (tally.get(p) || 0) + 1); break; }
+          }
+          p = p.parentElement;
+        }
+      }
+      let best = null, bestScore = 0;
+      tally.forEach((n, p) => {
+        const score = n * 10000 + p.clientHeight;
+        if (score > bestScore) { best = p; bestScore = score; }
+      });
+      return best;
+    }
+
+    /* ---------------- Old mode (kept as a safety switch) ---------------- */
+    let legacyTimer = null;
+
+    function clearLegacy(el) {
+      delete el.dataset.igHlId;
+      el.style.backgroundColor = '';
+      el.style.color = '';
+      el.style.fontWeight = '';
+      el.style.borderRadius = '';
+      el.style.padding = '';
+    }
+
+    function legacyScan() {
+      if (!masterEnabled) return;
+      const enabledRules = rules.filter(r => r.enabled && r.term.trim());
+      const counts = {};
+      enabledRules.forEach(r => { counts[r.id] = 0; });
+      document.querySelectorAll(SPAN_SEL).forEach(s => {
+        const text = (s.innerText || '').toLowerCase();
+        if (!text) { if (s.dataset.igHlId) clearLegacy(s); return; }
+        let matched = null;
+        for (const r of enabledRules) {
+          if (text.includes(r.term.toLowerCase())) { matched = r; break; }
+        }
+        if (matched) {
+          counts[matched.id] = (counts[matched.id] || 0) + 1;
+          if (s.dataset.igHlId !== matched.id) {
+            s.dataset.igHlId = matched.id;
+            s.style.backgroundColor = matched.color;
+            s.style.color = contrastColor(matched.color);
+            s.style.fontWeight = 'bold';
+            s.style.borderRadius = '3px';
+            s.style.padding = '0 2px';
+          }
+        } else if (s.dataset.igHlId) {
+          clearLegacy(s);
+        }
+      });
+      setBadges(counts);
+    }
+
+    /* ---------------- Mode control ---------------- */
+    function clearNewMarks() {
+      document.querySelectorAll('[data-ig-hl]').forEach(el => el.removeAttribute('data-ig-hl'));
+      seen = new WeakMap();
+    }
+    function clearLegacyMarks() {
+      document.querySelectorAll('[data-ig-hl-id]').forEach(clearLegacy);
+    }
+
+    function inDirect() { return location.href.includes('/direct/'); }
+
+    function applyMode() {
+      stopObserver();
+      clearInterval(legacyTimer); legacyTimer = null;
+      cancelAnimationFrame(raf); raf = 0; needFull = false;
+
+      if (!masterEnabled || !compiled.length) {
+        clearNewMarks(); clearLegacyMarks();
+        setBadges({});
+        setStats(masterEnabled ? 'No active rules' : 'Highlighting is off');
+        return;
+      }
+      if (legacyMode) {
+        clearNewMarks();
+        legacyScan();
+        legacyTimer = setInterval(legacyScan, 500);
+        refreshStats();
+        return;
+      }
+      clearLegacyMarks();
+      if (inDirect()) attach(findContainer());
+      schedule(true);
+    }
+
+    function rulesChanged() {
+      compileRules();
+      updateHighlightCss();
+      applyMode();
+    }
+
+    // Safety net: every few seconds, when the browser is idle, re-find the box if it
+    // went away and do one cheap re-check (cached rows are skipped).
+    function idleTick() {
+      setTimeout(idleTick, IDLE_CHECK_MS);
+      if (legacyMode || !masterEnabled || !compiled.length || !inDirect()) return;
+      const work = () => {
+        if (!container || !container.isConnected) attach(findContainer());
+        schedule(true);
+      };
+      if (window.requestIdleCallback) requestIdleCallback(work, { timeout: 1000 });
+      else work();
+    }
+
+    /* ---------------- Wiring ---------------- */
+    gearBtn.onclick = () => {
+      const open = !settingsEl.classList.contains('open');
+      settingsEl.classList.toggle('open', open);
+      gearBtn.classList.toggle('on', open);
+    };
+
+    wrap.querySelector('#ig-hl-legacy-chk').onchange = (e) => {
+      legacyMode = e.target.checked;
+      localStorage.setItem(LEGACY_KEY, String(legacyMode));
+      applyMode();
+    };
+
+    wrap.querySelector('#ig-hl-master-chk').onchange = (e) => {
       masterEnabled = e.target.checked;
       saveMaster();
-      if (!masterEnabled) {
-        document.querySelectorAll('[data-ig-hl-id]').forEach(el => clearHighlight(el));
-      }
+      applyMode();
     };
 
     wrap.querySelector('#ig-hl-add-btn').onclick = () => {
@@ -5360,69 +5908,23 @@ LegoCore.registerBlock({
       input.value = '';
       colorInput.value = nextPaletteColor();
       renderList();
-      scanAndHighlight();
+      rulesChanged();
     };
 
     wrap.querySelector('#ig-hl-new-term').addEventListener('keydown', e => {
       if (e.key === 'Enter') { e.preventDefault(); wrap.querySelector('#ig-hl-add-btn').click(); }
     });
 
-    // ---------------- Scan & highlight ----------------
-    function clearHighlight(el) {
-      delete el.dataset.igHlId;
-      el.style.backgroundColor = '';
-      el.style.color = '';
-      el.style.fontWeight = '';
-      el.style.borderRadius = '';
-      el.style.padding = '';
-    }
-
-    function scanAndHighlight() {
-      if (!masterEnabled) return;
-      const enabledRules = rules.filter(r => r.enabled && r.term.trim());
-      const counts = {};
-      enabledRules.forEach(r => { counts[r.id] = 0; });
-
-      const spans = document.querySelectorAll('div[role="link"] span, div[role="button"] span');
-      spans.forEach(s => {
-        const text = (s.innerText || '').toLowerCase();
-        if (!text) { if (s.dataset.igHlId) clearHighlight(s); return; }
-
-        let matched = null;
-        for (const r of enabledRules) {
-          if (text.includes(r.term.toLowerCase())) { matched = r; break; }
-        }
-
-        if (matched) {
-          counts[matched.id] = (counts[matched.id] || 0) + 1;
-          if (s.dataset.igHlId !== matched.id) {
-            s.dataset.igHlId = matched.id;
-            s.style.backgroundColor = matched.color;
-            s.style.color = contrastColor(matched.color);
-            s.style.fontWeight = 'bold';
-            s.style.borderRadius = '3px';
-            s.style.padding = '0 2px';
-          }
-        } else if (s.dataset.igHlId) {
-          clearHighlight(s);
-        }
-      });
-
-      Object.keys(counts).forEach(id => {
-        const badge = wrap.querySelector(`[data-count-for="${id}"]`);
-        if (badge) badge.innerText = counts[id];
-      });
-    }
-
-    setInterval(scanAndHighlight, 500);
-
-    // ---------------- Mount ----------------
+    /* ---------------- Mount ---------------- */
     function mountCard(attemptsLeft) {
       attemptsLeft = attemptsLeft === undefined ? 10 : attemptsLeft;
       if (typeof core.registerMenu === 'function') {
         injectStyles();
+        updateHighlightCss();
         core.registerMenu('left', '🖍️ Text Highlighter', wrap, '⠿', 'text-highlighter');
         renderList();
+        applyMode();
+        setTimeout(idleTick, IDLE_CHECK_MS);
       } else if (attemptsLeft > 0) {
         setTimeout(() => mountCard(attemptsLeft - 1), 200);
       }
@@ -5434,10 +5936,13 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Commands (v9)
+   BLOCK: Commands (v12)
    ============================================================ */
 /* ============================================================
-   BLOCK: Commands (v30.4 - ⚡ Follows Quick Message "Delay" On/Off (Off = stop instantly; 0 ms really = 0)
+   BLOCK: Commands (v30.7 - 🪶 Image sets: pictures opened only when sent (needs Core v8)
+                    v30.6 - 🎙️ Mic opens only when you press 🔴, shared, auto-off (needs Core v6)
+                    v30.5 - 📦 Opens a clip's sound only when you pick it (needs Core v5)
+                    v30.4 - ⚡ Follows Quick Message "Delay" On/Off (Off = stop instantly; 0 ms really = 0)
                     v30.3 - ✂️ Trim + WAV in one pass; follows Quick Message "Cut start" Off/Auto/Manual
                     v30.2 - 🎧 Recordings saved as WAV mono (via "Audio WAV Engine" block)
                     v30.1 - 🎙️ Enter while recording = stop → preview (never restarts/discards)
@@ -5672,8 +6177,9 @@ LegoCore.registerBlock({
     }
 
     async function detectAndTrimSilence(blob, cutStart, cutEnd, customThreshold) {
+      let audioCtx = null; // closed when done (v5: no leftover audio engines)
       try {
-        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         const audioBuffer = await audioCtx.decodeAudioData(await blob.arrayBuffer());
         const channelData = audioBuffer.getChannelData(0);
         const sr = audioBuffer.sampleRate;
@@ -5685,7 +6191,7 @@ LegoCore.registerBlock({
         const trimmed = audioCtx.createBuffer(audioBuffer.numberOfChannels, endIdx - startIdx, sr);
         for (let c = 0; c < audioBuffer.numberOfChannels; c++) trimmed.getChannelData(c).set(audioBuffer.getChannelData(c).subarray(startIdx, endIdx));
         return new Blob([audioBufferToWav(trimmed)], { type: 'audio/mp4' });
-      } catch (e) { return blob; }
+      } catch (e) { return blob; } finally { if (audioCtx) audioCtx.close().catch(() => {}); }
     }
 
     function audioBufferToWav(buffer) {
@@ -6012,6 +6518,8 @@ LegoCore.registerBlock({
       let emojiStartIndex = -1;
 
       let pendingAudioBlob = null;
+      let pendingAudioLoad = null;   // v30.5: the picked clip's sound is still being opened
+      let audioPickToken = 0;        // a newer pick (or clear) cancels an older one
       let pendingAudioName = '';
       let pendingTranscript = '';
       let pendingFlowNs = null;
@@ -6021,12 +6529,13 @@ LegoCore.registerBlock({
 
       // 🎙️ Recorder state (declared here so the helpers below can read it)
       let isRecording = false;     // mic is capturing
+      let micStarting = false;     // 🎙️ waiting for the microphone to open (v30.6)
       let isFinishing = false;     // ⏳ trailing-lag window after stop was requested
       let isProcessing = false;    // recorder stopped, auto-trim still running
       let recordedPending = false; // the pending audio came from the recorder
 
       // While a recording is live or its clip is waiting, Enter/Escape belong to the audio flow, not to a sequence
-      function audioOwnsEnter() { return isRecording || isFinishing || isProcessing || recordedPending; }
+      function audioOwnsEnter() { return micStarting || isRecording || isFinishing || isProcessing || recordedPending; }
       function syncSeqExempt() {
         if (dropdownOpen || audioOwnsEnter() || parseSaveText(input.value) !== null) input.setAttribute('data-seq-exempt', '1');
         else input.removeAttribute('data-seq-exempt');
@@ -6366,8 +6875,23 @@ LegoCore.registerBlock({
           input.setSelectionRange(input.value.length, input.value.length);
         } else {
           markUsed('audio', m.item.id);
-          pendingAudioBlob = m.item.blob; pendingAudioName = m.item.name; pendingTranscript = m.item.transcript || '';
-          input.value = ''; closeDropdown(); showAudioPreview(); input.focus();
+          const pick = m.item;
+          const token = ++audioPickToken;
+          pendingAudioName = pick.name; pendingTranscript = pick.transcript || '';
+          pendingAudioBlob = pick.blob || null;
+          input.value = ''; closeDropdown(); input.focus();
+          if (pendingAudioBlob) { showAudioPreview(); }
+          else {
+            // Open just this one clip's sound
+            previewBar.style.display = 'flex'; previewLabel.innerText = '⏳ ' + (pick.name || 'audio');
+            previewPlayBtn.style.display = 'none'; previewSaveBtn.style.display = 'none';
+            pendingAudioLoad = core.clipStore.getBlob(pick.id).then(b => {
+              if (token !== audioPickToken) return;
+              pendingAudioLoad = null;
+              if (!b) { previewLabel.innerText = '⚠️ Audio not found'; setTimeout(() => { if (token === audioPickToken) clearPending(); }, 1500); return; }
+              pendingAudioBlob = b; showAudioPreview();
+            });
+          }
         }
       }
 
@@ -6391,11 +6915,12 @@ LegoCore.registerBlock({
       }
 
       function clearPending() {
+        audioPickToken++; pendingAudioLoad = null;
         pendingAudioBlob = null; pendingAudioName = ''; pendingTranscript = '';
         pendingFlowNs = null; pendingFlowName = ''; pendingSet = null;
         recordedPending = false;
         previewBar.style.display = 'none';
-        if (previewPlayer) { previewPlayer.pause(); previewPlayer = null; }
+        disposePreviewPlayer();
         previewPlayBtn.innerText = '▶️';
         previewPlayBtn.style.display = '';
         previewSaveBtn.style.display = '';
@@ -6403,13 +6928,21 @@ LegoCore.registerBlock({
         syncSeqExempt();
       }
 
+      // v30.6: a finished/stopped preview lets go of its audio (no leftovers in memory)
+      function disposePreviewPlayer() {
+        if (!previewPlayer) return;
+        try { previewPlayer.pause(); previewPlayer.removeAttribute('src'); previewPlayer.load(); } catch (e) { /* noop */ }
+        if (previewPlayer._url) URL.revokeObjectURL(previewPlayer._url);
+        previewPlayer = null;
+      }
       previewPlayBtn.onclick = () => {
         if (!pendingAudioBlob) return;
         if (!previewPlayer) {
-          previewPlayer = new Audio(URL.createObjectURL(pendingAudioBlob));
+          const url = URL.createObjectURL(pendingAudioBlob);
+          previewPlayer = new Audio(url); previewPlayer._url = url;
           previewPlayBtn.innerText = '⏹️'; previewPlayer.play();
-          previewPlayer.onended = () => { previewPlayBtn.innerText = '▶️'; previewPlayer = null; };
-        } else { previewPlayer.pause(); previewPlayer = null; previewPlayBtn.innerText = '▶️'; }
+          previewPlayer.onended = () => { previewPlayBtn.innerText = '▶️'; disposePreviewPlayer(); };
+        } else { disposePreviewPlayer(); previewPlayBtn.innerText = '▶️'; }
       };
 
       // --- INLINE QUICK SAVE MODAL ---
@@ -6484,12 +7017,12 @@ LegoCore.registerBlock({
           const finalTx = overlay.querySelector('#ig-qcx-save-transcript').value.trim();
 
           withDb(db => {
-            const tx = db.transaction(['folders', 'clips'], 'readwrite');
+            const tx = db.transaction(['folders'].concat(core.clipStore.STORES), 'readwrite');
             tx.objectStore('folders').put({ name: finalFolder });
             const store = tx.objectStore('clips');
             const countReq = store.count();
             countReq.onsuccess = () => {
-              store.add({
+              core.clipStore.addInTx(tx, {
                 name: finalName,
                 folder: finalFolder,
                 color: '#0095f6',
@@ -6513,10 +7046,24 @@ LegoCore.registerBlock({
       previewSaveBtn.onclick = () => openSaveClipModal();
       previewDiscardBtn.onclick = () => clearPending();
 
-      function sendImageSet(setObj, btnEl) {
+      let setOpening = false;  // v30.7: a double Enter can't send the album twice
+      async function sendImageSet(setObj, btnEl) {
+        if (setOpening) return;
+        const original = btnEl.innerText;
+        // v30.7: search copies hold only titles — open the real pictures now, just for this set
+        let full = setObj;
+        if (!(setObj.images || []).some(i => i && i.blob)) {
+          btnEl.innerText = '⏳';
+          setOpening = true;
+          try { full = (core.getImageSetFull && setObj.id !== undefined) ? await core.getImageSetFull(setObj.id) : null; }
+          finally { setOpening = false; }
+          btnEl.innerText = original;
+          if (pendingSet !== setObj) return;                         // cleared/changed while opening
+          if (!full) { previewLabel.innerText = '⚠️ Image set not found'; setTimeout(() => clearPending(), 1500); return; }
+        }
         // Shared core bridge: the whole set goes in ONE DataTransfer (one drop = one album)
-        if (!core.injectImageSetToChat(setObj.images || [])) return;
-        const original = btnEl.innerText; btnEl.innerText = '⏳';
+        if (!core.injectImageSetToChat(full.images || [])) return;
+        btnEl.innerText = '⏳';
         setTimeout(() => { btnEl.innerText = '✅'; setTimeout(() => { btnEl.innerText = original; clearPending(); }, 1000); }, 200);
       }
 
@@ -6529,6 +7076,7 @@ LegoCore.registerBlock({
       }
 
       function sendCurrent() {
+        if (pendingAudioLoad) { const t = audioPickToken; pendingAudioLoad.then(() => { if (t === audioPickToken && pendingAudioBlob) sendCurrent(); }); return; }
         if (pendingAudioBlob) { core.injectClipToChat(pendingAudioBlob, pendingAudioName); clearPending(); return; }
         if (pendingSet) { sendImageSet(pendingSet, sendBtn); return; }
         if (pendingFlowNs) {
@@ -6926,7 +7474,7 @@ LegoCore.registerBlock({
         // 🎙️ RECORDING ENTER: 1st Enter stops the recording (normal trailing lag + auto-trim → preview).
         // While ⏳ finishing / trimming, Enter is swallowed so it can never restart or discard the clip.
         // Once the preview shows, the regular Enter below pastes it into Instagram's chat box.
-        if (e.key === 'Enter' && !e.shiftKey && !dropdownOpen && (isRecording || isFinishing || isProcessing)) {
+        if (e.key === 'Enter' && !e.shiftKey && !dropdownOpen && (micStarting || isRecording || isFinishing || isProcessing)) {
           e.preventDefault(); e.stopPropagation();
           if (isRecording && !isFinishing) finishRecording();
           return;
@@ -6960,27 +7508,25 @@ LegoCore.registerBlock({
           }
           sendCurrent(); return;
         }
-        if (e.key === 'Escape') { if (pendingAudioBlob || pendingFlowNs || pendingSet) clearPending(); }
+        if (e.key === 'Escape') { if (pendingAudioBlob || pendingAudioLoad || pendingFlowNs || pendingSet) clearPending(); }
       });
       document.addEventListener('click', (e) => { if (dropdownOpen && !wrapper.contains(e.target) && !dropdownEl.contains(e.target)) closeDropdown(); });
 
-      let mediaRecorder;
-      let audioChunks = [];
+      // 🎙️ v30.6 — the microphone opens only when you press 🔴 (shared with the other
+      // recorders via core.mic) and switches itself off after the idle time you set.
+      let mediaRecorder = null;      // the recording in progress (a new one each time)
       let lagTimeoutId = null;
       let activeSessionId = 0;
-      let discardNextStop = false;
 
-      navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
-        mediaRecorder = new MediaRecorder(stream);
-        mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
-
-        mediaRecorder.onstop = async () => {
-          let blob = new Blob(audioChunks, { type: 'audio/mp4' });
-          audioChunks = [];
-
-          if (discardNextStop) { discardNextStop = false; return; }
-
-          const mySession = activeSessionId;
+      function makeRecorder(stream, sessionId) {
+        const chunks = [];           // each recording keeps its own audio pieces
+        const rec = new MediaRecorder(stream);
+        rec.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+        rec.onstop = async () => {
+          core.mic.release();        // the audio is collected — the mic may now rest
+          if (rec._discard) return;
+          let blob = new Blob(chunks, { type: 'audio/mp4' });
+          if (sessionId !== activeSessionId) return; // a newer recording owns the state now
           const effectsEnabled = localStorage.getItem(EFFECTS_KEY) !== 'false';
 
           if (core.audio && core.audio.process) {
@@ -6995,9 +7541,10 @@ LegoCore.registerBlock({
             const threshold = localStorage.getItem('sb_quick_silence_threshold') || '0.035';
             if (trimStart || trimEnd) blob = await detectAndTrimSilence(blob, trimStart, trimEnd, threshold);
           }
-          if (mySession !== activeSessionId) return; // a newer recording owns the state now
+          if (sessionId !== activeSessionId) return; // a newer recording owns the state now
 
           isProcessing = false;
+          audioPickToken++; pendingAudioLoad = null; // a fresh recording wins over a clip still opening
           pendingAudioBlob = blob;
           pendingAudioName = 'quick_audio_' + Date.now();
           pendingTranscript = '';
@@ -7006,11 +7553,38 @@ LegoCore.registerBlock({
           previewLabel.innerText = '🎙️ Clip ready · Enter ↵ to paste';
           syncSeqExempt();
         };
-      }).catch(err => console.warn("[QuickCommandExtension] Mic error:", err));
+        return rec;
+      }
 
-      function startRecording() {
-        clearPending(); audioChunks = []; activeSessionId = Date.now(); isProcessing = false;
-        mediaRecorder.start(); isRecording = true;
+      async function startRecording() {
+        if (micStarting || isRecording) return;
+        clearPending(); isProcessing = false;
+        const sessionId = ++activeSessionId;
+        micStarting = true;
+        recordBtn.innerText = '🎙️'; recordBtn.title = 'Opening microphone…';
+        let stream;
+        try {
+          stream = await core.mic.open();
+        } catch (err) {
+          micStarting = false;
+          recordBtn.innerText = '🔴'; recordBtn.title = 'Record a quick audio clip';
+          syncSeqExempt();
+          flashNote(core.mic.errorText(err), 3500);
+          return;
+        }
+        micStarting = false;
+        recordBtn.title = 'Record a quick audio clip';
+        if (sessionId !== activeSessionId) { core.mic.release(); return; } // cancelled while opening
+        try {
+          mediaRecorder = makeRecorder(stream, sessionId);
+          mediaRecorder.start();
+        } catch (err) {
+          core.mic.release();
+          recordBtn.innerText = '🔴';
+          flashNote('⚠️ Could not start recording', 2500);
+          return;
+        }
+        isRecording = true;
         recordBtn.classList.add('recording'); recordBtn.classList.remove('finishing'); recordBtn.innerText = '⏹️';
         syncSeqExempt();
         input.focus(); // keep Enter pointed at Quick Chat while recording
@@ -7026,7 +7600,7 @@ LegoCore.registerBlock({
         recordBtn.innerText = '⏳'; recordBtn.classList.remove('recording'); recordBtn.classList.add('finishing');
         lagTimeoutId = setTimeout(() => {
           isFinishing = false; isRecording = false;
-          if (mediaRecorder.state === 'recording') { isProcessing = true; mediaRecorder.stop(); }
+          if (mediaRecorder && mediaRecorder.state === 'recording') { isProcessing = true; mediaRecorder.stop(); }
           recordBtn.classList.remove('finishing'); recordBtn.innerText = '🔴';
           syncSeqExempt();
         }, lagMs);
@@ -7034,23 +7608,22 @@ LegoCore.registerBlock({
 
       // Mouse-only: clicking 🔴 during ⏳ throws away the clip and starts over (Enter never does this)
       function restartDuringFinish() {
-        clearTimeout(lagTimeoutId); isFinishing = false; discardNextStop = true; activeSessionId = Date.now();
-        if (mediaRecorder.state === 'recording') {
-          const restartHandler = () => {
-            clearPending(); audioChunks = []; mediaRecorder.start(); isRecording = true;
-            recordBtn.classList.add('recording'); recordBtn.classList.remove('finishing'); recordBtn.innerText = '⏹️';
-            syncSeqExempt();
-            mediaRecorder.removeEventListener('stop', restartHandler);
-          };
-          mediaRecorder.addEventListener('stop', restartHandler); mediaRecorder.stop();
+        clearTimeout(lagTimeoutId); isFinishing = false; isRecording = false;
+        recordBtn.classList.remove('finishing', 'recording');
+        const old = mediaRecorder;
+        if (old && old.state === 'recording') {
+          old._discard = true;
+          startRecording();   // asks for the mic first, so it stays open between the two
+          old.stop();
         } else {
-          isRecording = false; recordBtn.classList.remove('finishing', 'recording'); recordBtn.innerText = '🔴';
+          recordBtn.innerText = '🔴';
           syncSeqExempt();
         }
       }
 
       recordBtn.onclick = () => {
-        if (!mediaRecorder) { alert("Microphone not initialized."); return; }
+        if (!core.mic) { alert("This Commands block needs the newer Core (v6)."); return; }
+        if (micStarting) return;
         if (isFinishing) { restartDuringFinish(); return; }
         if (!isRecording) startRecording();
         else finishRecording();
@@ -7466,338 +8039,164 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Image Library (v2)
+   BLOCK: Image Library (v3)
    ============================================================ */
 /* ============================================================
-   BLOCK: Image Sets Library (v4 - 🔗 Permanent set IDs)
-   v4: new sets get a permanent "syncId" (sequences point at it).
-       Editing a set re-reads it from the database before saving, so the
-       permanent ID (and anything a sync added) is never overwritten.
+   BLOCK: Text Library Image Manager (Right-Side Icon & Viewer) (v2 - 🪶 Light)
+   - v2: watches ONLY the page's top layer, where the Text Library adds its
+     editor window — Instagram's messages, typing dots and hovers no longer
+     wake it. The snippet pictures are read once and re-read only when the
+     library changes (before: every time the list redrew).
+   - Completely separate extension.
+   - Handles file uploading, compression, and hover viewing.
    ============================================================ */
 LegoCore.registerBlock({
-  id: 'imageSetsLibraryModule',
+  id: 'textLibraryImageManager',
   init(core) {
-    const DB_NAME = 'IG_ImageSets_Core_DB';
-    const DB_VERSION = 1;
-    let db = null;
-    let draggedItem = null;
-
-    const request = indexedDB.open(DB_NAME, DB_VERSION);
-    request.onerror = e => console.error("[ImageSets] DB Error:", e);
-    request.onupgradeneeded = e => {
-      const database = e.target.result;
-      if (!database.objectStoreNames.contains('sets')) {
-        const store = database.createObjectStore('sets', { keyPath: 'id' });
-        store.createIndex('order', 'order', { unique: false });
-      }
-    };
-    request.onsuccess = e => {
-      db = e.target.result;
-      renderTree();
-    };
+    const PRO_KEY = 'ig_text_library_pro_v1';
 
     const style = document.createElement('style');
-    style.id = 'ig-image-sets-styles';
     style.innerHTML = `
-      .ig-isl-container { display: flex; flex-direction: column; gap: 8px; font-family: -apple-system, sans-serif; font-size: 11px; flex: 1; min-height: 0; }
-      .ig-isl-header-btns { display: flex; gap: 4px; }
-      .ig-isl-hbtn { flex: 1; background: var(--igls-surface-2, #1c1c23); color: #e2e8f0; border: 1px solid #334155; border-radius: 4px; padding: 6px 4px; font-size: 10px; font-weight: bold; cursor: pointer; transition: 0.2s; text-align: center; }
-      .ig-isl-hbtn:hover { background: #334155; color: #fff; }
-      .ig-isl-tree { flex: 1; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; padding-right: 2px; }
-      .ig-isl-tree::-webkit-scrollbar { width: 4px; }
-      .ig-isl-tree::-webkit-scrollbar-thumb { background: #475569; border-radius: 4px; }
-      .ig-isl-row { display: flex; align-items: center; padding: 6px 8px; border-bottom: 1px solid rgba(255,255,255,0.03); background: rgba(255,255,255,0.01); cursor: grab; transition: background 0.2s; }
-      .ig-isl-row:hover { background: rgba(255,255,255,0.05); }
-      .ig-isl-row.alt { background: rgba(255,255,255,0.02); }
-      .ig-isl-row:active { cursor: grabbing; }
-      .ig-isl-grip { color: #475569; font-size: 10px; cursor: grab; margin-right: 6px; flex-shrink: 0; }
-      .ig-isl-title { flex: 1; font-size: 11px; color: #f8fafc; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
-      .ig-isl-count-badge { font-size: 9px; background: rgba(255,255,255,0.1); color: #c9a876; padding: 2px 6px; border-radius: 8px; font-weight: bold; margin: 0 8px; flex-shrink: 0; }
-      .ig-isl-actions { display: flex; gap: 4px; align-items: center; flex-shrink: 0; }
-      .ig-isl-btn { background: transparent; border: none; color: #64748b; cursor: pointer; font-size: 11px; padding: 3px 6px; border-radius: 4px; transition: 0.2s; }
-      .ig-isl-btn:hover { background: rgba(255,255,255,0.1); color: #fff; }
-      .ig-isl-send-btn { background: #10b981; color: #fff; border-radius: 4px; padding: 4px 8px; font-weight: bold; font-size: 10px; }
-      .ig-isl-send-btn:hover { background: #059669; color: #fff; }
-      .ig-isl-drop-top { border-top: 2px solid #10b981 !important; }
-      .ig-isl-drop-bottom { border-bottom: 2px solid #10b981 !important; }
-      .ig-isl-modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 2147483647; display: flex; justify-content: center; align-items: center; }
-      .ig-isl-modal { background: #0f172a; border: 1px solid #334155; border-radius: 8px; width: 360px; max-height: 90vh; display: flex; flex-direction: column; box-shadow: 0 10px 25px rgba(0,0,0,0.5); overflow: hidden; }
-      .ig-isl-modal-header { padding: 16px; border-bottom: 1px solid #334155; display: flex; justify-content: space-between; align-items: center; }
-      .ig-isl-modal-header h3 { margin: 0; font-size: 14px; color: #fff; }
-      .ig-isl-modal-body { padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 12px; flex: 1; }
-      .ig-isl-modal-footer { padding: 12px 16px; border-top: 1px solid #334155; display: flex; justify-content: space-between; background: #1e293b; }
-      .ig-isl-input { width: 100%; background: #1e293b; border: 1px solid #475569; color: #fff; padding: 8px; border-radius: 4px; font-size: 12px; box-sizing: border-box; outline: none; }
-      .ig-isl-input:focus { border-color: #6366f1; }
-      .ig-isl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(70px, 1fr)); gap: 8px; margin-top: 8px; }
-      .ig-isl-thumb-wrap { position: relative; aspect-ratio: 1; background: #1e293b; border: 1px solid #334155; border-radius: 4px; overflow: hidden; }
-      .ig-isl-thumb-wrap img { width: 100%; height: 100%; object-fit: cover; }
-      .ig-isl-thumb-del { position: absolute; top: 2px; right: 2px; background: rgba(220,38,38,0.9); color: #fff; border: none; width: 18px; height: 18px; border-radius: 3px; font-size: 10px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
-      .ig-isl-thumb-del:hover { background: #b91c1c; }
+      .ig-tln-thumb-btn {
+        background: transparent; border: none; font-size: 11px; cursor: pointer;
+        padding: 4px; border-radius: 4px; transition: 0.1s; margin-right: 2px;
+      }
+      .ig-tln-thumb-btn:hover { background: rgba(255,255,255,0.1); }
+      .ig-tln-thumb-btn:active { transform: scale(0.9); }
     `;
     document.head.appendChild(style);
 
-    const libUI = document.createElement('div');
-    libUI.className = 'ig-isl-container';
-    libUI.innerHTML = `
-      <div class="ig-isl-header-btns">
-        <button id="ig-isl-new-set" class="ig-isl-hbtn">➕ New Image Set</button>
-      </div>
-      <div id="ig-isl-tree" class="ig-isl-tree"></div>
-    `;
+    const thumbViewer = document.createElement('div');
+    thumbViewer.style.cssText = 'position:fixed; z-index:2147483647; max-width:250px; max-height:250px; border-radius:8px; box-shadow:0 10px 30px rgba(0,0,0,0.8); pointer-events:none; display:none; background:#0f172a; padding:6px; border:1px solid #334155;';
+    const thumbViewerImg = document.createElement('img');
+    thumbViewerImg.style.cssText = 'max-width:100%; max-height:100%; border-radius:4px; object-fit:contain; display:block;';
+    thumbViewer.appendChild(thumbViewerImg);
+    document.body.appendChild(thumbViewer);
 
-    function compressThumbnail(file, maxSize = 200) {
-      return new Promise((resolve) => {
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          const img = new Image();
-          img.onload = () => {
-            const canvas = document.createElement('canvas');
-            let w = img.width, h = img.height;
-            if (w > maxSize || h > maxSize) {
-              const ratio = Math.min(maxSize / w, maxSize / h);
-              w *= ratio; h *= ratio;
-            }
-            canvas.width = w; canvas.height = h;
-            canvas.getContext('2d').drawImage(img, 0, 0, w, h);
-            resolve(canvas.toDataURL('image/jpeg', 0.6));
-          };
-          img.src = e.target.result;
+    function compressImage(file, maxSize, callback) {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const img = new Image();
+        img.onload = () => {
+          const canvas = document.createElement('canvas');
+          let w = img.width; let h = img.height;
+          if (w > maxSize || h > maxSize) {
+            const ratio = Math.min(maxSize / w, maxSize / h);
+            w *= ratio; h *= ratio;
+          }
+          canvas.width = w; canvas.height = h;
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0, w, h);
+          callback(canvas.toDataURL('image/jpeg', 0.8));
         };
-        reader.readAsDataURL(file);
-      });
+        img.src = e.target.result;
+      };
+      reader.readAsDataURL(file);
     }
 
-    function openSetEditor(existingSet) {
-      const isEdit = !!existingSet;
-      let draftImages = isEdit ? [...existingSet.images] : [];
+    // v2: picture lookup by snippet id, built once, rebuilt only after a change
+    let thumbById = null;
+    function getThumbMap() {
+      if (thumbById) return thumbById;
+      thumbById = new Map();
+      try {
+        const data = JSON.parse(localStorage.getItem(PRO_KEY));
+        ((data && data.items) || []).forEach(i => { if (i && i.thumbnail) thumbById.set(i.id, i.thumbnail); });
+      } catch (e) { /* noop */ }
+      return thumbById;
+    }
+    const dropThumbs = () => { thumbById = null; };
+    core.on('textlib:updated', dropThumbs);
+    core.on('textlib:external-refresh', dropThumbs);
+    window.addEventListener('storage', e => { if (!e.key || e.key === PRO_KEY) dropThumbs(); });
 
-      const overlay = document.createElement('div');
-      overlay.className = 'ig-isl-modal-overlay';
-      overlay.innerHTML = `
-        <div class="ig-isl-modal">
-          <div class="ig-isl-modal-header">
-            <h3>${isEdit ? '✏️ Edit Image Set' : '🖼️ New Image Set'}</h3>
-            <button id="ig-isl-close" style="background:none; border:none; color:#94a3b8; cursor:pointer;">✕</button>
-          </div>
-          <div class="ig-isl-modal-body">
-            <div>
-              <div style="font-size:11px; font-weight:bold; color:#94a3b8; margin-bottom:4px;">Set Title:</div>
-              <input type="text" id="ig-isl-title" class="ig-isl-input" placeholder="e.g. Welcome Package..." value="${isEdit ? existingSet.title : ''}">
-            </div>
-            <div>
-              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
-                <div style="font-size:11px; font-weight:bold; color:#94a3b8;">Images: <span id="ig-isl-count">0</span></div>
-                <button id="ig-isl-add-imgs" style="background:#334155; color:#fff; border:none; padding:4px 8px; border-radius:4px; font-size:10px; cursor:pointer;">➕ Add Files</button>
-                <input type="file" id="ig-isl-file-input" accept="image/*" multiple style="display:none;">
+    core.on('tl:tree-rendered', (contentArea) => {
+      const rows = contentArea.querySelectorAll('.ig-tln-snippet');
+      if (!rows.length) return;
+      const thumbs = getThumbMap();
+      if (!thumbs.size) return;
+
+      rows.forEach(row => {
+        const id = row.dataset.id;
+        const thumb = thumbs.get(id);
+
+        if (thumb && !row.querySelector('.ig-tln-thumb-btn')) {
+          const actionsDiv = row.querySelector('.ig-tln-actions');
+          const btn = document.createElement('button');
+          btn.className = 'ig-tln-thumb-btn ig-tln-thumb-icon';
+          btn.title = 'Hold to view thumbnail';
+          btn.innerText = '🖼️';
+
+          btn.onmousedown = (e) => {
+            e.stopPropagation();
+            thumbViewerImg.src = thumbs.get(id) || thumb;
+            thumbViewer.style.left = (e.clientX - 265) + 'px';
+            thumbViewer.style.top = (e.clientY + 10) + 'px';
+            thumbViewer.style.display = 'block';
+          };
+          const hide = () => thumbViewer.style.display = 'none';
+          btn.onmouseup = hide; btn.onmouseleave = hide; btn.onclick = e => e.stopPropagation();
+
+          actionsDiv.insertBefore(btn, actionsDiv.firstChild);
+        }
+      });
+    });
+
+    const observer = new MutationObserver((mutations) => {
+      mutations.forEach(m => {
+        m.addedNodes.forEach(node => {
+          if (node.nodeType === 1 && node.classList && node.classList.contains('ig-tlp-modal-overlay') && node.querySelector('#ig-tlp-modal-box')) {
+            const overlay = node;
+            const modal = overlay.querySelector('#ig-tlp-modal-box');
+            const tagSection = Array.from(modal.querySelectorAll('div')).find(d => d.innerText.includes('Assign Tags:'));
+
+            if (!tagSection || modal.querySelector('#ig-tlc-thumb-upload')) return;
+
+            const currentThumb = overlay.dataset.thumbnail || '';
+
+            const thumbUI = document.createElement('div');
+            thumbUI.innerHTML = `
+              <div style="font-size:11px; font-weight:bold; color:#94a3b8; margin-top:4px;">Thumbnail Image (Optional):</div>
+              <div style="display:flex; gap:8px; align-items:center;">
+                <input type="file" id="ig-tlc-thumb-upload" accept="image/*" style="font-size:10px; color:#fff; width:180px;">
+                <button id="ig-tlc-thumb-clear" style="background:transparent; color:#f43f5e; border:none; cursor:pointer; font-size:10px; display:${currentThumb ? 'block' : 'none'};">Clear Image</button>
               </div>
-              <div id="ig-isl-grid" class="ig-isl-grid"></div>
-            </div>
-          </div>
-          <div class="ig-isl-modal-footer">
-            <div style="display:flex; gap:8px;">
-              ${isEdit ? '<button id="ig-isl-delete" style="background:#dc2626; color:#fff; border:none; padding:6px 12px; border-radius:4px; font-weight:bold; cursor:pointer;">🗑️ Delete Set</button>' : '<div></div>'}
-            </div>
-            <div style="display:flex; gap:8px;">
-              <button id="ig-isl-cancel" style="background:transparent; color:#94a3b8; border:none; cursor:pointer; font-weight:bold;">Cancel</button>
-              <button id="ig-isl-save" style="background:#6366f1; color:#fff; border:none; padding:6px 12px; border-radius:4px; font-weight:bold; cursor:pointer;">💾 Save</button>
-            </div>
-          </div>
-        </div>
-      `;
-      document.body.appendChild(overlay);
+              <img id="ig-tlc-thumb-preview" src="${currentThumb}" style="max-height:40px; border-radius:4px; display:${currentThumb ? 'block' : 'none'}; object-fit:contain; margin-top:4px;">
+            `;
 
-      const gridEl = overlay.querySelector('#ig-isl-grid');
-      const countEl = overlay.querySelector('#ig-isl-count');
-      const titleInput = overlay.querySelector('#ig-isl-title');
-      const fileInput = overlay.querySelector('#ig-isl-file-input');
+            modal.insertBefore(thumbUI, tagSection);
 
-      function renderGrid() {
-        gridEl.innerHTML = '';
-        countEl.innerText = draftImages.length;
-        draftImages.forEach((imgObj, idx) => {
-          const wrap = document.createElement('div');
-          wrap.className = 'ig-isl-thumb-wrap';
-          wrap.innerHTML = `<img src="${imgObj.thumb}" alt="thumb"><button class="ig-isl-thumb-del" data-idx="${idx}">✕</button>`;
-          wrap.querySelector('.ig-isl-thumb-del').onclick = () => { draftImages.splice(idx, 1); renderGrid(); };
-          gridEl.appendChild(wrap);
+            const upload = thumbUI.querySelector('#ig-tlc-thumb-upload');
+            const clear = thumbUI.querySelector('#ig-tlc-thumb-clear');
+            const preview = thumbUI.querySelector('#ig-tlc-thumb-preview');
+
+            upload.onchange = (e) => {
+              const file = e.target.files[0];
+              if (file) {
+                compressImage(file, 400, (base64) => {
+                  overlay.dataset.thumbnail = base64;
+                  preview.src = base64;
+                  preview.style.display = 'block';
+                  clear.style.display = 'block';
+                });
+              }
+            };
+
+            clear.onclick = () => {
+              overlay.dataset.thumbnail = 'CLEAR';
+              preview.style.display = 'none';
+              clear.style.display = 'none';
+              upload.value = '';
+            };
+          }
         });
-      }
-      renderGrid();
-
-      overlay.querySelector('#ig-isl-add-imgs').onclick = () => fileInput.click();
-
-      fileInput.onchange = async (e) => {
-        const files = Array.from(e.target.files);
-        if (!files.length) return;
-        const addBtn = overlay.querySelector('#ig-isl-add-imgs');
-        addBtn.innerText = '⏳ Processing...';
-        addBtn.disabled = true;
-
-        for (let file of files) {
-          const thumb = await compressThumbnail(file);
-          draftImages.push({
-            id: 'img_' + Date.now() + '_' + Math.random().toString(36).substr(2, 5),
-            type: file.type, blob: file, thumb: thumb
-          });
-        }
-        fileInput.value = ''; addBtn.innerText = '➕ Add Files'; addBtn.disabled = false; renderGrid();
-      };
-
-      const closeModal = () => overlay.remove();
-      overlay.querySelector('#ig-isl-close').onclick = closeModal;
-      overlay.querySelector('#ig-isl-cancel').onclick = closeModal;
-
-      if (isEdit) {
-        overlay.querySelector('#ig-isl-delete').onclick = () => {
-          if (!confirm("Permanently delete this entire image set?")) return;
-          const tx = db.transaction(['sets'], 'readwrite');
-          tx.objectStore('sets').delete(existingSet.id);
-          tx.oncomplete = () => { renderTree(); closeModal(); core.emit('images:updated'); };
-        };
-      }
-
-      overlay.querySelector('#ig-isl-save').onclick = () => {
-        const title = titleInput.value.trim() || 'Untitled Set';
-        if (!draftImages.length) { alert("Please add at least one image to save a set."); return; }
-        const tx = db.transaction(['sets'], 'readwrite');
-        const store = tx.objectStore('sets');
-
-        if (isEdit) {
-          // Re-read the saved copy so fields added since this window opened (e.g. syncId) survive
-          const getReq = store.get(existingSet.id);
-          getReq.onsuccess = () => {
-            const rec = getReq.result || existingSet;
-            rec.title = title;
-            rec.images = draftImages;
-            if (!rec.syncId) rec.syncId = rec.id;
-            store.put(rec);
-          };
-        } else {
-          const countReq = store.count();
-          countReq.onsuccess = () => {
-            const newId = 'set_' + Date.now();
-            store.add({ id: newId, syncId: newId, title: title, images: draftImages, order: countReq.result });
-          };
-        }
-        tx.oncomplete = () => { renderTree(); closeModal(); core.emit('images:updated'); };
-      };
-    }
-
-    libUI.querySelector('#ig-isl-new-set').onclick = () => openSetEditor(null);
-
-    function openPreviewModal(setObj) {
-      const overlay = document.createElement('div');
-      overlay.className = 'ig-isl-modal-overlay';
-      const thumbsHtml = setObj.images.map(img => `<div class="ig-isl-thumb-wrap"><img src="${img.thumb}" alt="thumb"></div>`).join('');
-      overlay.innerHTML = `
-        <div class="ig-isl-modal">
-          <div class="ig-isl-modal-header">
-            <h3>👁️ Preview: ${setObj.title}</h3>
-            <button id="ig-isl-close-prev" style="background:none; border:none; color:#94a3b8; cursor:pointer;">✕</button>
-          </div>
-          <div class="ig-isl-modal-body"><div class="ig-isl-grid">${thumbsHtml}</div></div>
-        </div>
-      `;
-      document.body.appendChild(overlay);
-      const close = () => overlay.remove();
-      overlay.querySelector('#ig-isl-close-prev').onclick = close;
-      overlay.addEventListener('click', (e) => { if (e.target === overlay) close(); });
-    }
-
-    function handleDragStart(e, id) { draggedItem = id; e.dataTransfer.effectAllowed = 'move'; setTimeout(() => e.target.style.opacity = '0.3', 0); }
-    function handleDragOver(e, id) {
-      e.preventDefault(); e.stopPropagation();
-      const targetEl = e.currentTarget;
-      document.querySelectorAll('.ig-isl-drop-top, .ig-isl-drop-bottom').forEach(el => el.classList.remove('ig-isl-drop-top', 'ig-isl-drop-bottom'));
-      if (!draggedItem || draggedItem === id) return;
-      const rect = targetEl.getBoundingClientRect(); const y = e.clientY - rect.top;
-      if (y < rect.height / 2) targetEl.classList.add('ig-isl-drop-top'); else targetEl.classList.add('ig-isl-drop-bottom');
-    }
-    function handleDrop(e, targetId) {
-      e.preventDefault(); e.stopPropagation();
-      if (!draggedItem || draggedItem === targetId) return;
-      const targetEl = e.currentTarget; const rect = targetEl.getBoundingClientRect(); const y = e.clientY - rect.top;
-      const tx = db.transaction(['sets'], 'readwrite');
-      const store = tx.objectStore('sets');
-      store.getAll().onsuccess = ev => {
-        const sets = ev.target.result.sort((a,b) => (a.order || 0) - (b.order || 0));
-        const dragIdx = sets.findIndex(s => s.id === draggedItem);
-        const targetIdx = sets.findIndex(s => s.id === targetId);
-        if (dragIdx > -1 && targetIdx > -1) {
-          const [moved] = sets.splice(dragIdx, 1);
-          if (y < rect.height / 2) sets.splice(targetIdx, 0, moved); else sets.splice(targetIdx + 1, 0, moved);
-          sets.forEach((s, i) => { s.order = i; store.put(s); });
-        }
-      };
-      tx.oncomplete = () => { draggedItem = null; renderTree(); };
-    }
-
-    function sendImageSet(setObj, btnEl) {
-      const chatZone = core.getActiveChatZone();
-      if (!chatZone) { alert("Open an active Instagram chat window first."); return; }
-      const original = btnEl.innerText; btnEl.innerText = '⏳';
-      const dt = new DataTransfer();
-      setObj.images.forEach((imgData, i) => {
-        const ext = imgData.type ? imgData.type.split('/')[1] : 'jpeg';
-        const fileObj = new File([imgData.blob], `image_${i}.${ext}`, { type: imgData.type || 'image/jpeg' });
-        dt.items.add(fileObj);
       });
-      ['dragenter', 'dragover', 'drop'].forEach(eventType => {
-        chatZone.dispatchEvent(new DragEvent(eventType, { bubbles: true, cancelable: true, dataTransfer: dt }));
-      });
-      setTimeout(() => { btnEl.innerText = '✅'; setTimeout(() => btnEl.innerText = '📤 Send', 1000); }, 200);
-    }
+    });
 
-    function renderTree() {
-      if (!db) return;
-      const tree = libUI.querySelector('#ig-isl-tree');
-      tree.innerHTML = '';
-      const tx = db.transaction(['sets'], 'readonly');
-      tx.objectStore('sets').getAll().onsuccess = e => {
-        const sets = (e.target.result || []).sort((a,b) => (a.order || 0) - (b.order || 0));
-        if (!sets.length) {
-          tree.innerHTML = '<div style="padding:12px; color:#94a3b8; font-size:10px; text-align:center;">No Image Sets yet. Click New to bundle images together.</div>';
-          return;
-        }
-        sets.forEach((set, idx) => {
-          const row = document.createElement('div');
-          row.className = `ig-isl-row ${idx % 2 === 0 ? 'alt' : ''}`;
-          row.draggable = true;
-          row.innerHTML = `
-            <span class="ig-isl-grip">⠿</span>
-            <span class="ig-isl-title" title="${set.title}">${set.title}</span>
-            <span class="ig-isl-count-badge">🖼️ ${set.images.length}</span>
-            <div class="ig-isl-actions">
-              <button class="ig-isl-btn prev-btn" title="Preview Contents">👁️</button>
-              <button class="ig-isl-btn edit-btn" title="Edit Set">✏️</button>
-              <button class="ig-isl-send-btn" title="Send all images in this set">📤 Send</button>
-            </div>
-          `;
-          row.addEventListener('dragstart', (ev) => handleDragStart(ev, set.id));
-          row.addEventListener('dragend', (ev) => { ev.target.style.opacity = '1'; draggedItem = null; });
-          row.addEventListener('dragover', (ev) => handleDragOver(ev, set.id));
-          row.addEventListener('dragleave', (ev) => ev.currentTarget.classList.remove('ig-isl-drop-top', 'ig-isl-drop-bottom'));
-          row.addEventListener('drop', (ev) => handleDrop(ev, set.id));
-          row.querySelector('.prev-btn').onclick = () => openPreviewModal(set);
-          row.querySelector('.edit-btn').onclick = () => openSetEditor(set);
-          row.querySelector('.ig-isl-send-btn').onclick = (ev) => sendImageSet(set, ev.target);
-          tree.appendChild(row);
-        });
-      };
-    }
-
-    core.on('images:external-refresh', () => { renderTree(); });
-
-    function mountCard(attemptsLeft = 10) {
-      if (typeof core.registerMenu === 'function') {
-        core.registerMenu('left', '🖼️ Image Sets', libUI, '⠿', 'image-sets-library');
-      } else if (attemptsLeft > 0) {
-        setTimeout(() => mountCard(attemptsLeft - 1), 200);
-      }
-    }
-    mountCard();
-
-    core.emit('block:ready', { id: 'imageSetsLibraryModule' });
+    // v2: top layer only — the Text Library editor is always added straight to <body>
+    observer.observe(document.body, { childList: true });
+    console.log('[TextLibraryImageManager] Loaded: Image Logic successfully decoupled.');
+    core.emit('block:ready', { id: 'textLibraryImageManager' });
   }
 });
 
@@ -8065,10 +8464,14 @@ LegoCore.registerBlock({
 
 
 /* ============================================================
-   BLOCK: Master Config Bunny Sync (v7)
+   BLOCK: Master Config Bunny Sync (v10)
    ============================================================ */
 /* ============================================================
-   BLOCK: Central Cloud Sync Center (v5 - Exact Names + Sync Manifests + Permanent IDs)
+   BLOCK: Central Cloud Sync Center (v5.2 - 🚀 Syncs the Launchpad too)
+   - v5.2: the Launchpad (tabs, buttons, colors, versions) rides the master config
+   - v5.1: 📦 reads each sound only to upload it; needs Core v5
+   - v5.1: clip lists come without sound (core.clipStore); Smart Backup opens
+     one clip's sound at a time, only for the files it actually uploads
    - Cloud file names keep (), dots, ¿¡, accents and emojis
    - ig_sync_meta/audio_manifest.json carries each clip's exact name, folder,
      color, custom command, transcript and order (+ folder order)
@@ -8112,7 +8515,9 @@ LegoCore.registerBlock({
         'ig_sequences_v1', 'ig_seq_col_widths_v1', 'ig_seq_hud_pos_v1',
         'ig_seq_folders_v1', 'ig_seq_folders_collapsed_v1',
         // Tag Colors (number + course badge colors)
-        'ig_tag_colors_v1'
+        'ig_tag_colors_v1',
+        // Launchpad (tabs + buttons, v5.2)
+        'ig_launchpad_v1'
     ];
 
     let prefs = JSON.parse(localStorage.getItem(BUNNY_PREFS_KEY)) || { zoneName: '', apiKey: '', region: 'default' };
@@ -8277,20 +8682,20 @@ LegoCore.registerBlock({
         });
     }
 
-    const getLocalClips = () => getAllFrom(requireAudioDb(), 'clips');
+    // v5.1: info only (each item has hasAudio); the sound is opened per upload
+    const getLocalClips = () => { requireAudioDb(); return core.clipStore.list(); };
     const getLocalFolders = () => getAllFrom(requireAudioDb(), 'folders');
 
     async function putClips(clips) {
         if (!clips.length) return;
-        const tx = requireAudioDb().transaction(['clips'], 'readwrite');
-        const store = tx.objectStore('clips');
-        clips.forEach(c => store.put(c));
+        const tx = requireAudioDb().transaction(core.clipStore.STORES, 'readwrite');
+        clips.forEach(c => core.clipStore.putInTx(tx, c));
         await txDone(tx);
     }
 
     async function addClip(clipData) {
-        const tx = requireAudioDb().transaction(['clips'], 'readwrite');
-        tx.objectStore('clips').add(clipData);
+        const tx = requireAudioDb().transaction(core.clipStore.STORES, 'readwrite');
+        core.clipStore.addInTx(tx, clipData);
         await txDone(tx);
     }
 
@@ -8447,7 +8852,7 @@ LegoCore.registerBlock({
 
         const allClips = await getLocalClips();
         await ensureSyncIds(allClips);
-        const clips = allClips.filter(c => c.blob);
+        const clips = allClips.filter(c => c.hasAudio || c.blob);
 
         const prev = await fetchJSON(AUDIO_MANIFEST);
         const cloudInv = await getCloudInventory(AUDIO_DIR, AUDIO_EXT_RE);
@@ -8483,7 +8888,9 @@ LegoCore.registerBlock({
         for (let i = 0; i < toUpload.length; i++) {
             lockUI(`☁️ Audio: Pushing ${i + 1}/${toUpload.length}...`);
             const p = toUpload[i];
-            await bunnyRequest('PUT', p.path, await blobToArrayBuffer(p.clip.blob));
+            const sound = p.clip.blob || await core.clipStore.getBlob(p.clip.id); // one at a time
+            if (!sound) throw new Error(`Audio missing for "${p.clip.name || 'clip'}"`);
+            await bunnyRequest('PUT', p.path, await blobToArrayBuffer(sound));
             uploadedKeys.add(p.key);
             await sleep(100);
         }
@@ -11131,6 +11538,731 @@ LegoCore.registerBlock({
     core.injectClipToChat = injectClipToChat;
 
     core.emit('block:ready', { id: 'audioWavEngine' });
+  }
+});
+
+/* ============================================================
+   BLOCK: Launchpad (v1)
+   ============================================================ */
+/* ============================================================
+   BLOCK: Launchpad (v1.2 - 🔤 A = main version)
+   ------------------------------------------------------------
+   v1.2: the main version is "A"; the others are B, C, D…
+   v1.1: hover a button (or a version in the tree) to preview what it
+         sends — text, audio transcript, image-set pictures, sequence steps —
+         in the same style as the Commands search preview.
+   Buttons that load a message into the Instagram chat box with one click.
+   - Tabs (one per course, e.g. "Portrait", "Animals").
+   - Each button: a title, a color, white or black text, any size.
+   - Left 2/3 = sends version A (the main one). Right 1/3 (▾) = opens
+     the tree with A and the other versions (B, C, D…). Click one to send it.
+   - A message can be: a Text Library snippet, an audio clip, an image set,
+     a Sequence, or text typed right here.
+   - ⚙️ = edit mode: add/delete tabs and buttons, drag to reorder,
+     drag the corner to resize, click a button to edit it.
+   - Engine: the Core (the same search + sending that Commands and
+     Sequences use). No other block is changed. Items are saved as links,
+     so renaming or moving an audio never breaks a button.
+   - Saved in 'ig_launchpad_v1' (synced by the Sync Center's master config).
+   - Light: no timers, no page watchers; nothing is loaded until you click.
+   Needs Core v8.
+   ============================================================ */
+LegoCore.registerBlock({
+  id: 'launchpad',
+  init(core) {
+    const KEY = 'ig_launchpad_v1';
+    const KINDS = ['text', 'audio', 'set', 'sequence'];
+    const ICON = { text: '📝', audio: '🎵', set: '🖼️', sequence: '🔗', custom: '✍️' };
+    const COLORS = ['#334155', '#16a34a', '#dc2626', '#ea580c', '#ca8a04', '#2563eb', '#7c3aed', '#db2777'];
+    const LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    const esc = core.escapeHtml;
+    const uid = p => p + '_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+    const norm = s => String(s || '').trim().toLowerCase();
+
+    // ---------------- Data ----------------
+    function blankState() {
+      const tabId = uid('tab');
+      return { v: 1, activeTab: tabId, tabs: [{ id: tabId, name: 'Main', cols: 3, tiles: [] }] };
+    }
+    function load() {
+      try {
+        const s = JSON.parse(localStorage.getItem(KEY));
+        if (s && Array.isArray(s.tabs) && s.tabs.length) {
+          s.tabs.forEach(t => { t.tiles = Array.isArray(t.tiles) ? t.tiles : []; t.cols = clamp(t.cols || 3, 2, 6); });
+          if (!s.tabs.some(t => t.id === s.activeTab)) s.activeTab = s.tabs[0].id;
+          return s;
+        }
+      } catch (e) { /* noop */ }
+      return blankState();
+    }
+    function save() {
+      try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) { toast('⚠️ Could not save'); }
+      core.emit('launchpad:updated');
+    }
+    function clamp(n, a, b) { return Math.max(a, Math.min(b, Math.round(Number(n) || a))); }
+    let state = load();
+    let editMode = false;
+    const activeTab = () => state.tabs.find(t => t.id === state.activeTab) || state.tabs[0];
+    const findTile = id => { for (const t of state.tabs) { const x = t.tiles.find(i => i.id === id); if (x) return { tab: t, tile: x }; } return null; };
+
+    // ---------------- Styles ----------------
+    const style = document.createElement('style');
+    style.textContent = `
+      .ig-lp { display:flex; flex-direction:column; gap:6px; font-size:11px; color:var(--igls-text,#e2e8f0); }
+      .ig-lp-bar { display:flex; align-items:center; gap:4px; }
+      .ig-lp-tabs { display:flex; gap:4px; overflow-x:auto; flex:1; scrollbar-width:none; }
+      .ig-lp-tabs::-webkit-scrollbar { display:none; }
+      .ig-lp-tab { flex-shrink:0; background:transparent; border:1px solid var(--igls-border,#334155); color:var(--igls-text-dim,#94a3b8); padding:3px 9px; border-radius:999px; cursor:pointer; font-size:10px; white-space:nowrap; }
+      .ig-lp-tab.on { background:var(--igls-accent,#c9a876); border-color:var(--igls-accent,#c9a876); color:#111; font-weight:bold; }
+      .ig-lp-icon { background:transparent; border:none; color:var(--igls-text-dim,#94a3b8); cursor:pointer; font-size:12px; padding:2px 4px; border-radius:4px; flex-shrink:0; }
+      .ig-lp-icon:hover, .ig-lp-icon.on { color:var(--igls-accent,#c9a876); background:rgba(255,255,255,0.08); }
+      .ig-lp-tools { display:none; align-items:center; gap:6px; font-size:10px; color:var(--igls-text-dim,#94a3b8); }
+      .ig-lp.edit .ig-lp-tools { display:flex; }
+      .ig-lp-tools button { background:transparent; border:1px solid var(--igls-border,#334155); color:inherit; border-radius:4px; padding:2px 7px; cursor:pointer; font-size:10px; }
+      .ig-lp-grid { display:grid; gap:6px; grid-auto-rows:44px; }
+      .ig-lp-tile { position:relative; display:flex; border-radius:8px; overflow:hidden; user-select:none; box-shadow:0 1px 2px rgba(0,0,0,0.3); transition:transform .08s, filter .15s; }
+      .ig-lp-tile:active { transform:scale(0.97); }
+      .ig-lp-main, .ig-lp-tog { border:none; background:transparent; color:inherit; cursor:pointer; font:inherit; padding:0; }
+      .ig-lp-main { flex:1; min-width:0; padding:4px 8px; text-align:left; font-weight:600; font-size:11px; line-height:1.2; overflow:hidden; display:flex; align-items:center; word-break:break-word; }
+      .ig-lp-main:hover, .ig-lp-tog:hover { background:rgba(255,255,255,0.12); }
+      .ig-lp-tile.dark .ig-lp-main:hover, .ig-lp-tile.dark .ig-lp-tog:hover { background:rgba(0,0,0,0.12); }
+      .ig-lp-tog { width:33.34%; flex-shrink:0; font-size:14px; border-left:1px solid rgba(255,255,255,0.25); display:flex; align-items:center; justify-content:center; }
+      .ig-lp-tile.dark .ig-lp-tog { border-left-color:rgba(0,0,0,0.2); }
+      .ig-lp-tile.ok { filter:brightness(1.35); }
+      .ig-lp-tile.bad { filter:grayscale(1); }
+      .ig-lp-tile.dragging { opacity:.35; }
+      .ig-lp-tile.drop { outline:2px dashed var(--igls-accent,#c9a876); outline-offset:1px; }
+      .ig-lp-size { display:none; position:absolute; right:0; bottom:0; width:14px; height:14px; cursor:nwse-resize; background:linear-gradient(135deg, transparent 50%, rgba(255,255,255,0.7) 50%); }
+      .ig-lp.edit .ig-lp-size { display:block; }
+      .ig-lp.edit .ig-lp-tile { cursor:grab; outline:1px dashed rgba(255,255,255,0.35); outline-offset:-1px; }
+      .ig-lp.edit .ig-lp-main, .ig-lp.edit .ig-lp-tog { cursor:pointer; }
+      .ig-lp-add { border:1px dashed var(--igls-border,#334155); background:transparent; color:var(--igls-text-dim,#94a3b8); border-radius:8px; cursor:pointer; font-size:16px; display:none; }
+      .ig-lp.edit .ig-lp-add { display:block; }
+      .ig-lp-empty { color:var(--igls-text-dim,#94a3b8); font-size:10px; padding:6px 2px; }
+      .ig-lp-toast { font-size:10px; color:#fbbf24; min-height:0; }
+      .ig-lp-tree { position:fixed; z-index:2147483647; min-width:170px; max-width:280px; max-height:60vh; overflow:auto; background:var(--igls-surface,#111118); border:1px solid var(--igls-border-strong,#475569); border-radius:8px; box-shadow:0 10px 30px rgba(0,0,0,0.6); padding:4px; display:flex; flex-direction:column; gap:2px; font-size:11px; color:var(--igls-text,#e2e8f0); }
+      .ig-lp-tree button { display:flex; align-items:center; gap:6px; background:transparent; border:none; color:inherit; text-align:left; padding:6px 8px; border-radius:5px; cursor:pointer; font:inherit; }
+      .ig-lp-tree button:hover { background:rgba(255,255,255,0.08); }
+      .ig-lp-tree b { min-width:16px; color:var(--igls-accent,#c9a876); }
+      .ig-lp-tree span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+      .ig-lp-preview { position:fixed; z-index:2147483647; width:240px; max-height:50vh; overflow-y:auto; background:#0f172a; border:1px solid #334155; border-radius:8px; box-shadow:0 10px 30px rgba(0,0,0,0.5); display:none; flex-direction:column; padding:10px; gap:6px; pointer-events:none; }
+      .ig-lp-preview::-webkit-scrollbar { width:4px; }
+      .ig-lp-preview::-webkit-scrollbar-thumb { background:#334155; border-radius:4px; }
+      .ig-lp-pv-title { font-size:11px; font-weight:bold; color:#f8fafc; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; padding-bottom:4px; border-bottom:1px solid rgba(255,255,255,0.08); }
+      .ig-lp-pv-body { font-size:11px; color:#cbd5e1; line-height:1.5; white-space:pre-wrap; word-break:break-word; }
+      .ig-lp-pv-empty { font-size:10px; color:#64748b; font-style:italic; }
+      .ig-lp-pv-imgs { display:grid; grid-template-columns:repeat(3, 1fr); gap:4px; }
+      .ig-lp-pv-imgs img { width:100%; aspect-ratio:1; object-fit:cover; border-radius:4px; background:#1e293b; }
+      .ig-lp-overlay { position:fixed; inset:0; z-index:2147483646; background:rgba(0,0,0,0.5); display:flex; align-items:center; justify-content:center; }
+      .ig-lp-ed { width:320px; max-width:94vw; max-height:88vh; overflow:auto; background:var(--igls-surface,#111118); border:1px solid var(--igls-border-strong,#475569); border-radius:10px; padding:12px; display:flex; flex-direction:column; gap:10px; font-size:11px; color:var(--igls-text,#e2e8f0); box-shadow:0 14px 44px rgba(0,0,0,0.65); }
+      .ig-lp-ed input[type=text], .ig-lp-ed textarea { width:100%; box-sizing:border-box; background:#0f172a; color:#fff; border:1px solid #334155; border-radius:5px; padding:6px; font:inherit; }
+      .ig-lp-ed textarea { min-height:44px; resize:vertical; }
+      .ig-lp-row { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+      .ig-lp-lbl { color:var(--igls-text-dim,#94a3b8); font-size:10px; }
+      .ig-lp-sw { width:20px; height:20px; border-radius:50%; border:2px solid transparent; cursor:pointer; padding:0; }
+      .ig-lp-sw.on { border-color:#fff; }
+      .ig-lp-ed input[type=color] { width:24px; height:22px; border:none; background:transparent; padding:0; cursor:pointer; }
+      .ig-lp-seg { display:flex; border:1px solid #334155; border-radius:5px; overflow:hidden; }
+      .ig-lp-seg button { background:transparent; border:none; color:var(--igls-text-dim,#94a3b8); padding:3px 10px; cursor:pointer; font-size:10px; }
+      .ig-lp-seg button.on { background:#334155; color:#fff; }
+      .ig-lp-slot { display:flex; flex-direction:column; gap:4px; background:rgba(255,255,255,0.03); border:1px solid #1e293b; border-radius:6px; padding:6px; }
+      .ig-lp-slot-head { display:flex; align-items:center; gap:6px; }
+      .ig-lp-slot-head b { color:var(--igls-accent,#c9a876); min-width:30px; }
+      .ig-lp-slot-head input { flex:1; }
+      .ig-lp-pick { display:flex; align-items:center; gap:6px; background:#0f172a; border:1px solid #334155; border-radius:5px; padding:5px 6px; cursor:pointer; min-height:16px; }
+      .ig-lp-pick span { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+      .ig-lp-pick.none span { color:#64748b; }
+      .ig-lp-x { background:transparent; border:none; color:#f43f5e; cursor:pointer; font-size:11px; padding:0 2px; }
+      .ig-lp-res { display:flex; flex-direction:column; max-height:170px; overflow:auto; border:1px solid #334155; border-radius:5px; }
+      .ig-lp-res button { display:flex; gap:6px; align-items:center; background:transparent; border:none; border-bottom:1px solid #1e293b; color:#e2e8f0; text-align:left; padding:5px 6px; cursor:pointer; font:inherit; }
+      .ig-lp-res button:hover { background:rgba(255,255,255,0.07); }
+      .ig-lp-res span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+      .ig-lp-foot { display:flex; gap:6px; justify-content:space-between; }
+      .ig-lp-btn { background:#1e293b; border:1px solid #475569; color:#fff; border-radius:5px; padding:5px 10px; cursor:pointer; font-size:11px; }
+      .ig-lp-btn.go { background:#10b981; border-color:#10b981; }
+      .ig-lp-btn.del { background:transparent; border-color:#7f1d1d; color:#f87171; }
+      .ig-lp-btn.ghost { background:transparent; border-style:dashed; color:var(--igls-text-dim,#94a3b8); }
+    `;
+    document.head.appendChild(style);
+
+    // ---------------- Card ----------------
+    const ui = document.createElement('div');
+    ui.className = 'ig-lp';
+    ui.innerHTML = `
+      <div class="ig-lp-bar">
+        <div class="ig-lp-tabs"></div>
+        <button class="ig-lp-icon ig-lp-gear" title="Edit buttons and tabs">⚙️</button>
+      </div>
+      <div class="ig-lp-tools">
+        <button data-act="add-tab" title="New tab">＋ Tab</button>
+        <button data-act="rename-tab" title="Rename this tab">✏️ Rename</button>
+        <button data-act="del-tab" title="Delete this tab">🗑 Tab</button>
+        <span style="margin-left:auto;">Columns</span>
+        <button data-act="cols-" title="Fewer columns">−</button>
+        <span class="ig-lp-cols"></span>
+        <button data-act="cols+" title="More columns">＋</button>
+      </div>
+      <div class="ig-lp-grid"></div>
+      <div class="ig-lp-toast"></div>
+    `;
+    const tabsEl = ui.querySelector('.ig-lp-tabs');
+    const gridEl = ui.querySelector('.ig-lp-grid');
+    const toastEl = ui.querySelector('.ig-lp-toast');
+    const colsEl = ui.querySelector('.ig-lp-cols');
+    const gearBtn = ui.querySelector('.ig-lp-gear');
+
+    let toastTimer = null;
+    function toast(msg, ms) {
+      toastEl.textContent = msg || '';
+      clearTimeout(toastTimer);
+      if (msg) toastTimer = setTimeout(() => { toastEl.textContent = ''; }, ms || 2200);
+    }
+
+    function textColor(tile) { return tile.text === 'dark' ? '#111111' : '#ffffff'; }
+    function slotTitle(slot) {
+      if (!slot) return '';
+      if (slot.label) return slot.label;
+      if (slot.kind === 'custom') return String(slot.text || '').slice(0, 40);
+      return slot.title || (slot.step && slot.step.title) || '';
+    }
+
+    function render() {
+      closeTree();
+      const tab = activeTab();
+      ui.classList.toggle('edit', editMode);
+      gearBtn.classList.toggle('on', editMode);
+      tabsEl.innerHTML = '';
+      state.tabs.forEach(t => {
+        const b = document.createElement('button');
+        b.className = 'ig-lp-tab' + (t.id === tab.id ? ' on' : '');
+        b.textContent = t.name;
+        b.title = editMode ? 'Double-click to rename' : t.name;
+        b.onclick = () => { if (state.activeTab === t.id) return; state.activeTab = t.id; save(); render(); };
+        b.ondblclick = () => { if (editMode) renameTab(t); };
+        tabsEl.appendChild(b);
+      });
+      colsEl.textContent = String(tab.cols);
+      gridEl.style.gridTemplateColumns = `repeat(${tab.cols}, minmax(0, 1fr))`;
+      gridEl.innerHTML = '';
+      tab.tiles.forEach(tile => gridEl.appendChild(tileEl(tile, tab)));
+      if (!tab.tiles.length && !editMode) {
+        const e = document.createElement('div');
+        e.className = 'ig-lp-empty';
+        e.style.gridColumn = '1 / -1';
+        e.textContent = 'No buttons yet — press ⚙️ to add some.';
+        gridEl.appendChild(e);
+      }
+      const add = document.createElement('button');
+      add.className = 'ig-lp-add';
+      add.textContent = '＋';
+      add.title = 'New button';
+      add.onclick = () => {
+        const tile = { id: uid('tile'), title: 'New button', color: COLORS[(tab.tiles.length + 1) % COLORS.length], text: 'light', w: 1, h: 1, main: null, alts: [] };
+        tab.tiles.push(tile); save(); render(); openEditor(tile.id);
+      };
+      gridEl.appendChild(add);
+    }
+
+    function tileEl(tile, tab) {
+      const el = document.createElement('div');
+      el.className = 'ig-lp-tile' + (tile.text === 'dark' ? ' dark' : '');
+      el.dataset.id = tile.id;
+      el.style.background = tile.color || COLORS[0];
+      el.style.color = textColor(tile);
+      el.style.gridColumn = `span ${clamp(tile.w || 1, 1, tab.cols)}`;
+      el.style.gridRow = `span ${clamp(tile.h || 1, 1, 4)}`;
+      const alts = (tile.alts || []).filter(Boolean);
+      el.innerHTML = `<button class="ig-lp-main" title="${esc(slotTitle(tile.main) || tile.title)}">${esc(tile.title || 'Untitled')}</button>` +
+        (alts.length ? `<button class="ig-lp-tog" title="${alts.length} other version(s)">▾</button>` : '') +
+        `<div class="ig-lp-size" title="Drag to resize"></div>`;
+
+      const mainBtn = el.querySelector('.ig-lp-main');
+      mainBtn.onclick = e => {
+        e.stopPropagation();
+        hidePreview();
+        if (editMode) return openEditor(tile.id);
+        sendSlot(tile.main, el);
+      };
+      mainBtn.removeAttribute('title');           // the preview replaces the plain tooltip
+      attachPreview(mainBtn, () => tile.main, () => el);
+      const tog = el.querySelector('.ig-lp-tog');
+      if (tog) tog.onclick = e => {
+        e.stopPropagation();
+        if (editMode) return openEditor(tile.id);
+        hidePreview();
+        if (treeEl && treeEl.dataset.tile === tile.id) return closeTree();
+        openTree(tile, el);
+      };
+
+      // Edit mode: drag to reorder
+      el.draggable = editMode;
+      el.ondragstart = e => {
+        if (!editMode || resizing) { e.preventDefault(); return; }
+        dragId = tile.id; el.classList.add('dragging');
+        try { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', tile.id); } catch (_) { /* noop */ }
+      };
+      el.ondragend = () => { dragId = null; el.classList.remove('dragging'); gridEl.querySelectorAll('.drop').forEach(x => x.classList.remove('drop')); };
+      el.ondragover = e => { if (!dragId || dragId === tile.id) return; e.preventDefault(); el.classList.add('drop'); };
+      el.ondragleave = () => el.classList.remove('drop');
+      el.ondrop = e => {
+        e.preventDefault(); el.classList.remove('drop');
+        if (!dragId || dragId === tile.id) return;
+        const from = tab.tiles.findIndex(t => t.id === dragId);
+        const [moved] = tab.tiles.splice(from, 1);
+        const to = tab.tiles.findIndex(t => t.id === tile.id);
+        const r = el.getBoundingClientRect();
+        const after = (e.clientX - r.left) > r.width / 2;
+        tab.tiles.splice(after ? to + 1 : to, 0, moved);
+        dragId = null; save(); render();
+      };
+
+      // Edit mode: drag the corner to resize (snaps to the grid)
+      el.querySelector('.ig-lp-size').onmousedown = e => {
+        if (!editMode) return;
+        e.preventDefault(); e.stopPropagation();
+        resizing = true;
+        const gap = 6;
+        const cellW = (gridEl.clientWidth - gap * (tab.cols - 1)) / tab.cols + gap;
+        const cellH = 44 + gap;
+        const startX = e.clientX, startY = e.clientY, w0 = tile.w || 1, h0 = tile.h || 1;
+        const move = ev => {
+          const w = clamp(w0 + Math.round((ev.clientX - startX) / cellW), 1, tab.cols);
+          const h = clamp(h0 + Math.round((ev.clientY - startY) / cellH), 1, 4);
+          if (w !== tile.w || h !== tile.h) {
+            tile.w = w; tile.h = h;
+            el.style.gridColumn = `span ${w}`; el.style.gridRow = `span ${h}`;
+          }
+        };
+        const up = () => {
+          document.removeEventListener('mousemove', move);
+          document.removeEventListener('mouseup', up);
+          resizing = false; save();
+        };
+        document.addEventListener('mousemove', move);
+        document.addEventListener('mouseup', up);
+      };
+      return el;
+    }
+    let dragId = null, resizing = false;
+
+    // ---------------- Tree (versions A, B, C…) ----------------
+    let treeEl = null;
+    function closeTree() {
+      hidePreview();
+      if (!treeEl) return;
+      treeEl.remove(); treeEl = null;
+      document.removeEventListener('mousedown', onOutside, true);
+      document.removeEventListener('keydown', onTreeKey, true);
+    }
+    function onOutside(e) { if (treeEl && !treeEl.contains(e.target) && !e.target.closest('.ig-lp-tog')) closeTree(); }
+    function onTreeKey(e) { if (e.key === 'Escape') { e.stopPropagation(); closeTree(); } }
+    function openTree(tile, anchor) {
+      closeTree();
+      treeEl = document.createElement('div');
+      treeEl.className = 'ig-lp-tree';
+      treeEl.dataset.tile = tile.id;
+      const rows = [{ letter: 'A', main: true, slot: tile.main }].concat((tile.alts || []).filter(Boolean).map((s, i) => ({ letter: LETTERS[i + 1] || '·', slot: s })));
+      rows.forEach(r => {
+        const b = document.createElement('button');
+        const kind = r.slot ? r.slot.kind : null;
+        b.innerHTML = `<b>${esc(r.letter)}</b><span>${kind ? ICON[kind] + ' ' : ''}${esc(slotTitle(r.slot) || (r.main ? 'Main (empty)' : '(empty)'))}</span>`;
+        b.title = r.main ? 'A — main message' : 'Version ' + r.letter;
+        b.removeAttribute('title');
+        b.onclick = () => { hidePreview(); closeTree(); sendSlot(r.slot, anchor); };
+        attachPreview(b, () => r.slot, () => treeEl || anchor);
+        treeEl.appendChild(b);
+      });
+      document.body.appendChild(treeEl);
+      const a = anchor.getBoundingClientRect();
+      const t = treeEl.getBoundingClientRect();
+      let left = a.right - t.width, top = a.bottom + 4;
+      if (left < 6) left = 6;
+      if (left + t.width > window.innerWidth - 6) left = window.innerWidth - t.width - 6;
+      if (top + t.height > window.innerHeight - 6) top = Math.max(6, a.top - t.height - 4);
+      treeEl.style.left = left + 'px'; treeEl.style.top = top + 'px';
+      document.addEventListener('mousedown', onOutside, true);
+      document.addEventListener('keydown', onTreeKey, true);
+    }
+
+    // ---------------- Hover preview (like the Commands search) ----------------
+    let previewEl = null, hoverTimer = null, hoverToken = 0;
+    function attachPreview(target, getSlot, getAnchor) {
+      target.addEventListener('mouseenter', () => {
+        if (editMode) return;
+        clearTimeout(hoverTimer);
+        hoverTimer = setTimeout(() => showPreview(getSlot(), getAnchor()), 250);
+      });
+      target.addEventListener('mouseleave', hidePreview);
+    }
+    function hidePreview() {
+      clearTimeout(hoverTimer);
+      hoverToken++;
+      if (previewEl) previewEl.style.display = 'none';
+    }
+    const pvTitle = (icon, text) => `<div class="ig-lp-pv-title">${icon} ${esc(text || 'Untitled')}</div>`;
+    const pvBody = text => `<div class="ig-lp-pv-body">${esc(text)}</div>`;
+    const pvEmpty = text => `<div class="ig-lp-pv-empty">${esc(text)}</div>`;
+    async function previewHtml(slot) {
+      if (!slot) return pvEmpty('No message yet — ⚙️ to set it.');
+      if (slot.kind === 'custom') {
+        const t = String(slot.text || '');
+        return pvTitle(ICON.custom, slot.label || 'Typed text') + (t.trim() ? pvBody(t) : pvEmpty('No text yet.'));
+      }
+      if (slot.kind === 'sequence') {
+        const seq = findSequence(slot);
+        if (!seq) return pvTitle('⚠️', slot.title) + pvEmpty('Sequence not found anymore.');
+        const steps = Array.isArray(seq.steps) ? seq.steps : [];
+        const list = steps.map((st, i) => `${i + 1}. ${ICON[st.kind] || '•'} ${st.title || '(untitled)'}`).join('\n');
+        return pvTitle(ICON.sequence, seq.name) + (steps.length ? pvBody(list) : pvEmpty('Empty sequence.'));
+      }
+      const inv = await core.getSearchableInventory();
+      const item = slot.step ? core.findStepItem(slot.step, inv) : null;
+      if (!item) return pvTitle('⚠️', slotTitle(slot)) + pvEmpty('Not found anymore.');
+      if (slot.kind === 'text') {
+        return pvTitle(ICON.text, item.title) + (String(item.text || '').trim() ? pvBody(item.text) : pvEmpty('No text saved.'));
+      }
+      if (slot.kind === 'audio') {
+        const tx = String(item.transcript || '').trim();
+        return pvTitle(ICON.audio, item.name) + (tx ? pvBody(tx) : pvEmpty('No transcript yet.')) +
+          `<div class="ig-lp-pv-empty" style="font-style:normal;">📁 ${esc(item.folder || 'General')}</div>`;
+      }
+      if (slot.kind === 'set') {
+        const count = (item.images || []).length;
+        let thumbs = '';
+        try {
+          const full = core.getImageSetFull ? await core.getImageSetFull(item.id) : null;   // one set, only on hover
+          const imgs = ((full && full.images) || []).filter(i => i && i.thumb).slice(0, 9);
+          if (imgs.length) thumbs = `<div class="ig-lp-pv-imgs">${imgs.map(i => `<img src="${esc(i.thumb)}" alt="">`).join('')}</div>`;
+        } catch (e) { /* noop */ }
+        return pvTitle(ICON.set, item.title) + pvEmpty(`${count} image(s) — sent together as one album.`) + thumbs;
+      }
+      return pvEmpty('Nothing to preview.');
+    }
+    async function showPreview(slot, anchor) {
+      const my = ++hoverToken;
+      let html;
+      try { html = await previewHtml(slot); } catch (e) { html = pvEmpty('Preview not available.'); }
+      if (my !== hoverToken || !anchor || !anchor.isConnected) return;
+      if (!previewEl) {
+        previewEl = document.createElement('div');
+        previewEl.className = 'ig-lp-preview';
+        document.body.appendChild(previewEl);
+      }
+      previewEl.innerHTML = html;
+      previewEl.style.display = 'flex';
+      const a = anchor.getBoundingClientRect();
+      const p = previewEl.getBoundingClientRect();
+      const gap = 8;
+      let left = a.right + gap;                                   // to the right of the button…
+      if (left + p.width > window.innerWidth - 6) left = a.left - p.width - gap;  // …or to the left
+      if (left < 6) left = 6;
+      let top = a.top;
+      if (top + p.height > window.innerHeight - 6) top = Math.max(6, window.innerHeight - p.height - 6);
+      previewEl.style.left = left + 'px';
+      previewEl.style.top = top + 'px';
+    }
+
+    // ---------------- Sending (through the Core) ----------------
+    function flashTile(el, ok) {
+      if (!el) return;
+      el.classList.remove('ok', 'bad');
+      el.classList.add(ok ? 'ok' : 'bad');
+      setTimeout(() => el.classList.remove('ok', 'bad'), 600);
+    }
+    function focusComposer(zone) {
+      if (!zone) return;
+      zone.focus();
+      if (zone.isContentEditable) {
+        try {
+          const range = document.createRange();
+          range.selectNodeContents(zone); range.collapse(false);
+          const sel = window.getSelection(); sel.removeAllRanges(); sel.addRange(range);
+        } catch (_) { /* noop */ }
+      }
+    }
+    function findSequence(slot) {
+      const list = core.getSequences ? core.getSequences() : [];
+      const byId = list.find(s => s.id && s.id === slot.ref);
+      if (byId) return byId;
+      const same = list.filter(s => norm(s.name) === norm(slot.title));
+      return same.length === 1 ? same[0] : null;
+    }
+    let sending = false;
+    async function sendSlot(slot, el) {
+      if (sending) return;
+      if (!slot) { flashTile(el, false); return toast('This button has no message yet — ⚙️ to set it.'); }
+      if (slot.kind === 'sequence') {
+        const seq = findSequence(slot);
+        if (!seq) { flashTile(el, false); return toast('⚠️ Sequence not found: ' + (slot.title || '')); }
+        const ok = core.setActiveSequence(seq);
+        flashTile(el, ok);
+        if (!ok) toast('⚠️ That sequence is empty');
+        return;
+      }
+      const zone = core.getActiveChatZone();
+      if (!zone) { flashTile(el, false); return toast('⚠️ Open an Instagram chat first'); }
+      sending = true;
+      try {
+        let ok = false, kind = slot.kind;
+        if (kind === 'custom') {
+          ok = core.injectTextToChat(slot.text || '', { silent: true });
+        } else {
+          const payload = slot.step ? await core.fetchStepData(slot.step) : null;
+          if (!payload) { flashTile(el, false); return toast('⚠️ Not found anymore: ' + slotTitle(slot)); }
+          kind = payload.kind;
+          if (kind === 'audio') ok = core.injectClipToChat(payload.blob, payload.name, { silent: true });
+          else if (kind === 'set') ok = core.injectImageSetToChat(payload.images, { silent: true });
+          else if (kind === 'text') ok = core.injectTextToChat(payload.text, { silent: true });
+          if (ok && core.markUsed) core.markUsed(kind, payload.id);
+        }
+        flashTile(el, ok);
+        if (!ok) toast('⚠️ Chat box not found');
+        else if (kind !== 'text' && kind !== 'custom') setTimeout(() => focusComposer(core.getActiveChatZone()), 60);
+      } catch (e) {
+        console.error('[Launchpad] send error:', e);
+        flashTile(el, false); toast('⚠️ Could not send');
+      } finally {
+        sending = false;
+      }
+    }
+
+    // ---------------- Tabs ----------------
+    function renameTab(t) {
+      const name = prompt('Tab name:', t.name);
+      if (name === null || !name.trim()) return;
+      t.name = name.trim(); save(); render();
+    }
+    ui.querySelector('.ig-lp-tools').onclick = e => {
+      const b = e.target.closest('button[data-act]');
+      if (!b) return;
+      const tab = activeTab();
+      const act = b.dataset.act;
+      if (act === 'add-tab') {
+        const name = prompt('New tab name (e.g. a course):', 'New tab');
+        if (name === null || !name.trim()) return;
+        const t = { id: uid('tab'), name: name.trim(), cols: tab.cols || 3, tiles: [] };
+        state.tabs.push(t); state.activeTab = t.id; save(); render();
+      } else if (act === 'rename-tab') {
+        renameTab(tab);
+      } else if (act === 'del-tab') {
+        if (state.tabs.length === 1) return toast('You need at least one tab.');
+        if (!confirm(`Delete the tab "${tab.name}" and its ${tab.tiles.length} button(s)?`)) return;
+        const i = state.tabs.indexOf(tab);
+        state.tabs.splice(i, 1);
+        state.activeTab = state.tabs[Math.max(0, i - 1)].id;
+        save(); render();
+      } else if (act === 'cols-' || act === 'cols+') {
+        tab.cols = clamp(tab.cols + (act === 'cols+' ? 1 : -1), 2, 6);
+        save(); render();
+      }
+    };
+    gearBtn.onclick = () => { editMode = !editMode; hidePreview(); render(); };
+
+    // ---------------- Button editor ----------------
+    function openEditor(tileId) {
+      const found = findTile(tileId);
+      if (!found) return;
+      closeTree();
+      const orig = found.tile;
+      const draft = JSON.parse(JSON.stringify(orig));
+      draft.alts = (draft.alts || []).filter(Boolean);
+      let draftTabId = found.tab.id;
+
+      const overlay = document.createElement('div');
+      overlay.className = 'ig-lp-overlay';
+      const box = document.createElement('div');
+      box.className = 'ig-lp-ed';
+      overlay.appendChild(box);
+      document.body.appendChild(overlay);
+      const close = () => { overlay.remove(); document.removeEventListener('keydown', onKey, true); };
+      const onKey = e => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
+      document.addEventListener('keydown', onKey, true);
+      overlay.onmousedown = e => { if (e.target === overlay) close(); };
+
+      function paint() {
+        box.innerHTML = `
+          <input type="text" class="ig-lp-title" placeholder="Button title" value="${esc(draft.title || '')}">
+          <div class="ig-lp-row ig-lp-colors"><span class="ig-lp-lbl">Color</span></div>
+          <div class="ig-lp-row"><span class="ig-lp-lbl">Text</span>
+            <div class="ig-lp-seg"><button data-t="light" class="${draft.text !== 'dark' ? 'on' : ''}">White</button><button data-t="dark" class="${draft.text === 'dark' ? 'on' : ''}">Black</button></div>
+            ${state.tabs.length > 1 ? `<span class="ig-lp-lbl" style="margin-left:auto;">Tab</span><select class="ig-lp-tabsel" style="background:#0f172a;color:#fff;border:1px solid #334155;border-radius:4px;font-size:10px;padding:2px;">${state.tabs.map(t => `<option value="${esc(t.id)}" ${t.id === draftTabId ? 'selected' : ''}>${esc(t.name)}</option>`).join('')}</select>` : ''}
+          </div>
+          <div class="ig-lp-slots"></div>
+          <button class="ig-lp-btn ghost ig-lp-addalt">＋ Add version ${LETTERS[draft.alts.length + 1] || ''}</button>
+          <div class="ig-lp-foot">
+            <button class="ig-lp-btn del ig-lp-del">🗑 Delete</button>
+            <div style="display:flex;gap:6px;"><button class="ig-lp-btn ig-lp-cancel">Cancel</button><button class="ig-lp-btn go ig-lp-save">Save</button></div>
+          </div>`;
+        const titleIn = box.querySelector('.ig-lp-title');
+        titleIn.oninput = () => { draft.title = titleIn.value; };
+
+        const colorsRow = box.querySelector('.ig-lp-colors');
+        COLORS.forEach(c => {
+          const sw = document.createElement('button');
+          sw.className = 'ig-lp-sw' + (norm(draft.color) === norm(c) ? ' on' : '');
+          sw.style.background = c; sw.title = c;
+          sw.onclick = () => { draft.color = c; paint(); };
+          colorsRow.appendChild(sw);
+        });
+        const custom = document.createElement('input');
+        custom.type = 'color'; custom.title = 'Any color';
+        custom.value = /^#[0-9a-f]{6}$/i.test(draft.color || '') ? draft.color : '#334155';
+        custom.onchange = () => { draft.color = custom.value; paint(); };
+        colorsRow.appendChild(custom);
+
+        box.querySelectorAll('.ig-lp-seg button').forEach(b => { b.onclick = () => { draft.text = b.dataset.t; paint(); }; });
+        const tabSel = box.querySelector('.ig-lp-tabsel');
+        if (tabSel) tabSel.onchange = () => { draftTabId = tabSel.value; };
+
+        const slotsEl = box.querySelector('.ig-lp-slots');
+        slotsEl.style.cssText = 'display:flex;flex-direction:column;gap:6px;';
+        slotsEl.appendChild(slotEditor('A', draft.main, s => { draft.main = s; }, null, true));
+        draft.alts.forEach((s, i) => {
+          slotsEl.appendChild(slotEditor(LETTERS[i + 1] || '·', s, ns => { draft.alts[i] = ns; }, () => { draft.alts.splice(i, 1); paint(); }));
+        });
+
+        box.querySelector('.ig-lp-addalt').onclick = () => { draft.alts.push({ kind: 'custom', text: '' }); paint(); };
+        box.querySelector('.ig-lp-cancel').onclick = close;
+        box.querySelector('.ig-lp-del').onclick = () => {
+          if (!confirm(`Delete the button "${orig.title}"?`)) return;
+          const f = findTile(orig.id);
+          if (f) f.tab.tiles.splice(f.tab.tiles.indexOf(f.tile), 1);
+          save(); close(); render();
+        };
+        box.querySelector('.ig-lp-save').onclick = () => {
+          const f = findTile(orig.id);
+          if (!f) return close();
+          const cleanSlot = s => (!s ? null : (s.kind === 'custom' && !String(s.text || '').trim()) ? null : s);
+          const updated = Object.assign(f.tile, draft, {
+            title: String(draft.title || '').trim() || 'Untitled',
+            main: cleanSlot(draft.main),
+            alts: draft.alts.map(cleanSlot).filter(Boolean)
+          });
+          if (draftTabId !== f.tab.id) {
+            const dest = state.tabs.find(t => t.id === draftTabId);
+            if (dest) { f.tab.tiles.splice(f.tab.tiles.indexOf(updated), 1); dest.tiles.push(updated); }
+          }
+          save(); close(); render();
+        };
+        titleIn.focus();
+      }
+
+      // One message slot: label + what it sends (pick from the library, or type text)
+      function slotEditor(letter, slot, setSlot, onRemove, isMain) {
+        const wrap = document.createElement('div');
+        wrap.className = 'ig-lp-slot';
+        wrap.innerHTML = `
+          <div class="ig-lp-slot-head"><b>${esc(letter)}</b>${isMain ? '<span class="ig-lp-lbl">main · sent by clicking the button</span>' : ''}
+            ${isMain ? '' : `<input type="text" class="ig-lp-slot-label" placeholder="Short name (optional)" value="${esc((slot && slot.label) || '')}">`}
+            ${onRemove ? '<button class="ig-lp-x" title="Remove this version">✕</button>' : ''}
+          </div>
+          <div class="ig-lp-pick ${slot && slot.kind !== 'custom' ? '' : 'none'}" title="Pick from your library"><span></span>🔍</div>
+          <textarea class="ig-lp-custom" placeholder="…or type the text to send"></textarea>
+          <div class="ig-lp-results" style="display:none;"></div>`;
+        const pick = wrap.querySelector('.ig-lp-pick');
+        const pickTxt = pick.querySelector('span');
+        const custom = wrap.querySelector('.ig-lp-custom');
+        const results = wrap.querySelector('.ig-lp-results');
+        const labelIn = wrap.querySelector('.ig-lp-slot-label');
+        let current = slot ? Object.assign({}, slot) : null;
+        const commit = () => setSlot(current);
+
+        function show() {
+          if (current && current.kind !== 'custom') {
+            pick.classList.remove('none');
+            pickTxt.textContent = `${ICON[current.kind] || ''} ${current.title || (current.step && current.step.title) || ''}`;
+            custom.style.display = 'none';
+          } else {
+            pick.classList.add('none');
+            pickTxt.textContent = 'Pick text, audio, image set or sequence…';
+            custom.style.display = '';
+            custom.value = (current && current.text) || '';
+          }
+        }
+        show();
+
+        if (labelIn) labelIn.oninput = () => {
+          current = current || { kind: 'custom', text: '' };
+          current.label = labelIn.value.trim() || undefined;
+          commit();
+        };
+        custom.oninput = () => {
+          const label = current && current.label;
+          current = { kind: 'custom', text: custom.value };
+          if (label) current.label = label;
+          commit();
+        };
+        const rm = wrap.querySelector('.ig-lp-x');
+        if (rm) rm.onclick = onRemove;
+
+        pick.onclick = () => {
+          if (results.style.display !== 'none') { results.style.display = 'none'; return; }
+          results.style.display = 'flex';
+          results.style.cssText = 'display:flex;flex-direction:column;gap:4px;';
+          results.innerHTML = `<input type="text" placeholder="Search… (audio / text / set / seq + name)"><div class="ig-lp-res"></div>
+            ${current && current.kind !== 'custom' ? '<button class="ig-lp-btn ghost ig-lp-clear" style="font-size:10px;">✍️ Type text instead</button>' : ''}`;
+          const q = results.querySelector('input');
+          const list = results.querySelector('.ig-lp-res');
+          const clearBtn = results.querySelector('.ig-lp-clear');
+          if (clearBtn) clearBtn.onclick = () => {
+            const label = current && current.label;
+            current = { kind: 'custom', text: '' };
+            if (label) current.label = label;
+            commit(); results.style.display = 'none'; show();
+          };
+          let token = 0;
+          const run = async () => {
+            const my = ++token;
+            const parsed = core.parseSearchPrefix(q.value);
+            let found = [];
+            try { found = await core.searchInventory(parsed.q, parsed.mode, { kinds: KINDS, limit: 12 }); } catch (e) { found = []; }
+            if (my !== token) return;
+            list.innerHTML = '';
+            if (!found.length) { list.innerHTML = '<div style="padding:6px;color:#64748b;">Nothing found.</div>'; return; }
+            found.forEach(m => {
+              const b = document.createElement('button');
+              const name = m.kind === 'audio' ? m.item.name : m.kind === 'sequence' ? m.item.name : m.item.title;
+              const extra = m.kind === 'audio' ? (m.item.folder || '') : m.kind === 'set' ? `${(m.item.images || []).length} img` : m.kind === 'sequence' ? `${(m.item.steps || []).length} steps` : '';
+              b.innerHTML = `<span>${ICON[m.kind]}</span><span style="flex:1;">${esc(name || '(untitled)')}</span><span style="opacity:.5;font-size:9px;">${esc(extra)}</span>`;
+              b.onclick = () => {
+                const label = current && current.label;
+                if (m.kind === 'sequence') current = { kind: 'sequence', ref: m.item.id, title: m.item.name || 'Sequence' };
+                else {
+                  const step = core.makeStep(m.kind, m.item);
+                  if (!step) return;
+                  current = { kind: m.kind, step, title: step.title };
+                }
+                if (label) current.label = label;
+                commit(); results.style.display = 'none'; show();
+              };
+              list.appendChild(b);
+            });
+          };
+          q.oninput = run;
+          q.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); const first = list.querySelector('button'); if (first) first.click(); } };
+          run(); q.focus();
+        };
+        return wrap;
+      }
+      paint();
+    }
+
+    // ---------------- Keep in step ----------------
+    window.addEventListener('storage', e => {
+      if (e.key !== KEY) return;
+      state = load();
+      if (!document.querySelector('.ig-lp-overlay')) render();
+    });
+
+    render();
+    function mountCard(attemptsLeft) {
+      attemptsLeft = attemptsLeft === undefined ? 20 : attemptsLeft;
+      if (typeof core.registerMenu === 'function') core.registerMenu('left', '🚀 Launchpad', ui, '⠿', 'launchpad');
+      else if (attemptsLeft > 0) setTimeout(() => mountCard(attemptsLeft - 1), 200);
+    }
+    mountCard();
+
+    core.emit('block:ready', { id: 'launchpad' });
   }
 });
 
