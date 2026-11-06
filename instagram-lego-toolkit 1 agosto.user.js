@@ -2,7 +2,7 @@
 // @name         Instagram Lego Toolkit
 // @namespace    https://node-builder.local/
 // @version      1.0.0
-// @description  Compiled by Node Builder -- 29 block(s): Quick Message Recorder, Sidebar Plugin Manager, Recorder Studio, Audio Library, Dual Sidebar UI Shell, menuCollapseModule, Menu Panel Switcher Module, Menu Card Pop-out Module, Header Toolbar Organizer Module, Workspace Profile & Visibility Manager, Instagram Resizer Feature, Sidebar-to-Resizer Sync, Quick Chat Box, Text Library Module (Saved Snippets), Highlighter, Commands, Reorder Module, Text Library Height Fix (v1), Reset menus, Image Library, Emoji Module, Mobile Core, Mobile Bottom Sheet UI, Master Config Bunny Sync, native emoji picker, Sequence Manager, Tag Colors, Audio Engine, Launchpad
+// @description  Compiled by Node Builder -- 30 block(s): Quick Message Recorder, Sidebar Plugin Manager, Recorder Studio, Audio Library, Dual Sidebar UI Shell, menuCollapseModule, Menu Panel Switcher Module, Menu Card Pop-out Module, Header Toolbar Organizer Module, Workspace Profile & Visibility Manager, Instagram Resizer Feature, Sidebar-to-Resizer Sync, Quick Chat Box, Text Library Module (Saved Snippets), image manager, Highlighter, Commands, Reorder Module, Text Library Height Fix (v1), Reset menus, Image Library, Emoji Module, Mobile Core, Mobile Bottom Sheet UI, Master Config Bunny Sync, native emoji picker, Sequence Manager, Tag Colors, Audio Engine, Launchpad
 // @author       You
 // @match        https://www.instagram.com/*
 // @grant        GM_xmlhttpRequest
@@ -3610,111 +3610,234 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Menu Card Pop-out Module (v6)
+   BLOCK: Menu Card Pop-out Module (v2)
    ============================================================ */
 /* ============================================================
-   BLOCK: Menu Card Pop-out Module (v6 - Draggable Icons & Emojis)
+   BLOCK: Menu Card Pop-out Module (v7 - 🪟 One look for every floating window)
+   ------------------------------------------------------------
+   v7:
+   - ONE header style for EVERY floating window:
+       Classic = the original bar (the old look)
+       Slim    = a thin bar — its height is set with a slider
+       Ghost   = no bar at all. The controls float just above the
+                 window's top-right corner when you hover it.
+                 Drag the window by ⠿.
+     Set it in ⚙️ Profiles → "Floating windows". Saved in
+     'ig_float_chrome_v1' (synced by Sync Center v5.3).
+   - ⇄ works in floating windows: it switches which side panel
+     📥 docks the window back into.
+   - Smaller minimum size (120 × 50) and tighter padding in Slim/Ghost.
+   - Minimized windows become a small labeled pill (🚀 Launchpad).
+   - Positions are saved as a share of the screen and always kept
+     on-screen, so they land in the same place on every computer.
+   - New for other blocks: core.floatWindows.open({...}) opens extra
+     floating windows with the same look (used by the Launchpad).
+   Same window class + ids as v6, so the Highlighter, the Text Library
+   Height Fix and ⛑️ Reset Menus keep working.
+   Light: the hover effects and the style switch are plain CSS.
+   No timers, no new page watchers.
    ============================================================ */
 LegoCore.registerBlock({
   id: 'menuInPagePopoutModule',
   init(core) {
     const STORAGE_KEY = 'ig_menu_inpage_popouts_v1';
+    const CHROME_KEY = 'ig_float_chrome_v1';
+    const STYLES = ['classic', 'slim', 'ghost'];
+    const BAR_MIN = 14, BAR_MAX = 40, BAR_DEFAULT = 24;
+    const MIN_WIDTH = 120, MIN_HEIGHT = 50;
+    const PILL_ROOM = 30; // space a Ghost window needs above it for its controls
+
+    const clampNum = (n, a, b) => Math.max(a, Math.min(b, n));
+
+    // ---------------- Saved positions ----------------
     let popoutStates = {};
-
-    try {
-      popoutStates = JSON.parse(localStorage.getItem(STORAGE_KEY)) || {};
-    } catch (e) {
-      popoutStates = {};
-    }
-
+    try { popoutStates = JSON.parse(localStorage.getItem(STORAGE_KEY)) || {}; } catch (e) { popoutStates = {}; }
     function saveStates() {
-      try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(popoutStates));
-      } catch (e) {}
+      try { localStorage.setItem(STORAGE_KEY, JSON.stringify(popoutStates)); } catch (e) { /* quota */ }
+    }
+    function patchState(key, patch) {
+      popoutStates[key] = Object.assign({}, popoutStates[key], patch);
+      saveStates();
     }
 
-    // Helper to extract an emoji or the first letter from a title
+    // ---------------- Header style (one setting for all windows) ----------------
+    function readChrome() {
+      try {
+        const c = JSON.parse(localStorage.getItem(CHROME_KEY)) || {};
+        return {
+          style: STYLES.includes(c.style) ? c.style : 'classic',
+          barH: clampNum(Math.round(Number(c.barH) || BAR_DEFAULT), BAR_MIN, BAR_MAX)
+        };
+      } catch (e) { return { style: 'classic', barH: BAR_DEFAULT }; }
+    }
+    let chrome = readChrome();
+
+    function applyChrome() {
+      const root = document.documentElement;
+      const h = chrome.barH;
+      root.setAttribute('data-ig-float-chrome', chrome.style);
+      root.style.setProperty('--ig-float-bar-h', h + 'px');
+      root.style.setProperty('--ig-float-title-fs', clampNum(h * 0.45, 9, 11.5).toFixed(1) + 'px');
+      root.style.setProperty('--ig-float-title-op', h >= 22 ? '1' : '0');
+      root.style.setProperty('--ig-float-btn-fs', clampNum(h * 0.42, 8, 12).toFixed(1) + 'px');
+      document.querySelectorAll('.ig-floating-modal').forEach(clampModal);
+    }
+
+    function setChrome(patch, persist) {
+      const next = Object.assign({}, chrome, patch || {});
+      next.style = STYLES.includes(next.style) ? next.style : 'classic';
+      next.barH = clampNum(Math.round(Number(next.barH) || BAR_DEFAULT), BAR_MIN, BAR_MAX);
+      chrome = next;
+      applyChrome();
+      if (persist !== false) {
+        try { localStorage.setItem(CHROME_KEY, JSON.stringify(chrome)); } catch (e) { /* quota */ }
+        core.emit('float:chrome', Object.assign({}, chrome));
+      }
+      return Object.assign({}, chrome);
+    }
+
+    // ---------------- Helpers ----------------
     function extractIcon(text) {
       if (!text) return '⠿';
-      const emojiMatch = text.match(/[\p{Emoji_Presentation}\p{Extended_Pictographic}]/u);
+      const emojiMatch = String(text).match(/[\p{Emoji_Presentation}\p{Extended_Pictographic}]/u);
       if (emojiMatch) return emojiMatch[0];
-      const charMatch = text.match(/[A-Za-z0-9]/);
+      const charMatch = String(text).match(/[A-Za-z0-9]/);
       if (charMatch) return charMatch[0].toUpperCase();
       return '⠿';
     }
+    function labelFrom(text) {
+      return String(text || '')
+        .replace(/[\p{Emoji_Presentation}\p{Extended_Pictographic}\uFE0F\u200D]/gu, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    }
+    const safeId = k => String(k).replace(/[^a-zA-Z0-9_-]/g, '_');
 
-    // Inject CSS for popout button, floating window chrome, and iconified state
+    // ---------------- Styles ----------------
     const style = document.createElement('style');
     style.id = 'ig-inpage-popout-styles';
-    style.innerHTML = `
+    style.textContent = `
       .ig-popout-btn {
-        background: transparent;
-        border: none;
-        color: var(--igls-text-dim, #96949c);
-        cursor: pointer;
-        font-size: 11px;
-        font-weight: bold;
-        line-height: 1;
-        padding: 2px 4px;
-        margin-left: 4px;
-        border-radius: 3px;
-        transition: color 0.2s, background 0.2s;
+        background: transparent; border: none; color: var(--igls-text-dim, #96949c);
+        cursor: pointer; font-size: 11px; font-weight: bold; line-height: 1;
+        padding: 2px 4px; margin-left: 4px; border-radius: 3px; transition: color 0.2s, background 0.2s;
       }
-      .ig-popout-btn:hover {
-        color: var(--igls-accent, #c9a876);
-        background: rgba(255, 255, 255, 0.08);
-      }
+      .ig-popout-btn:hover { color: var(--igls-accent, #c9a876); background: rgba(255, 255, 255, 0.08); }
 
-      .ig-draggable-menu.is-popped-out {
-        display: none !important;
-      }
+      .ig-draggable-menu.is-popped-out { display: none !important; }
 
+      /* ===== Window (Classic = the original look) ===== */
       .ig-floating-modal {
-        position: fixed;
-        z-index: 2147483647;
+        position: fixed; z-index: 2147483647;
         background: var(--igls-surface, #17171d);
-        border: 1px solid var(--igls-border-strong, rgba(255,255,255,0.2));
+        border: 1px solid var(--igls-border-strong, rgba(255,255,255,0.14));
         border-radius: 12px;
         box-shadow: 0 16px 40px rgba(0,0,0,0.6);
-        display: flex;
-        flex-direction: column;
-        min-width: 220px;
-        max-width: 95vw;
-        min-height: 150px;
-        max-height: 95vh;
+        display: flex; flex-direction: column;
+        min-width: ${MIN_WIDTH}px; max-width: 95vw;
+        min-height: ${MIN_HEIGHT}px; max-height: 95vh;
         overflow: hidden;
-        transition: border-radius 0.2s;
+        color: var(--igls-text, #ece9e4);
+        transition: border-color 0.2s, border-radius 0.2s;
       }
-
-      .ig-floating-modal .ig-menu-header {
+      .ig-floating-modal > .ig-menu-header {
         background: var(--igls-bg, #131318);
         border-bottom: 1px solid var(--igls-border, rgba(255,255,255,0.07));
-        padding: 10px 12px;
-        cursor: grab;
-        flex-shrink: 0;
+        padding: 10px 12px; gap: 8px;
+        display: flex; align-items: center; justify-content: space-between;
+        cursor: grab; user-select: none; flex-shrink: 0;
+        font-size: 11.5px; font-weight: 600; color: var(--igls-text, #ece9e4);
       }
-      .ig-floating-modal .ig-menu-header:active {
-        cursor: grabbing;
-      }
-
-      .ig-floating-modal .ig-menu-content {
-        padding: 12px;
-        overflow: auto;
-        flex: 1;
-        min-height: 0;
-        min-width: 0;
-        resize: none;
+      .ig-floating-modal > .ig-menu-header:active { cursor: grabbing; }
+      .ig-float-title { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; transition: opacity 0.15s; }
+      .ig-floating-modal > .ig-menu-content {
+        padding: 12px; overflow: auto; flex: 1; min-height: 0; min-width: 0; resize: none;
       }
 
-      /* Resizers */
+      /* ===== Controls ===== */
+      .ig-float-tools {
+        display: flex; align-items: center; gap: 2px; margin-left: auto; flex-shrink: 0;
+        background: rgba(255, 255, 255, 0.05);
+        border: 1px solid var(--igls-border, rgba(255, 255, 255, 0.08));
+        border-radius: 6px; padding: 2px;
+      }
+      .ig-float-tools button {
+        background: transparent !important; border: none !important;
+        color: var(--igls-text-dim, #96949c) !important; cursor: pointer !important;
+        font-size: 11px !important; line-height: 1 !important;
+        padding: 4px 6px !important; margin: 0 !important; border-radius: 4px !important;
+        display: inline-flex !important; align-items: center !important; justify-content: center !important;
+        width: auto !important; box-shadow: none !important;
+        transition: color 0.15s, background 0.15s !important;
+      }
+      .ig-float-tools button:hover, .ig-float-tools button.on {
+        color: var(--igls-accent, #c9a876) !important; background: rgba(255, 255, 255, 0.1) !important;
+      }
+      .ig-float-tools .ig-float-close:hover { color: #f87171 !important; }
+      .ig-float-grip {
+        display: none; align-items: center; justify-content: center;
+        color: var(--igls-text-dim, #96949c); font-size: 11px; line-height: 1;
+        padding: 4px 5px; border-radius: 4px; cursor: grab;
+      }
+      .ig-float-grip:hover { color: var(--igls-accent, #c9a876); background: rgba(255, 255, 255, 0.08); }
+      .ig-float-grip:active { cursor: grabbing; }
+
+      /* ===== Slim: a thin bar, height from the slider ===== */
+      html[data-ig-float-chrome="slim"] .ig-floating-modal > .ig-menu-header {
+        height: var(--ig-float-bar-h, 24px); padding: 0 3px 0 10px; gap: 6px; box-sizing: border-box;
+      }
+      html[data-ig-float-chrome="slim"] .ig-floating-modal .ig-float-title {
+        font-size: var(--ig-float-title-fs, 11px); opacity: var(--ig-float-title-op, 1);
+      }
+      html[data-ig-float-chrome="slim"] .ig-floating-modal .ig-float-tools {
+        background: transparent; border-color: transparent; padding: 0; height: 100%;
+      }
+      html[data-ig-float-chrome="slim"] .ig-floating-modal .ig-float-tools button {
+        font-size: var(--ig-float-btn-fs, 11px) !important;
+        padding: 0 5px !important;
+        height: calc(var(--ig-float-bar-h, 24px) - 4px) !important;
+      }
+      html[data-ig-float-chrome="slim"] .ig-floating-modal > .ig-menu-content { padding: 8px; }
+
+      /* ===== Ghost: no bar; controls float above the top-right corner on hover ===== */
+      html[data-ig-float-chrome="ghost"] .ig-floating-modal { overflow: visible; }
+      html[data-ig-float-chrome="ghost"] .ig-floating-modal:hover { border-color: rgba(201, 168, 118, 0.35); }
+      html[data-ig-float-chrome="ghost"] .ig-floating-modal > .ig-menu-content { padding: 8px; border-radius: 11px; }
+      html[data-ig-float-chrome="ghost"] .ig-floating-modal > .ig-menu-header {
+        position: absolute; right: 12px; bottom: 100%; top: auto; left: auto; z-index: 4;
+        padding: 0; margin: 0; gap: 0; background: transparent; border: none;
+        opacity: 0; visibility: hidden; transform: translateY(3px);
+        transition: opacity 0.16s ease, transform 0.16s ease, visibility 0s linear 0.16s;
+      }
+      html[data-ig-float-chrome="ghost"] .ig-floating-modal:hover > .ig-menu-header {
+        opacity: 1; visibility: visible; transform: none; transition-delay: 0s;
+      }
+      html[data-ig-float-chrome="ghost"] .ig-floating-modal .ig-float-title { display: none; }
+      html[data-ig-float-chrome="ghost"] .ig-floating-modal .ig-float-grip { display: inline-flex; }
+      html[data-ig-float-chrome="ghost"] .ig-floating-modal .ig-float-tools {
+        background: rgba(23, 23, 29, 0.94);
+        -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px);
+        border: 1px solid var(--igls-border-strong, rgba(255,255,255,0.14)); border-bottom: none;
+        border-radius: 8px 8px 0 0; padding: 2px 3px; margin: 0;
+        box-shadow: 0 -4px 14px rgba(0, 0, 0, 0.35);
+      }
+      /* Window pushed against the top of the screen: the controls drop inside the corner */
+      html[data-ig-float-chrome="ghost"] .ig-floating-modal.ig-float-pill-in > .ig-menu-header {
+        bottom: auto; top: 6px; right: 8px; transform: translateY(-3px);
+      }
+      html[data-ig-float-chrome="ghost"] .ig-floating-modal.ig-float-pill-in:hover > .ig-menu-header { transform: none; }
+      html[data-ig-float-chrome="ghost"] .ig-floating-modal.ig-float-pill-in .ig-float-tools {
+        border-bottom: 1px solid var(--igls-border-strong, rgba(255,255,255,0.14));
+        border-radius: 8px; box-shadow: 0 4px 14px rgba(0, 0, 0, 0.45);
+      }
+
+      /* ===== Resizers ===== */
       .ig-floating-resizer { position: absolute; top: 0; width: 6px; height: 100%; cursor: ew-resize; z-index: 2; }
       .ig-floating-resizer.left { left: 0; }
       .ig-floating-resizer.right { right: 0; }
       .ig-floating-resizer:hover, .ig-floating-resizer.active { background: rgba(201, 168, 118, 0.3); }
-
       .ig-floating-resizer-bottom { position: absolute; left: 0; bottom: 0; width: 100%; height: 6px; cursor: ns-resize; z-index: 2; }
       .ig-floating-resizer-bottom:hover, .ig-floating-resizer-bottom.active { background: rgba(201, 168, 118, 0.3); }
-
       .ig-floating-resizer-corner { position: absolute; right: 0; bottom: 0; width: 14px; height: 14px; cursor: nwse-resize; z-index: 3; }
       .ig-floating-resizer-corner::after {
         content: ''; position: absolute; right: 3px; bottom: 3px; width: 7px; height: 7px;
@@ -3724,267 +3847,322 @@ LegoCore.registerBlock({
         background: linear-gradient(135deg, transparent 50%, var(--igls-accent, #c9a876) 50%);
       }
 
-      /* === MINIMIZED (TINY ICON) STATE === */
+      /* ===== Minimized: a small labeled pill ===== */
       .ig-floating-modal.is-iconified {
-        width: 45px !important;
-        height: 45px !important;
-        min-width: 0 !important;
-        min-height: 0 !important;
-        border-radius: 12px;
-        cursor: grab;
+        width: auto !important; height: 30px !important;
+        min-width: 0 !important; min-height: 0 !important; max-width: 220px;
+        flex-direction: row; align-items: center; gap: 6px;
+        padding: 0 12px 0 10px; border-radius: 15px;
+        overflow: hidden !important; cursor: grab;
       }
-      .ig-floating-modal.is-iconified:active {
-        cursor: grabbing;
-      }
-      /* Hide all normal contents when iconified */
-      .ig-floating-modal.is-iconified > * {
-        display: none !important;
-      }
-      /* Show the extracted Emoji/Letter */
+      .ig-floating-modal.is-iconified:active { cursor: grabbing; }
+      .ig-floating-modal.is-iconified > * { display: none !important; }
       .ig-floating-modal.is-iconified::before {
-        content: attr(data-icon);
-        display: flex;
-        align-items: center;
-        justify-content: center;
-        width: 100%;
-        height: 100%;
-        font-size: 20px;
-        color: var(--igls-accent, #c9a876);
-        background: var(--igls-surface, #17171d);
-        border-radius: 11px; /* inner radius */
+        content: attr(data-icon); font-size: 14px; line-height: 1; flex-shrink: 0;
       }
-      .ig-floating-modal.is-iconified:hover::before {
-        background: var(--igls-surface-2, #1c1c23);
+      .ig-floating-modal.is-iconified::after {
+        content: attr(data-label); font-size: 11px; font-weight: 600; line-height: 1;
+        color: var(--igls-text, #ece9e4); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
       }
+      .ig-floating-modal.is-iconified:hover {
+        background: var(--igls-surface-2, #1c1c23); border-color: rgba(201, 168, 118, 0.45);
+      }
+
+      /* ===== Setting inside ⚙️ Profiles ===== */
+      .ig-fc-seg { display: flex; border: 1px solid var(--igls-border-strong, rgba(255,255,255,0.14)); border-radius: 6px; overflow: hidden; }
+      .ig-fc-seg button {
+        flex: 1; background: transparent; border: none; color: var(--igls-text-dim, #96949c);
+        font-size: 10px; font-weight: 600; padding: 5px 0; cursor: pointer; transition: background 0.15s, color 0.15s;
+      }
+      .ig-fc-seg button + button { border-left: 1px solid var(--igls-border, rgba(255,255,255,0.08)); }
+      .ig-fc-seg button:hover { color: var(--igls-text, #ece9e4); }
+      .ig-fc-seg button.on { background: var(--igls-accent, #c9a876); color: #171208; }
+      .ig-fc-row { display: flex; align-items: center; gap: 8px; font-size: 10px; color: var(--igls-text-dim, #96949c); }
+      .ig-fc-row input[type=range] { flex: 1; accent-color: var(--igls-accent, #c9a876); cursor: pointer; }
+      .ig-fc-val { min-width: 30px; text-align: right; color: var(--igls-text, #ece9e4); font-weight: 600; }
+      .ig-fc-hint { font-size: 10px; color: var(--igls-text-dim, #96949c); line-height: 1.4; }
     `;
     document.head.appendChild(style);
+    applyChrome();
 
-    function createFloatingWindow(card) {
-      const key = card.dataset.key;
-      if (document.getElementById('ig-float-modal-' + key)) return;
-
-      const savedPos = popoutStates[key] || { top: 100, left: 200 };
-      const savedWidth = savedPos.width || 300;
-      const savedHeight = savedPos.height || null;
-
-      const modal = document.createElement('div');
-      modal.className = 'ig-floating-modal';
-      modal.id = 'ig-float-modal-' + key;
-      modal.style.top = savedPos.top + 'px';
-      modal.style.left = savedPos.left + 'px';
-      modal.style.width = savedWidth + 'px';
-      if (savedHeight) modal.style.height = savedHeight + 'px';
-      modal.style.position = 'fixed';
-
-      // Extract Icon and set it for minimized mode
-      const titleSpan = card.querySelector('.ig-menu-header span:first-child');
-      const icon = extractIcon(titleSpan ? titleSpan.innerText : key);
-      modal.setAttribute('data-icon', icon);
-
-      // Restore iconified state if saved
-      if (savedPos.iconified) {
-        modal.classList.add('is-iconified');
-      }
-
-      const header = card.querySelector('.ig-menu-header').cloneNode(true);
-      const content = card.querySelector('.ig-menu-content');
-
-      // Swap popout button for dock back button
-      const popBtn = header.querySelector('.ig-popout-btn');
-      if (popBtn) {
-        popBtn.innerText = '📥';
-        popBtn.title = 'Dock back to sidebar';
-        popBtn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          dockBack(card, key);
-        });
-      }
-
-      // Hide side panel control buttons on float header
-      const switchBtn = header.querySelector('.ig-switch-panel-btn');
-      if (switchBtn) switchBtn.style.display = 'none';
-
-      // Attach listener to minimize button
-      const collapseBtn = header.querySelector('.ig-collapse-btn');
-      if (collapseBtn) {
-        collapseBtn.innerText = '−';
-        collapseBtn.addEventListener('click', (e) => {
-          e.stopPropagation();
-          modal.classList.add('is-iconified');
-          popoutStates[key] = Object.assign({}, popoutStates[key], { iconified: true });
-          saveStates();
-        });
-      }
-
-      modal.appendChild(header);
-      modal.appendChild(content);
-
-      const leftResizer = document.createElement('div');
-      leftResizer.className = 'ig-floating-resizer left';
-      const rightResizer = document.createElement('div');
-      rightResizer.className = 'ig-floating-resizer right';
-      const bottomResizer = document.createElement('div');
-      bottomResizer.className = 'ig-floating-resizer-bottom';
-      const cornerResizer = document.createElement('div');
-      cornerResizer.className = 'ig-floating-resizer-corner';
-      modal.appendChild(leftResizer);
-      modal.appendChild(rightResizer);
-      modal.appendChild(bottomResizer);
-      modal.appendChild(cornerResizer);
-
-      document.body.appendChild(modal);
-      card.classList.add('is-popped-out');
-
-      makeModalDraggable(modal, key);
-      makeModalResizable(modal, leftResizer, rightResizer, bottomResizer, cornerResizer, key);
+    // ---------------- Position helpers ----------------
+    function clampModal(modal) {
+      if (!modal || !modal.isConnected) return;
+      const r = modal.getBoundingClientRect();
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const left = clampNum(r.left, 0, Math.max(0, vw - r.width));
+      const top = clampNum(r.top, 0, Math.max(0, vh - r.height));
+      if (Math.abs(left - r.left) > 0.5) modal.style.left = left + 'px';
+      if (Math.abs(top - r.top) > 0.5) modal.style.top = top + 'px';
+      modal.classList.toggle('ig-float-pill-in', top < PILL_ROOM);
     }
 
-    function dockBack(card, key) {
-      const modal = document.getElementById('ig-float-modal-' + key);
-      if (!modal) return;
+    function placeModal(modal, s, d) {
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const num = v => (v === undefined || v === null || v === '' || isNaN(parseFloat(v))) ? null : parseFloat(v);
+      let left = typeof s.fx === 'number' ? s.fx * vw : num(s.left);
+      let top = typeof s.fy === 'number' ? s.fy * vh : num(s.top);
+      if (left === null) left = num(d.left) !== null ? num(d.left) : 200;
+      if (top === null) top = num(d.top) !== null ? num(d.top) : 100;
+      modal.style.left = left + 'px';
+      modal.style.top = top + 'px';
+      clampModal(modal);
+    }
 
-      const content = modal.querySelector('.ig-menu-content');
-      if (content) {
-        card.appendChild(content);
-      }
-
-      modal.remove();
-      card.classList.remove('is-popped-out');
-
-      delete popoutStates[key];
+    // Saved as pixels AND as a share of the screen (fx / fy), so a window
+    // lands in the same place on a bigger or smaller monitor.
+    function savePos(key, modal, withSize) {
+      const r = modal.getBoundingClientRect();
+      const vw = window.innerWidth || 1, vh = window.innerHeight || 1;
+      const s = Object.assign({}, popoutStates[key]);
+      s.left = Math.round(r.left);
+      s.top = Math.round(r.top);
+      s.fx = +(r.left / vw).toFixed(4);
+      s.fy = +(r.top / vh).toFixed(4);
+      if (withSize) { s.width = Math.round(modal.offsetWidth); s.height = Math.round(modal.offsetHeight); }
+      popoutStates[key] = s;
       saveStates();
     }
 
-    // Completely rewritten to handle dragging from both header AND the minimized icon
+    function bringToFront(modal) {
+      if (modal && modal.parentNode === document.body && modal.nextElementSibling) document.body.appendChild(modal);
+    }
+
+    function minimize(modal, key) {
+      if (!modal) return;
+      modal.classList.add('is-iconified');
+      clampModal(modal);
+      patchState(key, { iconified: true });
+    }
+
+    let resizeRaf = 0;
+    window.addEventListener('resize', () => {
+      if (resizeRaf) return;
+      resizeRaf = requestAnimationFrame(() => {
+        resizeRaf = 0;
+        document.querySelectorAll('.ig-floating-modal').forEach(clampModal);
+      });
+    });
+
+    // ---------------- Controls ----------------
+    // o: { extras: [existing buttons], buttons: [{text,title,onClick,className}],
+    //      onDock, onSide, onMin, onClose }
+    function makeTools(o) {
+      const el = document.createElement('div');
+      el.className = 'ig-float-tools';
+      const grip = document.createElement('span');
+      grip.className = 'ig-float-grip';
+      grip.textContent = '⠿';
+      grip.title = 'Drag to move';
+      el.appendChild(grip);
+
+      const out = { el, sideBtn: null, buttons: [] };
+      (o.extras || []).forEach(b => el.appendChild(b));
+      const add = (cls, text, title, fn) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'ig-float-btn ' + (cls || '');
+        b.textContent = text;
+        if (title) b.title = title;
+        b.addEventListener('click', e => { e.stopPropagation(); fn(b, e); });
+        el.appendChild(b);
+        return b;
+      };
+      (o.buttons || []).forEach(x => out.buttons.push(add(x.className, x.text, x.title, x.onClick)));
+      if (o.onDock) add('ig-float-dock', '📥', 'Dock back to the side panel', o.onDock);
+      if (o.onSide) out.sideBtn = add('ig-float-side', '⇄', '', o.onSide);
+      if (o.onMin) add('ig-float-min', '−', 'Minimize', o.onMin);
+      if (o.onClose) add('ig-float-close', '✕', 'Close', o.onClose);
+      return out;
+    }
+
+    // ---------------- Window builder (shared by cards and other blocks) ----------------
+    function buildModal(o) {
+      const s = popoutStates[o.key] || {};
+      const d = o.defaults || {};
+      const modal = document.createElement('div');
+      modal.className = 'ig-floating-modal' + (o.className ? ' ' + o.className : '');
+      modal.id = o.id;
+      modal.dataset.floatKey = o.key;
+      modal.setAttribute('data-icon', o.icon || '⠿');
+      modal.setAttribute('data-label', o.label || '');
+      modal.style.position = 'fixed';
+      modal.style.width = (Number(s.width) || Number(d.width) || 300) + 'px';
+      const h = Number(s.height) || Number(d.height) || 0;
+      if (h) modal.style.height = h + 'px';
+      if (s.iconified && o.minimizable !== false) modal.classList.add('is-iconified');
+
+      modal.appendChild(o.header);
+      modal.appendChild(o.content);
+
+      let rz = null;
+      if (o.resizable !== false) {
+        rz = {
+          left: Object.assign(document.createElement('div'), { className: 'ig-floating-resizer left' }),
+          right: Object.assign(document.createElement('div'), { className: 'ig-floating-resizer right' }),
+          bottom: Object.assign(document.createElement('div'), { className: 'ig-floating-resizer-bottom' }),
+          corner: Object.assign(document.createElement('div'), { className: 'ig-floating-resizer-corner' })
+        };
+        modal.append(rz.left, rz.right, rz.bottom, rz.corner);
+      }
+
+      document.body.appendChild(modal);
+      placeModal(modal, s, d);
+      makeModalDraggable(modal, o.key);
+      if (rz) makeModalResizable(modal, rz, o.key);
+      return modal;
+    }
+
+    // Drag by the header (or the ⠿ in Ghost), or anywhere on a minimized pill
     function makeModalDraggable(modal, key) {
-      let isDragging = false;
-      let startX, startY, initLeft, initTop;
-      let moved = false; // Used to distinguish between a "click" and a "drag"
+      let dragging = false, moved = false, startX = 0, startY = 0, initLeft = 0, initTop = 0;
 
-      modal.addEventListener('mousedown', (e) => {
-        // Only accept left-click and ignore nested buttons (like minimize, dock, etc)
-        if (e.button !== 0 || e.target.closest('button')) return;
+      modal.addEventListener('mousedown', e => {
+        if (e.button !== 0 || e.target.closest('button, input, select, textarea, a')) return;
+        const iconified = modal.classList.contains('is-iconified');
+        const header = e.target.closest('.ig-menu-header');
+        if (!iconified && !(header && header.parentElement === modal)) return;
 
-        const isHeaderClick = e.target.closest('.ig-menu-header');
-        const isIconified = modal.classList.contains('is-iconified');
-
-        // Only start drag if we click the header, OR if the whole window is currently a tiny icon
-        if (!isHeaderClick && !isIconified) return;
-
-        isDragging = true;
-        moved = false;
-        startX = e.clientX;
-        startY = e.clientY;
-        initLeft = modal.offsetLeft;
-        initTop = modal.offsetTop;
-
-        document.addEventListener('mousemove', onMouseMove);
-        document.addEventListener('mouseup', onMouseUp);
+        dragging = true; moved = false;
+        startX = e.clientX; startY = e.clientY;
+        const r = modal.getBoundingClientRect();
+        initLeft = r.left; initTop = r.top;
+        bringToFront(modal);
+        document.addEventListener('mousemove', onMove);
+        document.addEventListener('mouseup', onUp);
         e.preventDefault();
       });
 
-      function onMouseMove(e) {
-        if (!isDragging) return;
-        const dx = e.clientX - startX;
-        const dy = e.clientY - startY;
-
-        // If mouse moves more than 3px, we register this as a drag, not a click
-        if (Math.abs(dx) > 3 || Math.abs(dy) > 3) {
-          moved = true;
-        }
-
+      function onMove(e) {
+        if (!dragging) return;
+        const dx = e.clientX - startX, dy = e.clientY - startY;
+        if (!moved && (Math.abs(dx) > 3 || Math.abs(dy) > 3)) moved = true;
+        if (!moved) return;
         modal.style.left = (initLeft + dx) + 'px';
         modal.style.top = (initTop + dy) + 'px';
       }
 
-      function onMouseUp(e) {
-        if (!isDragging) return;
-        isDragging = false;
-        document.removeEventListener('mousemove', onMouseMove);
-        document.removeEventListener('mouseup', onMouseUp);
-
-        const isIconified = modal.classList.contains('is-iconified');
-
-        // If it was a tiny icon and we didn't drag it around, it was a click to Expand
-        if (isIconified && !moved) {
+      function onUp() {
+        if (!dragging) return;
+        dragging = false;
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+        if (modal.classList.contains('is-iconified') && !moved) {
+          // a click on the pill = open it again
           modal.classList.remove('is-iconified');
-          popoutStates[key] = Object.assign({}, popoutStates[key], { iconified: false });
-        } else {
-          // Otherwise, just save its new position
-          popoutStates[key] = Object.assign({}, popoutStates[key], {
-            top: modal.offsetTop,
-            left: modal.offsetLeft
-          });
+          patchState(key, { iconified: false });
         }
-        saveStates();
+        clampModal(modal);
+        savePos(key, modal);
       }
     }
 
-    function makeModalResizable(modal, leftResizer, rightResizer, bottomResizer, cornerResizer, key) {
-      const MIN_WIDTH = 220;
-      const MIN_HEIGHT = 150;
-
+    function makeModalResizable(modal, rz, key) {
       function startResize(mode) {
         return function (e) {
           if (e.button !== 0 || modal.classList.contains('is-iconified')) return;
           e.preventDefault();
           e.stopPropagation();
-
-          const startX = e.clientX;
-          const startY = e.clientY;
-          const startWidth = modal.offsetWidth;
-          const startHeight = modal.offsetHeight;
-          const startLeft = modal.offsetLeft;
-
-          const resizerEl = mode === 'left' ? leftResizer
-            : mode === 'right' ? rightResizer
-            : mode === 'bottom' ? bottomResizer
-            : cornerResizer;
-          resizerEl.classList.add('active');
+          const startX = e.clientX, startY = e.clientY;
+          const startWidth = modal.offsetWidth, startHeight = modal.offsetHeight;
+          const startLeft = modal.getBoundingClientRect().left;
+          const handle = rz[mode];
+          handle.classList.add('active');
 
           function onMove(ev) {
-            const dx = ev.clientX - startX;
-            const dy = ev.clientY - startY;
-
+            const dx = ev.clientX - startX, dy = ev.clientY - startY;
             if (mode === 'right' || mode === 'corner') {
-              const newWidth = Math.max(MIN_WIDTH, startWidth + dx);
-              modal.style.width = newWidth + 'px';
+              modal.style.width = Math.max(MIN_WIDTH, startWidth + dx) + 'px';
             } else if (mode === 'left') {
-              const newWidth = Math.max(MIN_WIDTH, startWidth - dx);
-              const widthDelta = newWidth - startWidth;
-              modal.style.width = newWidth + 'px';
-              modal.style.left = (startLeft - widthDelta) + 'px';
+              const w = Math.max(MIN_WIDTH, startWidth - dx);
+              modal.style.width = w + 'px';
+              modal.style.left = (startLeft - (w - startWidth)) + 'px';
             }
-
             if (mode === 'bottom' || mode === 'corner') {
-              const newHeight = Math.max(MIN_HEIGHT, startHeight + dy);
-              modal.style.height = newHeight + 'px';
+              modal.style.height = Math.max(MIN_HEIGHT, startHeight + dy) + 'px';
             }
           }
-
           function onUp() {
             document.removeEventListener('mousemove', onMove);
             document.removeEventListener('mouseup', onUp);
-            resizerEl.classList.remove('active');
-
-            popoutStates[key] = Object.assign({}, popoutStates[key], {
-              top: modal.offsetTop,
-              left: modal.offsetLeft,
-              width: modal.offsetWidth,
-              height: modal.offsetHeight
-            });
-            saveStates();
+            handle.classList.remove('active');
+            clampModal(modal);
+            savePos(key, modal, true);
           }
-
           document.addEventListener('mousemove', onMove);
           document.addEventListener('mouseup', onUp);
         };
       }
+      rz.left.addEventListener('mousedown', startResize('left'));
+      rz.right.addEventListener('mousedown', startResize('right'));
+      rz.bottom.addEventListener('mousedown', startResize('bottom'));
+      rz.corner.addEventListener('mousedown', startResize('corner'));
+    }
 
-      leftResizer.addEventListener('mousedown', startResize('left'));
-      rightResizer.addEventListener('mousedown', startResize('right'));
-      bottomResizer.addEventListener('mousedown', startResize('bottom'));
-      cornerResizer.addEventListener('mousedown', startResize('corner'));
+    // ---------------- Side-panel cards → floating windows ----------------
+    function updateSideTitle(btn, card) {
+      if (!btn) return;
+      const right = !!(card.parentElement && card.parentElement.id === 'ig-right-menu-container');
+      btn.title = `📥 docks to the ${right ? 'right' : 'left'} panel — click to switch to the ${right ? 'left' : 'right'}`;
+    }
+
+    function createFloatingWindow(card) {
+      const key = card.dataset.key;
+      if (!key || document.getElementById('ig-float-modal-' + key)) return null;
+      const srcHeader = card.querySelector('.ig-menu-header');
+      const content = card.querySelector('.ig-menu-content');
+      if (!srcHeader || !content) return null;
+
+      // Copy the card's header: keep its title (and any module buttons such as
+      // the Quick Chat ⚙️), drop the side-panel controls — v7 adds working ones.
+      const header = srcHeader.cloneNode(true);
+      header.removeAttribute('draggable');
+      delete header.dataset.reorderBound;
+      header.querySelectorAll('.ig-card-toolbar, .ig-popout-btn, .ig-switch-panel-btn, .ig-collapse-btn, .ig-drag-handle, .ig-qcx-hdr-btn')
+        .forEach(n => n.remove());
+      const titleSpan = header.querySelector(':scope > span');
+      if (titleSpan) titleSpan.classList.add('ig-float-title');
+      const titleText = titleSpan ? titleSpan.textContent : key;
+      const extras = Array.from(header.querySelectorAll('button'));
+
+      const hasSwitch = !!card.querySelector('.ig-switch-panel-btn');
+      let modal = null;
+      const tools = makeTools({
+        extras,
+        onDock: () => dockBack(card, key),
+        onSide: hasSwitch ? (btn) => {
+          // press the real ⇄ on the hidden card (Menu Panel Switcher does the move + saves it)
+          const real = card.querySelector('.ig-switch-panel-btn');
+          if (real) real.click();
+          updateSideTitle(btn, card);
+        } : null,
+        onMin: () => minimize(modal, key)
+      });
+      updateSideTitle(tools.sideBtn, card);
+      header.appendChild(tools.el);
+
+      modal = buildModal({
+        id: 'ig-float-modal-' + key,
+        key,
+        header,
+        content,
+        icon: extractIcon(titleText),
+        label: labelFrom(titleText) || key,
+        defaults: {}
+      });
+      card.classList.add('is-popped-out');
+      return modal;
+    }
+
+    function dockBack(card, key) {
+      const modal = document.getElementById('ig-float-modal-' + key);
+      if (!modal) return;
+      const content = modal.querySelector(':scope > .ig-menu-content');
+      if (content) card.appendChild(content);
+      modal.remove();
+      card.classList.remove('is-popped-out');
+      delete popoutStates[key];
+      saveStates();
     }
 
     function processCard(card) {
@@ -3997,32 +4175,22 @@ LegoCore.registerBlock({
       btn.className = 'ig-popout-btn';
       btn.title = 'Pop out as floating window';
       btn.innerText = '⧉';
-
       btn.addEventListener('mousedown', (e) => e.stopPropagation());
       btn.addEventListener('click', (e) => {
         e.stopPropagation();
-        createFloatingWindow(card);
-        popoutStates[key] = popoutStates[key] || { top: 120, left: 220, width: 300, iconified: false };
-        saveStates();
+        const modal = createFloatingWindow(card);
+        if (modal) savePos(key, modal);
       });
 
       const switchBtn = header.querySelector('.ig-switch-panel-btn');
       const collapseBtn = header.querySelector('.ig-collapse-btn');
       const dragHandle = header.querySelector('.ig-drag-handle');
+      if (switchBtn) header.insertBefore(btn, switchBtn);
+      else if (collapseBtn) header.insertBefore(btn, collapseBtn);
+      else if (dragHandle) header.insertBefore(btn, dragHandle);
+      else header.appendChild(btn);
 
-      if (switchBtn) {
-        header.insertBefore(btn, switchBtn);
-      } else if (collapseBtn) {
-        header.insertBefore(btn, collapseBtn);
-      } else if (dragHandle) {
-        header.insertBefore(btn, dragHandle);
-      } else {
-        header.appendChild(btn);
-      }
-
-      if (popoutStates[key]) {
-        setTimeout(() => createFloatingWindow(card), 100);
-      }
+      if (popoutStates[key]) setTimeout(() => createFloatingWindow(card), 100);
     }
 
     function attachToContainer(containerId) {
@@ -4038,7 +4206,6 @@ LegoCore.registerBlock({
     function initWatcher(attempts) {
       const left = document.getElementById('ig-left-menu-container');
       const right = document.getElementById('ig-right-menu-container');
-
       if (left && right) {
         attachToContainer('ig-left-menu-container');
         attachToContainer('ig-right-menu-container');
@@ -4047,8 +4214,148 @@ LegoCore.registerBlock({
       }
     }
 
+    // ---------------- Extra windows for other blocks ----------------
+    // core.floatWindows.open({
+    //   key, title, icon, label, content (element), defaults {left,top,width,height},
+    //   buttons [{text,title,onClick,className}], closable, minimizable, resizable,
+    //   onClose(handle), onDock(handle), className
+    // }) → handle { el, buttons, setTitle, setLabel, setIcon, restore, front, close({forget}) }
+    // The ✕ calls onClose(handle) when given (the owner then calls handle.close),
+    // otherwise it just closes. close() keeps the saved position unless { forget: true }.
+    const extraWindows = new Map();
+
+    function openFloat(o) {
+      if (!o || !o.key || !o.content) return null;
+      const existing = extraWindows.get(o.key);
+      if (existing && existing.el.isConnected) { existing.front(); return existing; }
+
+      const header = document.createElement('div');
+      header.className = 'ig-menu-header';
+      const titleEl = document.createElement('span');
+      titleEl.className = 'ig-float-title';
+      titleEl.textContent = o.title || '';
+      header.appendChild(titleEl);
+
+      const content = document.createElement('div');
+      content.className = 'ig-menu-content';
+      content.appendChild(o.content);
+
+      let handle = null, modal = null;
+      const tools = makeTools({
+        buttons: o.buttons || [],
+        onDock: typeof o.onDock === 'function' ? () => o.onDock(handle) : null,
+        onMin: o.minimizable === false ? null : () => minimize(modal, o.key),
+        onClose: o.closable === false ? null : () => {
+          if (typeof o.onClose === 'function') o.onClose(handle);
+          else handle.close();
+        }
+      });
+      header.appendChild(tools.el);
+
+      const hadState = !!popoutStates[o.key];
+      modal = buildModal({
+        id: 'ig-float-modal-' + safeId(o.key),
+        key: o.key,
+        header,
+        content,
+        icon: o.icon || extractIcon(o.title),
+        label: o.label !== undefined && o.label !== null ? o.label : labelFrom(o.title),
+        defaults: o.defaults,
+        resizable: o.resizable,
+        minimizable: o.minimizable,
+        className: o.className
+      });
+      if (!hadState) savePos(o.key, modal);
+
+      handle = {
+        key: o.key,
+        el: modal,
+        buttons: tools.buttons,
+        setTitle(t) { titleEl.textContent = t || ''; },
+        setLabel(t) { modal.setAttribute('data-label', t || ''); },
+        setIcon(t) { modal.setAttribute('data-icon', t || '⠿'); },
+        isMinimized() { return modal.classList.contains('is-iconified'); },
+        restore() {
+          if (!modal.classList.contains('is-iconified')) return;
+          modal.classList.remove('is-iconified');
+          patchState(o.key, { iconified: false });
+          clampModal(modal);
+        },
+        front() { handle.restore(); bringToFront(modal); },
+        close(opts) {
+          modal.remove();
+          extraWindows.delete(o.key);
+          if (opts && opts.forget) { delete popoutStates[o.key]; saveStates(); }
+        }
+      };
+      extraWindows.set(o.key, handle);
+      return handle;
+    }
+
+    // ---------------- Setting: ⚙️ Profiles → "Floating windows" ----------------
+    const HINTS = {
+      classic: 'The original bar.',
+      slim: 'A thin bar — set its height below.',
+      ghost: 'No bar. Hover a window to see its controls above its top-right corner. Drag it by ⠿.'
+    };
+    core.on('profile-window:opened', ({ container }) => {
+      if (!container) return;
+      const sec = document.createElement('div');
+      sec.className = 'ig-profile-section';
+      sec.innerHTML = `
+        <span class="ig-profile-section-title">Floating windows</span>
+        <div class="ig-fc-seg">
+          <button type="button" data-style="classic">Classic</button>
+          <button type="button" data-style="slim">Slim</button>
+          <button type="button" data-style="ghost">Ghost</button>
+        </div>
+        <div class="ig-fc-row ig-fc-slider">
+          <span>Bar height</span>
+          <input type="range" min="${BAR_MIN}" max="${BAR_MAX}" step="1">
+          <span class="ig-fc-val"></span>
+        </div>
+        <div class="ig-fc-hint"></div>`;
+      const seg = sec.querySelector('.ig-fc-seg');
+      const sliderRow = sec.querySelector('.ig-fc-slider');
+      const range = sec.querySelector('input[type=range]');
+      const val = sec.querySelector('.ig-fc-val');
+      const hint = sec.querySelector('.ig-fc-hint');
+
+      function paint() {
+        seg.querySelectorAll('button').forEach(b => b.classList.toggle('on', b.dataset.style === chrome.style));
+        sliderRow.style.display = chrome.style === 'slim' ? '' : 'none';
+        range.value = String(chrome.barH);
+        val.textContent = chrome.barH + 'px';
+        hint.textContent = HINTS[chrome.style];
+      }
+      seg.addEventListener('click', e => {
+        const b = e.target.closest('button[data-style]');
+        if (!b) return;
+        setChrome({ style: b.dataset.style });
+        paint();
+      });
+      range.addEventListener('input', () => { setChrome({ barH: Number(range.value) }, false); val.textContent = chrome.barH + 'px'; });
+      range.addEventListener('change', () => { setChrome({ barH: Number(range.value) }); paint(); });
+      paint();
+      container.appendChild(sec);
+    });
+
+    // Another Instagram tab changed the style → follow it
+    window.addEventListener('storage', e => {
+      if (e.key !== CHROME_KEY) return;
+      chrome = readChrome();
+      applyChrome();
+    });
+
+    core.floatWindows = {
+      open: openFloat,
+      getChrome: () => Object.assign({}, chrome),
+      setChrome,
+      clamp: clampModal
+    };
+
     initWatcher(10);
-    console.log('[MenuInPagePopoutModule] Floating windows enabled (with draggable emoji icons).');
+    console.log('[MenuInPagePopoutModule] v7 — shared header style:', chrome.style);
     core.emit('block:ready', { id: 'menuInPagePopoutModule' });
   }
 });
@@ -5413,6 +5720,145 @@ LegoCore.registerBlock({
       }
     }
     mountCard();
+  }
+});
+
+/* ============================================================
+   BLOCK: image manager (v1)
+   ============================================================ */
+/* ============================================================
+   BLOCK: Text Library Image Manager (Right-Side Icon & Viewer)
+   - Completely separate extension.
+   - Handles file uploading, compression, and hover viewing.
+   ============================================================ */
+LegoCore.registerBlock({
+  id: 'textLibraryImageManager',
+  init(core) {
+    const PRO_KEY = 'ig_text_library_pro_v1';
+
+    const style = document.createElement('style');
+    style.innerHTML = `
+      .ig-tln-thumb-btn {
+        background: transparent; border: none; font-size: 11px; cursor: pointer;
+        padding: 4px; border-radius: 4px; transition: 0.1s; margin-right: 2px;
+      }
+      .ig-tln-thumb-btn:hover { background: rgba(255,255,255,0.1); }
+      .ig-tln-thumb-btn:active { transform: scale(0.9); }
+    `;
+    document.head.appendChild(style);
+
+    const thumbViewer = document.createElement('div');
+    thumbViewer.style.cssText = 'position:fixed; z-index:2147483647; max-width:250px; max-height:250px; border-radius:8px; box-shadow:0 10px 30px rgba(0,0,0,0.8); pointer-events:none; display:none; background:#0f172a; padding:6px; border:1px solid #334155;';
+    const thumbViewerImg = document.createElement('img');
+    thumbViewerImg.style.cssText = 'max-width:100%; max-height:100%; border-radius:4px; object-fit:contain; display:block;';
+    thumbViewer.appendChild(thumbViewerImg);
+    document.body.appendChild(thumbViewer);
+
+    function compressImage(file, maxSize, callback) {
+      const reader = new FileReader();
+      reader.onload = (e) => {
+        const img = new Image();
+        img.onload = () => {
+          const canvas = document.createElement('canvas');
+          let w = img.width; let h = img.height;
+          if (w > maxSize || h > maxSize) {
+            const ratio = Math.min(maxSize / w, maxSize / h);
+            w *= ratio; h *= ratio;
+          }
+          canvas.width = w; canvas.height = h;
+          const ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0, w, h);
+          callback(canvas.toDataURL('image/jpeg', 0.8));
+        };
+        img.src = e.target.result;
+      };
+      reader.readAsDataURL(file);
+    }
+
+    core.on('tl:tree-rendered', (contentArea) => {
+      const libraryData = JSON.parse(localStorage.getItem(PRO_KEY));
+      if (!libraryData) return;
+
+      contentArea.querySelectorAll('.ig-tln-snippet').forEach(row => {
+        const id = row.dataset.id;
+        const item = libraryData.items.find(i => i.id === id);
+
+        if (item && item.thumbnail && !row.querySelector('.ig-tln-thumb-btn')) {
+          const actionsDiv = row.querySelector('.ig-tln-actions');
+          const btn = document.createElement('button');
+          btn.className = 'ig-tln-thumb-btn ig-tln-thumb-icon';
+          btn.title = 'Hold to view thumbnail';
+          btn.innerText = '🖼️';
+
+          btn.onmousedown = (e) => {
+            e.stopPropagation();
+            thumbViewerImg.src = item.thumbnail;
+            thumbViewer.style.left = (e.clientX - 265) + 'px';
+            thumbViewer.style.top = (e.clientY + 10) + 'px';
+            thumbViewer.style.display = 'block';
+          };
+          const hide = () => thumbViewer.style.display = 'none';
+          btn.onmouseup = hide; btn.onmouseleave = hide; btn.onclick = e => e.stopPropagation();
+
+          actionsDiv.insertBefore(btn, actionsDiv.firstChild);
+        }
+      });
+    });
+
+    const observer = new MutationObserver((mutations) => {
+      mutations.forEach(m => {
+        m.addedNodes.forEach(node => {
+          if (node.nodeType === 1 && node.querySelector('#ig-tlp-modal-box')) {
+            const overlay = node;
+            const modal = overlay.querySelector('#ig-tlp-modal-box');
+            const tagSection = Array.from(modal.querySelectorAll('div')).find(d => d.innerText.includes('Assign Tags:'));
+
+            if (!tagSection || modal.querySelector('#ig-tlc-thumb-upload')) return;
+
+            const currentThumb = overlay.dataset.thumbnail || '';
+
+            const thumbUI = document.createElement('div');
+            thumbUI.innerHTML = `
+              <div style="font-size:11px; font-weight:bold; color:#94a3b8; margin-top:4px;">Thumbnail Image (Optional):</div>
+              <div style="display:flex; gap:8px; align-items:center;">
+                <input type="file" id="ig-tlc-thumb-upload" accept="image/*" style="font-size:10px; color:#fff; width:180px;">
+                <button id="ig-tlc-thumb-clear" style="background:transparent; color:#f43f5e; border:none; cursor:pointer; font-size:10px; display:${currentThumb ? 'block' : 'none'};">Clear Image</button>
+              </div>
+              <img id="ig-tlc-thumb-preview" src="${currentThumb}" style="max-height:40px; border-radius:4px; display:${currentThumb ? 'block' : 'none'}; object-fit:contain; margin-top:4px;">
+            `;
+
+            modal.insertBefore(thumbUI, tagSection);
+
+            const upload = thumbUI.querySelector('#ig-tlc-thumb-upload');
+            const clear = thumbUI.querySelector('#ig-tlc-thumb-clear');
+            const preview = thumbUI.querySelector('#ig-tlc-thumb-preview');
+
+            upload.onchange = (e) => {
+              const file = e.target.files[0];
+              if (file) {
+                compressImage(file, 400, (base64) => {
+                  overlay.dataset.thumbnail = base64;
+                  preview.src = base64;
+                  preview.style.display = 'block';
+                  clear.style.display = 'block';
+                });
+              }
+            };
+
+            clear.onclick = () => {
+              overlay.dataset.thumbnail = 'CLEAR';
+              preview.style.display = 'none';
+              clear.style.display = 'none';
+              upload.value = '';
+            };
+          }
+        });
+      });
+    });
+
+    observer.observe(document.body, { childList: true, subtree: true });
+    console.log('[TextLibraryImageManager] Loaded: Image Logic successfully decoupled.');
+    core.emit('block:ready', { id: 'textLibraryImageManager' });
   }
 });
 
@@ -8464,10 +8910,14 @@ LegoCore.registerBlock({
 
 
 /* ============================================================
-   BLOCK: Master Config Bunny Sync (v10)
+   BLOCK: Master Config Bunny Sync (v11)
    ============================================================ */
 /* ============================================================
-   BLOCK: Central Cloud Sync Center (v5.2 - 🚀 Syncs the Launchpad too)
+   BLOCK: Central Cloud Sync Center (v5.3 - 🪟 Syncs floating windows too)
+   - v5.3: floating windows ride the master config: their positions + sizes
+     ('ig_menu_inpage_popouts_v1'), the shared header style + bar height
+     ('ig_float_chrome_v1', Pop-out v7) and which side each card lives on
+     ('ig_menu_panel_assignments_v1')
    - v5.2: the Launchpad (tabs, buttons, colors, versions) rides the master config
    - v5.1: 📦 reads each sound only to upload it; needs Core v5
    - v5.1: clip lists come without sound (core.clipStore); Smart Backup opens
@@ -8516,8 +8966,10 @@ LegoCore.registerBlock({
         'ig_seq_folders_v1', 'ig_seq_folders_collapsed_v1',
         // Tag Colors (number + course badge colors)
         'ig_tag_colors_v1',
-        // Launchpad (tabs + buttons, v5.2)
-        'ig_launchpad_v1'
+        // Launchpad (categories, sub-tabs, buttons, windows, v5.2)
+        'ig_launchpad_v1',
+        // Floating windows (v5.3): positions + sizes, shared header style, card sides
+        'ig_menu_inpage_popouts_v1', 'ig_float_chrome_v1', 'ig_menu_panel_assignments_v1'
     ];
 
     let prefs = JSON.parse(localStorage.getItem(BUNNY_PREFS_KEY)) || { zoneName: '', apiKey: '', region: 'default' };
@@ -9400,7 +9852,7 @@ LegoCore.registerBlock({
     wrap.querySelector('#ig-csc-force-img').onclick = action(() => pushImages(true),
         '⚠️ Rewrite the cloud images from THIS computer?\nImages that only exist in the cloud will be removed.');
 
-    console.log('[CloudSyncCenterModule] v5 — exact names + manifests + permanent IDs active.');
+    console.log('[CloudSyncCenterModule] v5.3 — exact names + manifests + permanent IDs + floating windows active.');
     core.emit('block:ready', { id: 'cloudSyncCenterModule' });
   }
 });
@@ -11542,30 +11994,37 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Launchpad (v1)
+   BLOCK: Launchpad (v2)
    ============================================================ */
 /* ============================================================
-   BLOCK: Launchpad (v1.2 - 🔤 A = main version)
+   BLOCK: Launchpad (v1.3 - 🗂️ Categories + sub-tabs · ⧉ More windows)
    ------------------------------------------------------------
+   v1.3:
+   - Two levels: categories (filled pills) and their sub-tabs
+     (underlined). Your old tabs become sub-tabs of a "General"
+     category — rename it any time. A row with only one choice hides.
+   - ⚙️ edit mode: ＋ adds a category / sub-tab, double-click renames,
+     ✕ on the selected one deletes it, drag to reorder, drag a button
+     onto a sub-tab to move it there. Columns are set per sub-tab.
+   - ⧉ Window (in ⚙️): open more Launchpad windows. Each one remembers
+     its category + sub-tab and can show All / one Category / one Tab.
+     ✕ closes it.
+   - The button editor is a normal floating window (no dark screen).
+     It reopens where you left it. Clicking another button switches
+     to it (it asks first if you changed something).
+   - New buttons: black text; ＋ opens straight into search; the title
+     is the item's exact name and follows the item when you rename it,
+     until you type your own (clear the title to follow it again).
+   - Windows + editor use the Menu Card Pop-out block v7, so they share
+     the same header style as every floating window.
    v1.2: the main version is "A"; the others are B, C, D…
-   v1.1: hover a button (or a version in the tree) to preview what it
-         sends — text, audio transcript, image-set pictures, sequence steps —
-         in the same style as the Commands search preview.
-   Buttons that load a message into the Instagram chat box with one click.
-   - Tabs (one per course, e.g. "Portrait", "Animals").
-   - Each button: a title, a color, white or black text, any size.
-   - Left 2/3 = sends version A (the main one). Right 1/3 (▾) = opens
-     the tree with A and the other versions (B, C, D…). Click one to send it.
-   - A message can be: a Text Library snippet, an audio clip, an image set,
-     a Sequence, or text typed right here.
-   - ⚙️ = edit mode: add/delete tabs and buttons, drag to reorder,
-     drag the corner to resize, click a button to edit it.
-   - Engine: the Core (the same search + sending that Commands and
-     Sequences use). No other block is changed. Items are saved as links,
-     so renaming or moving an audio never breaks a button.
-   - Saved in 'ig_launchpad_v1' (synced by the Sync Center's master config).
-   - Light: no timers, no page watchers; nothing is loaded until you click.
-   Needs Core v8.
+   v1.1: hover a button (or a version) to preview what it sends.
+   - Left 2/3 of a button = sends version A. Right 1/3 (▾) = the other
+     versions. A message can be a Text Library snippet, an audio clip,
+     an image set, a Sequence, or text typed right here.
+   - Saved in 'ig_launchpad_v1' (synced by the Sync Center).
+   - Light: no timers, no page watchers; nothing loads until you click.
+   Needs Core v8 + Menu Card Pop-out v7.
    ============================================================ */
 LegoCore.registerBlock({
   id: 'launchpad',
@@ -11574,51 +12033,124 @@ LegoCore.registerBlock({
     const KINDS = ['text', 'audio', 'set', 'sequence'];
     const ICON = { text: '📝', audio: '🎵', set: '🖼️', sequence: '🔗', custom: '✍️' };
     const COLORS = ['#334155', '#16a34a', '#dc2626', '#ea580c', '#ca8a04', '#2563eb', '#7c3aed', '#db2777'];
+    const NEW_COLORS = ['#ca8a04', '#ea580c', '#16a34a', '#db2777', '#2563eb', '#dc2626'];
     const LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
     const esc = core.escapeHtml;
     const uid = p => p + '_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
     const norm = s => String(s || '').trim().toLowerCase();
+    function clamp(n, a, b) { return Math.max(a, Math.min(b, Math.round(Number(n) || a))); }
 
-    // ---------------- Data ----------------
-    function blankState() {
-      const tabId = uid('tab');
-      return { v: 1, activeTab: tabId, tabs: [{ id: tabId, name: 'Main', cols: 3, tiles: [] }] };
+    // ============================================================
+    // Data
+    //   { v:2, cats:[{ id, name, activeSub, subs:[{ id, name, cols, tiles:[] }] }],
+    //     activeCat, windows:[{ id, cat, sub, lock:'none'|'cat'|'sub' }] }
+    // ============================================================
+    function newSub(name) { return { id: uid('sub'), name: name || 'General', cols: 3, tiles: [] }; }
+    function newCat(name) { const s = newSub('General'); return { id: uid('cat'), name: name || 'General', subs: [s], activeSub: s.id }; }
+    function blankState() { const c = newCat('General'); return { v: 2, cats: [c], activeCat: c.id, windows: [] }; }
+    function fixSub(s) {
+      if (!s.id) s.id = uid('sub');
+      s.name = String(s.name || 'Tab');
+      s.cols = clamp(s.cols || 3, 2, 6);
+      s.tiles = Array.isArray(s.tiles) ? s.tiles.filter(t => t && typeof t === 'object') : [];
+      return s;
     }
+
+    let migrated = false;
     function load() {
-      try {
-        const s = JSON.parse(localStorage.getItem(KEY));
-        if (s && Array.isArray(s.tabs) && s.tabs.length) {
-          s.tabs.forEach(t => { t.tiles = Array.isArray(t.tiles) ? t.tiles : []; t.cols = clamp(t.cols || 3, 2, 6); });
-          if (!s.tabs.some(t => t.id === s.activeTab)) s.activeTab = s.tabs[0].id;
-          return s;
-        }
-      } catch (e) { /* noop */ }
-      return blankState();
+      let s = null;
+      try { s = JSON.parse(localStorage.getItem(KEY)); } catch (e) { s = null; }
+      if (!s || typeof s !== 'object') return blankState();
+      // v1.2 → v1.3: the old tabs become the sub-tabs of one "General" category
+      if (!Array.isArray(s.cats) && Array.isArray(s.tabs) && s.tabs.length) {
+        const subs = s.tabs.filter(t => t && typeof t === 'object').map(fixSub);
+        const cat = { id: uid('cat'), name: 'General', subs, activeSub: s.activeTab };
+        s = { v: 2, cats: [cat], activeCat: cat.id, windows: [] };
+        migrated = true;
+      }
+      if (!Array.isArray(s.cats)) return blankState();
+      s.cats = s.cats.filter(c => c && typeof c === 'object');
+      if (!s.cats.length) return blankState();
+      s.cats.forEach(c => {
+        if (!c.id) c.id = uid('cat');
+        c.name = String(c.name || 'Category');
+        c.subs = Array.isArray(c.subs) ? c.subs.filter(x => x && typeof x === 'object').map(fixSub) : [];
+        if (!c.subs.length) c.subs.push(newSub('General'));
+        if (!c.subs.some(x => x.id === c.activeSub)) c.activeSub = c.subs[0].id;
+      });
+      if (!s.cats.some(c => c.id === s.activeCat)) s.activeCat = s.cats[0].id;
+      s.windows = Array.isArray(s.windows) ? s.windows.filter(w => w && w.id) : [];
+      s.v = 2;
+      return s;
     }
     function save() {
       try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) { toast('⚠️ Could not save'); }
       core.emit('launchpad:updated');
     }
-    function clamp(n, a, b) { return Math.max(a, Math.min(b, Math.round(Number(n) || a))); }
+
     let state = load();
     let editMode = false;
-    const activeTab = () => state.tabs.find(t => t.id === state.activeTab) || state.tabs[0];
-    const findTile = id => { for (const t of state.tabs) { const x = t.tiles.find(i => i.id === id); if (x) return { tab: t, tile: x }; } return null; };
+    const views = new Set();
 
-    // ---------------- Styles ----------------
+    const findCat = id => state.cats.find(c => c.id === id) || null;
+    function findSub(subId) {
+      for (const c of state.cats) { const s = c.subs.find(x => x.id === subId); if (s) return { cat: c, sub: s }; }
+      return null;
+    }
+    function findTile(id) {
+      for (const c of state.cats) for (const s of c.subs) {
+        const t = s.tiles.find(x => x.id === id);
+        if (t) return { cat: c, sub: s, tile: t };
+      }
+      return null;
+    }
+    function viewSel(view) {
+      if (view.win) {
+        const cat = findCat(view.win.cat) || state.cats[0];
+        const sub = cat.subs.find(s => s.id === view.win.sub) || cat.subs.find(s => s.id === cat.activeSub) || cat.subs[0];
+        return { cat, sub };
+      }
+      const cat = findCat(state.activeCat) || state.cats[0];
+      const sub = cat.subs.find(s => s.id === cat.activeSub) || cat.subs[0];
+      return { cat, sub };
+    }
+
+    // ============================================================
+    // Styles
+    // ============================================================
     const style = document.createElement('style');
     style.textContent = `
-      .ig-lp { display:flex; flex-direction:column; gap:6px; font-size:11px; color:var(--igls-text,#e2e8f0); }
-      .ig-lp-bar { display:flex; align-items:center; gap:4px; }
-      .ig-lp-tabs { display:flex; gap:4px; overflow-x:auto; flex:1; scrollbar-width:none; }
-      .ig-lp-tabs::-webkit-scrollbar { display:none; }
-      .ig-lp-tab { flex-shrink:0; background:transparent; border:1px solid var(--igls-border,#334155); color:var(--igls-text-dim,#94a3b8); padding:3px 9px; border-radius:999px; cursor:pointer; font-size:10px; white-space:nowrap; }
-      .ig-lp-tab.on { background:var(--igls-accent,#c9a876); border-color:var(--igls-accent,#c9a876); color:#111; font-weight:bold; }
-      .ig-lp-icon { background:transparent; border:none; color:var(--igls-text-dim,#94a3b8); cursor:pointer; font-size:12px; padding:2px 4px; border-radius:4px; flex-shrink:0; }
+      .ig-lp { display:flex; flex-direction:column; gap:7px; font-size:11px; color:var(--igls-text,#e2e8f0); }
+      .ig-lp-row { display:flex; align-items:center; gap:6px; min-width:0; }
+      .ig-lp-cats, .ig-lp-subs { display:flex; align-items:center; gap:4px; overflow-x:auto; flex:1; min-width:0; scrollbar-width:none; }
+      .ig-lp-cats::-webkit-scrollbar, .ig-lp-subs::-webkit-scrollbar { display:none; }
+      .ig-lp-row2 { border-bottom:1px solid var(--igls-border, rgba(255,255,255,0.07)); }
+
+      .ig-lp-cat { flex-shrink:0; display:inline-flex; align-items:center; background:transparent; border:1px solid var(--igls-border-strong, rgba(255,255,255,0.14)); color:var(--igls-text-dim,#96949c); padding:3px 10px; border-radius:999px; cursor:pointer; font-size:10px; font-weight:600; line-height:1.3; white-space:nowrap; transition:color .15s, background .15s; }
+      .ig-lp-cat:hover { color:var(--igls-text,#ece9e4); }
+      .ig-lp-cat.on { background:var(--igls-accent,#c9a876); border-color:var(--igls-accent,#c9a876); color:#171208; }
+      .ig-lp-sub { flex-shrink:0; display:inline-flex; align-items:center; background:transparent; border:none; border-bottom:2px solid transparent; color:var(--igls-text-dim,#96949c); padding:3px 2px 5px; margin:0 8px -1px 0; cursor:pointer; font-size:10.5px; line-height:1.2; white-space:nowrap; transition:color .15s, border-color .15s; }
+      .ig-lp-sub:hover { color:var(--igls-text,#ece9e4); }
+      .ig-lp-sub.on { color:var(--igls-text,#ece9e4); border-bottom-color:var(--igls-accent,#c9a876); font-weight:600; }
+      .ig-lp-addpill { flex-shrink:0; background:transparent; border:1px dashed var(--igls-border-strong, rgba(255,255,255,0.14)); color:var(--igls-text-dim,#96949c); border-radius:999px; padding:2px 9px; cursor:pointer; font-size:10px; line-height:1.3; }
+      .ig-lp-addpill:hover { color:var(--igls-accent,#c9a876); border-color:var(--igls-accent,#c9a876); }
+      .ig-lp-subs .ig-lp-addpill { border-radius:4px; margin-bottom:2px; }
+      .ig-lp-xmini { margin-left:6px; font-size:9px; opacity:.55; cursor:pointer; }
+      .ig-lp-xmini:hover { opacity:1; color:#f87171; }
+      .ig-lp-cat.on .ig-lp-xmini:hover { color:#7f1d1d; }
+      .ig-lp-cat.drop, .ig-lp-sub.drop { box-shadow:0 0 0 2px var(--igls-accent,#c9a876); border-radius:6px; }
+      .ig-lp-cat.dragging, .ig-lp-sub.dragging { opacity:.35; }
+
+      .ig-lp-icon { background:transparent; border:none; color:var(--igls-text-dim,#96949c); cursor:pointer; font-size:12px; padding:2px 4px; border-radius:4px; flex-shrink:0; margin-left:auto; }
       .ig-lp-icon:hover, .ig-lp-icon.on { color:var(--igls-accent,#c9a876); background:rgba(255,255,255,0.08); }
-      .ig-lp-tools { display:none; align-items:center; gap:6px; font-size:10px; color:var(--igls-text-dim,#94a3b8); }
+
+      .ig-lp-tools { display:none; align-items:center; gap:6px; flex-wrap:wrap; font-size:10px; color:var(--igls-text-dim,#96949c); padding:5px 6px; background:rgba(255,255,255,0.03); border:1px solid var(--igls-border, rgba(255,255,255,0.07)); border-radius:6px; }
       .ig-lp.edit .ig-lp-tools { display:flex; }
-      .ig-lp-tools button { background:transparent; border:1px solid var(--igls-border,#334155); color:inherit; border-radius:4px; padding:2px 7px; cursor:pointer; font-size:10px; }
+      .ig-lp-tools > button { background:transparent; border:1px solid var(--igls-border-strong, rgba(255,255,255,0.14)); color:inherit; border-radius:4px; padding:2px 7px; cursor:pointer; font-size:10px; }
+      .ig-lp-tools > button:hover { color:var(--igls-accent,#c9a876); border-color:var(--igls-accent,#c9a876); }
+      .ig-lp-cols { min-width:10px; text-align:center; color:var(--igls-text,#ece9e4); font-weight:600; }
+      .ig-lp-sp { flex:1; }
+
       .ig-lp-grid { display:grid; gap:6px; grid-auto-rows:44px; }
       .ig-lp-tile { position:relative; display:flex; border-radius:8px; overflow:hidden; user-select:none; box-shadow:0 1px 2px rgba(0,0,0,0.3); transition:transform .08s, filter .15s; }
       .ig-lp-tile:active { transform:scale(0.97); }
@@ -11636,11 +12168,14 @@ LegoCore.registerBlock({
       .ig-lp.edit .ig-lp-size { display:block; }
       .ig-lp.edit .ig-lp-tile { cursor:grab; outline:1px dashed rgba(255,255,255,0.35); outline-offset:-1px; }
       .ig-lp.edit .ig-lp-main, .ig-lp.edit .ig-lp-tog { cursor:pointer; }
-      .ig-lp-add { border:1px dashed var(--igls-border,#334155); background:transparent; color:var(--igls-text-dim,#94a3b8); border-radius:8px; cursor:pointer; font-size:16px; display:none; }
-      .ig-lp.edit .ig-lp-add { display:block; }
-      .ig-lp-empty { color:var(--igls-text-dim,#94a3b8); font-size:10px; padding:6px 2px; }
-      .ig-lp-toast { font-size:10px; color:#fbbf24; min-height:0; }
-      .ig-lp-tree { position:fixed; z-index:2147483647; min-width:170px; max-width:280px; max-height:60vh; overflow:auto; background:var(--igls-surface,#111118); border:1px solid var(--igls-border-strong,#475569); border-radius:8px; box-shadow:0 10px 30px rgba(0,0,0,0.6); padding:4px; display:flex; flex-direction:column; gap:2px; font-size:11px; color:var(--igls-text,#e2e8f0); }
+      .ig-lp .ig-lp-tile.editing { outline:2px solid var(--igls-accent,#c9a876) !important; outline-offset:1px !important; }
+      .ig-lp-add { border:1px dashed var(--igls-border-strong, rgba(255,255,255,0.14)); background:transparent; color:var(--igls-text-dim,#96949c); border-radius:8px; cursor:pointer; font-size:16px; }
+      .ig-lp-add:hover { color:var(--igls-accent,#c9a876); border-color:var(--igls-accent,#c9a876); }
+      .ig-lp-empty { color:var(--igls-text-dim,#96949c); font-size:10px; padding:6px 2px; }
+      .ig-lp-toast { font-size:10px; color:#fbbf24; }
+      .ig-lp-toast:empty { display:none; }
+
+      .ig-lp-tree { position:fixed; z-index:2147483647; min-width:170px; max-width:280px; max-height:60vh; overflow:auto; background:var(--igls-surface,#17171d); border:1px solid var(--igls-border-strong, rgba(255,255,255,0.14)); border-radius:8px; box-shadow:0 10px 30px rgba(0,0,0,0.6); padding:4px; display:flex; flex-direction:column; gap:2px; font-size:11px; color:var(--igls-text,#e2e8f0); }
       .ig-lp-tree button { display:flex; align-items:center; gap:6px; background:transparent; border:none; color:inherit; text-align:left; padding:6px 8px; border-radius:5px; cursor:pointer; font:inherit; }
       .ig-lp-tree button:hover { background:rgba(255,255,255,0.08); }
       .ig-lp-tree b { min-width:16px; color:var(--igls-accent,#c9a876); }
@@ -11653,71 +12188,56 @@ LegoCore.registerBlock({
       .ig-lp-pv-empty { font-size:10px; color:#64748b; font-style:italic; }
       .ig-lp-pv-imgs { display:grid; grid-template-columns:repeat(3, 1fr); gap:4px; }
       .ig-lp-pv-imgs img { width:100%; aspect-ratio:1; object-fit:cover; border-radius:4px; background:#1e293b; }
-      .ig-lp-overlay { position:fixed; inset:0; z-index:2147483646; background:rgba(0,0,0,0.5); display:flex; align-items:center; justify-content:center; }
-      .ig-lp-ed { width:320px; max-width:94vw; max-height:88vh; overflow:auto; background:var(--igls-surface,#111118); border:1px solid var(--igls-border-strong,#475569); border-radius:10px; padding:12px; display:flex; flex-direction:column; gap:10px; font-size:11px; color:var(--igls-text,#e2e8f0); box-shadow:0 14px 44px rgba(0,0,0,0.65); }
-      .ig-lp-ed input[type=text], .ig-lp-ed textarea { width:100%; box-sizing:border-box; background:#0f172a; color:#fff; border:1px solid #334155; border-radius:5px; padding:6px; font:inherit; }
+
+      /* ---- Button editor (lives in a floating window) ---- */
+      .ig-lp-ed { display:flex; flex-direction:column; gap:10px; font-size:11px; color:var(--igls-text,#e2e8f0); }
+      .ig-lp-ed input[type=text], .ig-lp-ed textarea { width:100%; box-sizing:border-box; background:#0f172a; color:#fff; border:1px solid #334155; border-radius:5px; padding:6px; font:inherit; outline:none; }
+      .ig-lp-ed input[type=text]:focus, .ig-lp-ed textarea:focus { border-color:var(--igls-accent,#c9a876); }
       .ig-lp-ed textarea { min-height:44px; resize:vertical; }
-      .ig-lp-row { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
-      .ig-lp-lbl { color:var(--igls-text-dim,#94a3b8); font-size:10px; }
+      .ig-lp-ed-hint { font-size:9.5px; color:var(--igls-text-dim,#96949c); margin-top:3px; }
+      .ig-lp-ed-hint:empty { display:none; }
+      .ig-lp-erow { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
+      .ig-lp-lbl { color:var(--igls-text-dim,#96949c); font-size:10px; }
       .ig-lp-sw { width:20px; height:20px; border-radius:50%; border:2px solid transparent; cursor:pointer; padding:0; }
       .ig-lp-sw.on { border-color:#fff; }
       .ig-lp-ed input[type=color] { width:24px; height:22px; border:none; background:transparent; padding:0; cursor:pointer; }
       .ig-lp-seg { display:flex; border:1px solid #334155; border-radius:5px; overflow:hidden; }
-      .ig-lp-seg button { background:transparent; border:none; color:var(--igls-text-dim,#94a3b8); padding:3px 10px; cursor:pointer; font-size:10px; }
+      .ig-lp-seg button { background:transparent; border:none; color:var(--igls-text-dim,#96949c); padding:3px 10px; cursor:pointer; font-size:10px; }
+      .ig-lp-seg button + button { border-left:1px solid #334155; }
       .ig-lp-seg button.on { background:#334155; color:#fff; }
+      .ig-lp-tabsel { background:#0f172a; color:#fff; border:1px solid #334155; border-radius:4px; font-size:10px; padding:2px; max-width:160px; }
+      .ig-lp-slots { display:flex; flex-direction:column; gap:6px; }
       .ig-lp-slot { display:flex; flex-direction:column; gap:4px; background:rgba(255,255,255,0.03); border:1px solid #1e293b; border-radius:6px; padding:6px; }
       .ig-lp-slot-head { display:flex; align-items:center; gap:6px; }
-      .ig-lp-slot-head b { color:var(--igls-accent,#c9a876); min-width:30px; }
+      .ig-lp-slot-head b { color:var(--igls-accent,#c9a876); min-width:14px; }
       .ig-lp-slot-head input { flex:1; }
       .ig-lp-pick { display:flex; align-items:center; gap:6px; background:#0f172a; border:1px solid #334155; border-radius:5px; padding:5px 6px; cursor:pointer; min-height:16px; }
+      .ig-lp-pick:hover { border-color:var(--igls-accent,#c9a876); }
       .ig-lp-pick span { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
       .ig-lp-pick.none span { color:#64748b; }
-      .ig-lp-x { background:transparent; border:none; color:#f43f5e; cursor:pointer; font-size:11px; padding:0 2px; }
+      .ig-lp-x { background:transparent; border:none; color:#f43f5e; cursor:pointer; font-size:11px; padding:0 2px; margin-left:auto; }
+      .ig-lp-results { display:flex; flex-direction:column; gap:4px; }
       .ig-lp-res { display:flex; flex-direction:column; max-height:170px; overflow:auto; border:1px solid #334155; border-radius:5px; }
       .ig-lp-res button { display:flex; gap:6px; align-items:center; background:transparent; border:none; border-bottom:1px solid #1e293b; color:#e2e8f0; text-align:left; padding:5px 6px; cursor:pointer; font:inherit; }
       .ig-lp-res button:hover { background:rgba(255,255,255,0.07); }
       .ig-lp-res span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-      .ig-lp-foot { display:flex; gap:6px; justify-content:space-between; }
+      .ig-lp-foot { display:flex; gap:6px; justify-content:space-between; align-items:center; }
       .ig-lp-btn { background:#1e293b; border:1px solid #475569; color:#fff; border-radius:5px; padding:5px 10px; cursor:pointer; font-size:11px; }
       .ig-lp-btn.go { background:#10b981; border-color:#10b981; }
       .ig-lp-btn.del { background:transparent; border-color:#7f1d1d; color:#f87171; }
-      .ig-lp-btn.ghost { background:transparent; border-style:dashed; color:var(--igls-text-dim,#94a3b8); }
+      .ig-lp-btn.ghost { background:transparent; border-style:dashed; color:var(--igls-text-dim,#96949c); }
+      .ig-lp-ask { display:flex; flex-direction:column; gap:6px; background:rgba(201,168,118,0.12); border:1px solid rgba(201,168,118,0.4); border-radius:6px; padding:8px; }
+      .ig-lp-ask > div { display:flex; gap:6px; flex-wrap:wrap; }
+      /* Only used if the Pop-out block is still v6 */
+      .ig-lp-edwin { position:fixed; z-index:2147483647; width:330px; max-width:94vw; max-height:88vh; overflow:auto; background:var(--igls-surface,#17171d); border:1px solid var(--igls-border-strong, rgba(255,255,255,0.14)); border-radius:12px; padding:10px 12px 12px; box-shadow:0 16px 40px rgba(0,0,0,0.6); box-sizing:border-box; }
+      .ig-lp-edwin-head { display:flex; align-items:center; justify-content:space-between; gap:8px; cursor:grab; margin-bottom:8px; font-weight:600; font-size:11.5px; color:var(--igls-text,#ece9e4); user-select:none; }
+      .ig-lp-edwin-head button { background:transparent; border:none; color:var(--igls-text-dim,#96949c); cursor:pointer; font-size:12px; }
     `;
     document.head.appendChild(style);
 
-    // ---------------- Card ----------------
-    const ui = document.createElement('div');
-    ui.className = 'ig-lp';
-    ui.innerHTML = `
-      <div class="ig-lp-bar">
-        <div class="ig-lp-tabs"></div>
-        <button class="ig-lp-icon ig-lp-gear" title="Edit buttons and tabs">⚙️</button>
-      </div>
-      <div class="ig-lp-tools">
-        <button data-act="add-tab" title="New tab">＋ Tab</button>
-        <button data-act="rename-tab" title="Rename this tab">✏️ Rename</button>
-        <button data-act="del-tab" title="Delete this tab">🗑 Tab</button>
-        <span style="margin-left:auto;">Columns</span>
-        <button data-act="cols-" title="Fewer columns">−</button>
-        <span class="ig-lp-cols"></span>
-        <button data-act="cols+" title="More columns">＋</button>
-      </div>
-      <div class="ig-lp-grid"></div>
-      <div class="ig-lp-toast"></div>
-    `;
-    const tabsEl = ui.querySelector('.ig-lp-tabs');
-    const gridEl = ui.querySelector('.ig-lp-grid');
-    const toastEl = ui.querySelector('.ig-lp-toast');
-    const colsEl = ui.querySelector('.ig-lp-cols');
-    const gearBtn = ui.querySelector('.ig-lp-gear');
-
-    let toastTimer = null;
-    function toast(msg, ms) {
-      toastEl.textContent = msg || '';
-      clearTimeout(toastTimer);
-      if (msg) toastTimer = setTimeout(() => { toastEl.textContent = ''; }, ms || 2200);
-    }
-
+    // ============================================================
+    // Small helpers
+    // ============================================================
     function textColor(tile) { return tile.text === 'dark' ? '#111111' : '#ffffff'; }
     function slotTitle(slot) {
       if (!slot) return '';
@@ -11725,55 +12245,312 @@ LegoCore.registerBlock({
       if (slot.kind === 'custom') return String(slot.text || '').slice(0, 40);
       return slot.title || (slot.step && slot.step.title) || '';
     }
+    function itemName(slot) { // the item's own name (ignores a version's short label)
+      if (!slot || slot.kind === 'custom') return '';
+      return slot.title || (slot.step && slot.step.title) || '';
+    }
+    function tileTitle(tile) { return tile.title || itemName(tile.main) || slotTitle(tile.main) || 'Untitled'; }
+    function floatApi() { return core.floatWindows && typeof core.floatWindows.open === 'function' ? core.floatWindows : null; }
 
-    function render() {
+    function toast(msg, view, ms) {
+      const v = view || mainView;
+      if (!v || !v.toastEl) return;
+      v.toastEl.textContent = msg || '';
+      clearTimeout(v.toastTimer);
+      if (msg) v.toastTimer = setTimeout(() => { v.toastEl.textContent = ''; }, ms || 2200);
+    }
+
+    function miniX(title, fn) {
+      const x = document.createElement('span');
+      x.className = 'ig-lp-xmini';
+      x.textContent = '✕';
+      x.title = title;
+      x.addEventListener('click', e => { e.stopPropagation(); fn(); });
+      return x;
+    }
+    function addPill(title, fn) {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'ig-lp-addpill';
+      b.textContent = '＋';
+      b.title = title;
+      b.onclick = fn;
+      return b;
+    }
+
+    // ============================================================
+    // Views (the side-panel card + every extra window)
+    // ============================================================
+    function createView(win) {
+      const el = document.createElement('div');
+      el.className = 'ig-lp' + (win ? ' is-win' : '');
+      el.innerHTML = `
+        <div class="ig-lp-row ig-lp-row1"><div class="ig-lp-cats"></div></div>
+        <div class="ig-lp-row ig-lp-row2"><div class="ig-lp-subs"></div></div>
+        <div class="ig-lp-tools"></div>
+        <div class="ig-lp-grid"></div>
+        <div class="ig-lp-toast"></div>`;
+      const view = {
+        win: win || null, el, handle: null, toastTimer: null,
+        row1: el.querySelector('.ig-lp-row1'), row2: el.querySelector('.ig-lp-row2'),
+        catsEl: el.querySelector('.ig-lp-cats'), subsEl: el.querySelector('.ig-lp-subs'),
+        toolsEl: el.querySelector('.ig-lp-tools'), gridEl: el.querySelector('.ig-lp-grid'),
+        toastEl: el.querySelector('.ig-lp-toast'), gearBtn: null
+      };
+      if (!win) {
+        const g = document.createElement('button');
+        g.type = 'button';
+        g.className = 'ig-lp-icon ig-lp-gear';
+        g.title = 'Edit buttons and tabs';
+        g.textContent = '⚙️';
+        g.onclick = toggleEdit;
+        view.gearBtn = g;
+      }
+      views.add(view);
+      return view;
+    }
+
+    function renderAll() {
       closeTree();
-      const tab = activeTab();
-      ui.classList.toggle('edit', editMode);
-      gearBtn.classList.toggle('on', editMode);
-      tabsEl.innerHTML = '';
-      state.tabs.forEach(t => {
-        const b = document.createElement('button');
-        b.className = 'ig-lp-tab' + (t.id === tab.id ? ' on' : '');
-        b.textContent = t.name;
-        b.title = editMode ? 'Double-click to rename' : t.name;
-        b.onclick = () => { if (state.activeTab === t.id) return; state.activeTab = t.id; save(); render(); };
-        b.ondblclick = () => { if (editMode) renameTab(t); };
-        tabsEl.appendChild(b);
-      });
-      colsEl.textContent = String(tab.cols);
-      gridEl.style.gridTemplateColumns = `repeat(${tab.cols}, minmax(0, 1fr))`;
-      gridEl.innerHTML = '';
-      tab.tiles.forEach(tile => gridEl.appendChild(tileEl(tile, tab)));
-      if (!tab.tiles.length && !editMode) {
+      views.forEach(renderView);
+    }
+
+    function renderView(view) {
+      const { cat, sub } = viewSel(view);
+      const lock = view.win ? (view.win.lock || 'none') : 'none';
+      view.el.classList.toggle('edit', editMode);
+      if (view.gearBtn) view.gearBtn.classList.toggle('on', editMode);
+      if (view.handle && view.handle.buttons && view.handle.buttons[0]) view.handle.buttons[0].classList.toggle('on', editMode);
+
+      const showCats = editMode || (lock === 'none' && state.cats.length > 1);
+      const showSubs = editMode || (lock !== 'sub' && cat.subs.length > 1);
+
+      // Row 1 — categories
+      view.catsEl.innerHTML = '';
+      if (showCats) {
+        state.cats.forEach(c => {
+          const b = document.createElement('button');
+          b.type = 'button';
+          b.className = 'ig-lp-cat' + (c.id === cat.id ? ' on' : '');
+          b.appendChild(document.createTextNode(c.name));
+          b.title = editMode ? 'Double-click to rename · drag to reorder' : c.name;
+          b.onclick = () => { if (c.id !== cat.id) selectCat(view, c.id); };
+          if (editMode) {
+            b.ondblclick = () => renameCat(c);
+            if (c.id === cat.id && state.cats.length > 1) b.appendChild(miniX('Delete this category', () => deleteCat(c)));
+            pillDrag(b, 'cat', c.id, null);
+          }
+          view.catsEl.appendChild(b);
+        });
+        if (editMode) view.catsEl.appendChild(addPill('New category', () => addCat(view)));
+      }
+
+      // Row 2 — sub-tabs
+      view.subsEl.innerHTML = '';
+      if (showSubs) {
+        cat.subs.forEach(s => {
+          const b = document.createElement('button');
+          b.type = 'button';
+          b.className = 'ig-lp-sub' + (s.id === sub.id ? ' on' : '');
+          b.appendChild(document.createTextNode(s.name));
+          b.title = editMode ? 'Double-click to rename · drag to reorder · drop a button here to move it' : s.name;
+          b.onclick = () => { if (s.id !== sub.id) selectSub(view, cat, s.id); };
+          if (editMode) {
+            b.ondblclick = () => renameSub(s);
+            if (s.id === sub.id && cat.subs.length > 1) b.appendChild(miniX('Delete this sub-tab', () => deleteSub(cat, s)));
+            pillDrag(b, 'sub', s.id, cat);
+          }
+          view.subsEl.appendChild(b);
+        });
+        if (editMode) view.subsEl.appendChild(addPill('New sub-tab', () => addSub(view, cat)));
+      }
+
+      // ⚙️ (side-panel card) sits in the top-most visible row
+      if (view.gearBtn) {
+        const host = showCats ? view.row1 : showSubs ? view.row2 : view.row1;
+        if (view.gearBtn.parentNode !== host) host.appendChild(view.gearBtn);
+      }
+      view.catsEl.style.display = showCats ? '' : 'none';
+      view.row1.style.display = (showCats || (view.gearBtn && view.gearBtn.parentNode === view.row1)) ? '' : 'none';
+      view.row2.style.display = (showSubs || (view.gearBtn && view.gearBtn.parentNode === view.row2)) ? '' : 'none';
+
+      renderTools(view, sub);
+      renderGrid(view, sub);
+
+      if (view.handle) {
+        view.handle.setTitle(`🚀 ${state.cats.length > 1 ? cat.name + ' › ' : ''}${sub.name}`);
+        view.handle.setLabel(cat.subs.length > 1 || state.cats.length === 1 ? sub.name : cat.name);
+      }
+    }
+
+    function renderTools(view, sub) {
+      const t = view.toolsEl;
+      if (!editMode) { t.innerHTML = ''; t.onclick = null; return; }
+      const lock = view.win ? (view.win.lock || 'none') : null;
+      t.innerHTML = `
+        <span>Columns</span>
+        <button type="button" data-a="cols-" title="Fewer columns">−</button>
+        <span class="ig-lp-cols">${sub.cols}</span>
+        <button type="button" data-a="cols+" title="More columns">＋</button>
+        <span class="ig-lp-sp"></span>
+        ${lock ? `<span>Show</span><div class="ig-lp-seg" title="What this window shows when ⚙️ is off">
+          <button type="button" data-lock="none" class="${lock === 'none' ? 'on' : ''}">All</button>
+          <button type="button" data-lock="cat" class="${lock === 'cat' ? 'on' : ''}">Category</button>
+          <button type="button" data-lock="sub" class="${lock === 'sub' ? 'on' : ''}">Tab</button>
+        </div>` : ''}
+        <button type="button" data-a="win" title="Open another Launchpad window">⧉ Window</button>`;
+      t.onclick = e => {
+        const b = e.target.closest('button');
+        if (!b) return;
+        if (b.dataset.lock && view.win) { view.win.lock = b.dataset.lock; save(); renderAll(); return; }
+        const a = b.dataset.a;
+        if (a === 'cols-' || a === 'cols+') { sub.cols = clamp(sub.cols + (a === 'cols+' ? 1 : -1), 2, 6); save(); renderAll(); }
+        else if (a === 'win') newWindow(view);
+      };
+    }
+
+    function renderGrid(view, sub) {
+      const g = view.gridEl;
+      g.style.gridTemplateColumns = `repeat(${sub.cols}, minmax(0, 1fr))`;
+      g.innerHTML = '';
+      sub.tiles.forEach(tile => g.appendChild(tileEl(tile, sub, view)));
+      if (!sub.tiles.length && !editMode) {
         const e = document.createElement('div');
         e.className = 'ig-lp-empty';
         e.style.gridColumn = '1 / -1';
         e.textContent = 'No buttons yet — press ⚙️ to add some.';
-        gridEl.appendChild(e);
+        g.appendChild(e);
       }
-      const add = document.createElement('button');
-      add.className = 'ig-lp-add';
-      add.textContent = '＋';
-      add.title = 'New button';
-      add.onclick = () => {
-        const tile = { id: uid('tile'), title: 'New button', color: COLORS[(tab.tiles.length + 1) % COLORS.length], text: 'light', w: 1, h: 1, main: null, alts: [] };
-        tab.tiles.push(tile); save(); render(); openEditor(tile.id);
-      };
-      gridEl.appendChild(add);
+      if (editMode) {
+        const add = document.createElement('button');
+        add.type = 'button';
+        add.className = 'ig-lp-add';
+        add.textContent = '＋';
+        add.title = 'New button';
+        add.onclick = () => openEditor(null, { newIn: sub.id });
+        g.appendChild(add);
+      }
     }
 
-    function tileEl(tile, tab) {
+    // ============================================================
+    // Selecting, adding, renaming, deleting, reordering
+    // ============================================================
+    function selectCat(view, catId) {
+      const cat = findCat(catId);
+      if (!cat) return;
+      if (view.win) { view.win.cat = cat.id; view.win.sub = cat.activeSub; }
+      else state.activeCat = cat.id;
+      save(); renderAll();
+    }
+    function selectSub(view, cat, subId) {
+      if (view.win) { view.win.cat = cat.id; view.win.sub = subId; }
+      else { state.activeCat = cat.id; cat.activeSub = subId; }
+      save(); renderAll();
+    }
+    function addCat(view) {
+      const name = prompt('New category name (e.g. a course):', '');
+      if (name === null || !name.trim()) return;
+      const c = newCat(name.trim());
+      state.cats.push(c);
+      selectCat(view, c.id);
+    }
+    function addSub(view, cat) {
+      const name = prompt(`New sub-tab in "${cat.name}":`, '');
+      if (name === null || !name.trim()) return;
+      const s = newSub(name.trim());
+      cat.subs.push(s);
+      selectSub(view, cat, s.id);
+    }
+    function renameCat(c) {
+      const name = prompt('Category name:', c.name);
+      if (name === null || !name.trim()) return;
+      c.name = name.trim(); save(); renderAll();
+    }
+    function renameSub(s) {
+      const name = prompt('Sub-tab name:', s.name);
+      if (name === null || !name.trim()) return;
+      s.name = name.trim(); save(); renderAll();
+    }
+    function deleteCat(c) {
+      if (state.cats.length <= 1) return toast('You need at least one category.');
+      const n = c.subs.reduce((a, s) => a + s.tiles.length, 0);
+      if (!confirm(`Delete the category "${c.name}", its ${c.subs.length} sub-tab(s) and ${n} button(s)?`)) return;
+      const i = state.cats.indexOf(c);
+      state.cats.splice(i, 1);
+      if (state.activeCat === c.id) state.activeCat = state.cats[Math.max(0, i - 1)].id;
+      save(); renderAll();
+    }
+    function deleteSub(cat, s) {
+      if (cat.subs.length <= 1) return toast('A category needs at least one sub-tab.');
+      if (!confirm(`Delete the sub-tab "${s.name}" and its ${s.tiles.length} button(s)?`)) return;
+      const i = cat.subs.indexOf(s);
+      cat.subs.splice(i, 1);
+      if (cat.activeSub === s.id) cat.activeSub = cat.subs[Math.max(0, i - 1)].id;
+      save(); renderAll();
+    }
+    function moveTileToSub(tileId, subId) {
+      const f = findTile(tileId);
+      const dest = findSub(subId);
+      if (!f || !dest || f.sub.id === dest.sub.id) return;
+      f.sub.tiles.splice(f.sub.tiles.indexOf(f.tile), 1);
+      dest.sub.tiles.push(f.tile);
+      save(); renderAll();
+    }
+    function reorderList(list, fromId, toId, after) {
+      const fi = list.findIndex(x => x.id === fromId);
+      if (fi < 0 || !list.some(x => x.id === toId)) return false;
+      const [m] = list.splice(fi, 1);
+      const ti = list.findIndex(x => x.id === toId);
+      list.splice(after ? ti + 1 : ti, 0, m);
+      return true;
+    }
+
+    let dragId = null, resizing = false, pillDragState = null;
+    function clearDrops() { document.querySelectorAll('.ig-lp .drop').forEach(x => x.classList.remove('drop')); }
+
+    function pillDrag(b, type, id, cat) {
+      b.draggable = true;
+      b.addEventListener('dragstart', e => {
+        pillDragState = { type, id };
+        try { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', id); } catch (_) { /* noop */ }
+        b.classList.add('dragging');
+      });
+      b.addEventListener('dragend', () => { pillDragState = null; b.classList.remove('dragging'); clearDrops(); });
+      b.addEventListener('dragover', e => {
+        const tileDrop = type === 'sub' && !!dragId;
+        const pillDrop = !!pillDragState && pillDragState.type === type && pillDragState.id !== id;
+        if (!tileDrop && !pillDrop) return;
+        e.preventDefault();
+        b.classList.add('drop');
+      });
+      b.addEventListener('dragleave', () => b.classList.remove('drop'));
+      b.addEventListener('drop', e => {
+        e.preventDefault();
+        b.classList.remove('drop');
+        if (type === 'sub' && dragId) { const t = dragId; dragId = null; moveTileToSub(t, id); return; }
+        if (!pillDragState || pillDragState.type !== type || pillDragState.id === id) return;
+        const from = pillDragState.id;
+        pillDragState = null;
+        const r = b.getBoundingClientRect();
+        const after = (e.clientX - r.left) > r.width / 2;
+        if (reorderList(type === 'cat' ? state.cats : cat.subs, from, id, after)) { save(); renderAll(); }
+      });
+    }
+
+    // ============================================================
+    // Buttons (tiles)
+    // ============================================================
+    function tileEl(tile, sub, view) {
       const el = document.createElement('div');
-      el.className = 'ig-lp-tile' + (tile.text === 'dark' ? ' dark' : '');
+      el.className = 'ig-lp-tile' + (tile.text === 'dark' ? ' dark' : '') + (editor && editor.tileId === tile.id ? ' editing' : '');
       el.dataset.id = tile.id;
       el.style.background = tile.color || COLORS[0];
       el.style.color = textColor(tile);
-      el.style.gridColumn = `span ${clamp(tile.w || 1, 1, tab.cols)}`;
+      el.style.gridColumn = `span ${clamp(tile.w || 1, 1, sub.cols)}`;
       el.style.gridRow = `span ${clamp(tile.h || 1, 1, 4)}`;
       const alts = (tile.alts || []).filter(Boolean);
-      el.innerHTML = `<button class="ig-lp-main" title="${esc(slotTitle(tile.main) || tile.title)}">${esc(tile.title || 'Untitled')}</button>` +
-        (alts.length ? `<button class="ig-lp-tog" title="${alts.length} other version(s)">▾</button>` : '') +
+      el.innerHTML = `<button type="button" class="ig-lp-main">${esc(tileTitle(tile))}</button>` +
+        (alts.length ? `<button type="button" class="ig-lp-tog" title="${alts.length} other version(s)">▾</button>` : '') +
         `<div class="ig-lp-size" title="Drag to resize"></div>`;
 
       const mainBtn = el.querySelector('.ig-lp-main');
@@ -11781,9 +12558,8 @@ LegoCore.registerBlock({
         e.stopPropagation();
         hidePreview();
         if (editMode) return openEditor(tile.id);
-        sendSlot(tile.main, el);
+        sendSlot(tile.main, el, view);
       };
-      mainBtn.removeAttribute('title');           // the preview replaces the plain tooltip
       attachPreview(mainBtn, () => tile.main, () => el);
       const tog = el.querySelector('.ig-lp-tog');
       if (tog) tog.onclick = e => {
@@ -11791,29 +12567,30 @@ LegoCore.registerBlock({
         if (editMode) return openEditor(tile.id);
         hidePreview();
         if (treeEl && treeEl.dataset.tile === tile.id) return closeTree();
-        openTree(tile, el);
+        openTree(tile, el, view);
       };
 
-      // Edit mode: drag to reorder
+      // Edit mode: drag to reorder (or onto a sub-tab to move it)
       el.draggable = editMode;
       el.ondragstart = e => {
         if (!editMode || resizing) { e.preventDefault(); return; }
         dragId = tile.id; el.classList.add('dragging');
         try { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', tile.id); } catch (_) { /* noop */ }
       };
-      el.ondragend = () => { dragId = null; el.classList.remove('dragging'); gridEl.querySelectorAll('.drop').forEach(x => x.classList.remove('drop')); };
+      el.ondragend = () => { dragId = null; el.classList.remove('dragging'); clearDrops(); };
       el.ondragover = e => { if (!dragId || dragId === tile.id) return; e.preventDefault(); el.classList.add('drop'); };
       el.ondragleave = () => el.classList.remove('drop');
       el.ondrop = e => {
         e.preventDefault(); el.classList.remove('drop');
         if (!dragId || dragId === tile.id) return;
-        const from = tab.tiles.findIndex(t => t.id === dragId);
-        const [moved] = tab.tiles.splice(from, 1);
-        const to = tab.tiles.findIndex(t => t.id === tile.id);
+        const f = findTile(dragId);
+        if (!f) { dragId = null; return; }
+        f.sub.tiles.splice(f.sub.tiles.indexOf(f.tile), 1);  // may come from another sub-tab/window
+        const to = sub.tiles.findIndex(t => t.id === tile.id);
         const r = el.getBoundingClientRect();
         const after = (e.clientX - r.left) > r.width / 2;
-        tab.tiles.splice(after ? to + 1 : to, 0, moved);
-        dragId = null; save(); render();
+        sub.tiles.splice(after ? to + 1 : to, 0, f.tile);
+        dragId = null; save(); renderAll();
       };
 
       // Edit mode: drag the corner to resize (snaps to the grid)
@@ -11822,11 +12599,11 @@ LegoCore.registerBlock({
         e.preventDefault(); e.stopPropagation();
         resizing = true;
         const gap = 6;
-        const cellW = (gridEl.clientWidth - gap * (tab.cols - 1)) / tab.cols + gap;
+        const cellW = (view.gridEl.clientWidth - gap * (sub.cols - 1)) / sub.cols + gap;
         const cellH = 44 + gap;
         const startX = e.clientX, startY = e.clientY, w0 = tile.w || 1, h0 = tile.h || 1;
         const move = ev => {
-          const w = clamp(w0 + Math.round((ev.clientX - startX) / cellW), 1, tab.cols);
+          const w = clamp(w0 + Math.round((ev.clientX - startX) / cellW), 1, sub.cols);
           const h = clamp(h0 + Math.round((ev.clientY - startY) / cellH), 1, 4);
           if (w !== tile.w || h !== tile.h) {
             tile.w = w; tile.h = h;
@@ -11836,16 +12613,22 @@ LegoCore.registerBlock({
         const up = () => {
           document.removeEventListener('mousemove', move);
           document.removeEventListener('mouseup', up);
-          resizing = false; save();
+          resizing = false; save(); renderAll();
         };
         document.addEventListener('mousemove', move);
         document.addEventListener('mouseup', up);
       };
       return el;
     }
-    let dragId = null, resizing = false;
 
-    // ---------------- Tree (versions A, B, C…) ----------------
+    function markEditing() {
+      const id = editor && editor.tileId;
+      document.querySelectorAll('.ig-lp-tile').forEach(t => t.classList.toggle('editing', !!id && t.dataset.id === id));
+    }
+
+    // ============================================================
+    // Tree (versions A, B, C…)
+    // ============================================================
     let treeEl = null;
     function closeTree() {
       hidePreview();
@@ -11856,19 +12639,19 @@ LegoCore.registerBlock({
     }
     function onOutside(e) { if (treeEl && !treeEl.contains(e.target) && !e.target.closest('.ig-lp-tog')) closeTree(); }
     function onTreeKey(e) { if (e.key === 'Escape') { e.stopPropagation(); closeTree(); } }
-    function openTree(tile, anchor) {
+    function openTree(tile, anchor, view) {
       closeTree();
       treeEl = document.createElement('div');
       treeEl.className = 'ig-lp-tree';
       treeEl.dataset.tile = tile.id;
-      const rows = [{ letter: 'A', main: true, slot: tile.main }].concat((tile.alts || []).filter(Boolean).map((s, i) => ({ letter: LETTERS[i + 1] || '·', slot: s })));
+      const rows = [{ letter: 'A', main: true, slot: tile.main }]
+        .concat((tile.alts || []).filter(Boolean).map((s, i) => ({ letter: LETTERS[i + 1] || '·', slot: s })));
       rows.forEach(r => {
         const b = document.createElement('button');
+        b.type = 'button';
         const kind = r.slot ? r.slot.kind : null;
         b.innerHTML = `<b>${esc(r.letter)}</b><span>${kind ? ICON[kind] + ' ' : ''}${esc(slotTitle(r.slot) || (r.main ? 'Main (empty)' : '(empty)'))}</span>`;
-        b.title = r.main ? 'A — main message' : 'Version ' + r.letter;
-        b.removeAttribute('title');
-        b.onclick = () => { hidePreview(); closeTree(); sendSlot(r.slot, anchor); };
+        b.onclick = () => { hidePreview(); closeTree(); sendSlot(r.slot, anchor, view); };
         attachPreview(b, () => r.slot, () => treeEl || anchor);
         treeEl.appendChild(b);
       });
@@ -11884,7 +12667,9 @@ LegoCore.registerBlock({
       document.addEventListener('keydown', onTreeKey, true);
     }
 
-    // ---------------- Hover preview (like the Commands search) ----------------
+    // ============================================================
+    // Hover preview (like the Commands search)
+    // ============================================================
     let previewEl = null, hoverTimer = null, hoverToken = 0;
     function attachPreview(target, getSlot, getAnchor) {
       target.addEventListener('mouseenter', () => {
@@ -11953,8 +12738,8 @@ LegoCore.registerBlock({
       const a = anchor.getBoundingClientRect();
       const p = previewEl.getBoundingClientRect();
       const gap = 8;
-      let left = a.right + gap;                                   // to the right of the button…
-      if (left + p.width > window.innerWidth - 6) left = a.left - p.width - gap;  // …or to the left
+      let left = a.right + gap;
+      if (left + p.width > window.innerWidth - 6) left = a.left - p.width - gap;
       if (left < 6) left = 6;
       let top = a.top;
       if (top + p.height > window.innerHeight - 6) top = Math.max(6, window.innerHeight - p.height - 6);
@@ -11962,7 +12747,9 @@ LegoCore.registerBlock({
       previewEl.style.top = top + 'px';
     }
 
-    // ---------------- Sending (through the Core) ----------------
+    // ============================================================
+    // Sending (through the Core)
+    // ============================================================
     function flashTile(el, ok) {
       if (!el) return;
       el.classList.remove('ok', 'bad');
@@ -11988,19 +12775,19 @@ LegoCore.registerBlock({
       return same.length === 1 ? same[0] : null;
     }
     let sending = false;
-    async function sendSlot(slot, el) {
+    async function sendSlot(slot, el, view) {
       if (sending) return;
-      if (!slot) { flashTile(el, false); return toast('This button has no message yet — ⚙️ to set it.'); }
+      if (!slot) { flashTile(el, false); return toast('This button has no message yet — ⚙️ to set it.', view); }
       if (slot.kind === 'sequence') {
         const seq = findSequence(slot);
-        if (!seq) { flashTile(el, false); return toast('⚠️ Sequence not found: ' + (slot.title || '')); }
+        if (!seq) { flashTile(el, false); return toast('⚠️ Sequence not found: ' + (slot.title || ''), view); }
         const ok = core.setActiveSequence(seq);
         flashTile(el, ok);
-        if (!ok) toast('⚠️ That sequence is empty');
+        if (!ok) toast('⚠️ That sequence is empty', view);
         return;
       }
       const zone = core.getActiveChatZone();
-      if (!zone) { flashTile(el, false); return toast('⚠️ Open an Instagram chat first'); }
+      if (!zone) { flashTile(el, false); return toast('⚠️ Open an Instagram chat first', view); }
       sending = true;
       try {
         let ok = false, kind = slot.kind;
@@ -12008,7 +12795,7 @@ LegoCore.registerBlock({
           ok = core.injectTextToChat(slot.text || '', { silent: true });
         } else {
           const payload = slot.step ? await core.fetchStepData(slot.step) : null;
-          if (!payload) { flashTile(el, false); return toast('⚠️ Not found anymore: ' + slotTitle(slot)); }
+          if (!payload) { flashTile(el, false); return toast('⚠️ Not found anymore: ' + slotTitle(slot), view); }
           kind = payload.kind;
           if (kind === 'audio') ok = core.injectClipToChat(payload.blob, payload.name, { silent: true });
           else if (kind === 'set') ok = core.injectImageSetToChat(payload.images, { silent: true });
@@ -12016,251 +12803,513 @@ LegoCore.registerBlock({
           if (ok && core.markUsed) core.markUsed(kind, payload.id);
         }
         flashTile(el, ok);
-        if (!ok) toast('⚠️ Chat box not found');
+        if (!ok) toast('⚠️ Chat box not found', view);
         else if (kind !== 'text' && kind !== 'custom') setTimeout(() => focusComposer(core.getActiveChatZone()), 60);
       } catch (e) {
         console.error('[Launchpad] send error:', e);
-        flashTile(el, false); toast('⚠️ Could not send');
+        flashTile(el, false); toast('⚠️ Could not send', view);
       } finally {
         sending = false;
       }
     }
 
-    // ---------------- Tabs ----------------
-    function renameTab(t) {
-      const name = prompt('Tab name:', t.name);
-      if (name === null || !name.trim()) return;
-      t.name = name.trim(); save(); render();
+    // ============================================================
+    // Edit mode
+    // ============================================================
+    function toggleEdit() {
+      editMode = !editMode;
+      hidePreview();
+      renderAll();
     }
-    ui.querySelector('.ig-lp-tools').onclick = e => {
-      const b = e.target.closest('button[data-act]');
-      if (!b) return;
-      const tab = activeTab();
-      const act = b.dataset.act;
-      if (act === 'add-tab') {
-        const name = prompt('New tab name (e.g. a course):', 'New tab');
-        if (name === null || !name.trim()) return;
-        const t = { id: uid('tab'), name: name.trim(), cols: tab.cols || 3, tiles: [] };
-        state.tabs.push(t); state.activeTab = t.id; save(); render();
-      } else if (act === 'rename-tab') {
-        renameTab(tab);
-      } else if (act === 'del-tab') {
-        if (state.tabs.length === 1) return toast('You need at least one tab.');
-        if (!confirm(`Delete the tab "${tab.name}" and its ${tab.tiles.length} button(s)?`)) return;
-        const i = state.tabs.indexOf(tab);
-        state.tabs.splice(i, 1);
-        state.activeTab = state.tabs[Math.max(0, i - 1)].id;
-        save(); render();
-      } else if (act === 'cols-' || act === 'cols+') {
-        tab.cols = clamp(tab.cols + (act === 'cols+' ? 1 : -1), 2, 6);
-        save(); render();
-      }
-    };
-    gearBtn.onclick = () => { editMode = !editMode; hidePreview(); render(); };
 
-    // ---------------- Button editor ----------------
-    function openEditor(tileId) {
-      const found = findTile(tileId);
-      if (!found) return;
-      closeTree();
-      const orig = found.tile;
-      const draft = JSON.parse(JSON.stringify(orig));
-      draft.alts = (draft.alts || []).filter(Boolean);
-      let draftTabId = found.tab.id;
+    // ============================================================
+    // Extra windows
+    // ============================================================
+    function newWindow(fromView) {
+      if (!floatApi()) return toast('⚠️ Needs the Menu Card Pop-out block v7', fromView);
+      const { cat, sub } = viewSel(fromView);
+      const win = { id: uid('win'), cat: cat.id, sub: sub.id, lock: 'none' };
+      state.windows.push(win);
+      save();
+      openWinView(win, state.windows.length);
+    }
 
-      const overlay = document.createElement('div');
-      overlay.className = 'ig-lp-overlay';
-      const box = document.createElement('div');
-      box.className = 'ig-lp-ed';
-      overlay.appendChild(box);
-      document.body.appendChild(overlay);
-      const close = () => { overlay.remove(); document.removeEventListener('keydown', onKey, true); };
-      const onKey = e => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
-      document.addEventListener('keydown', onKey, true);
-      overlay.onmousedown = e => { if (e.target === overlay) close(); };
+    function openWinView(win, n) {
+      const api = floatApi();
+      if (!api) return;
+      const k = Math.max(0, (n || 1) - 1) % 8;
+      const view = createView(win);
+      view.handle = api.open({
+        key: 'launchpad~' + win.id,
+        title: '🚀 Launchpad',
+        icon: '🚀',
+        label: 'Launchpad',
+        content: view.el,
+        defaults: { width: 300, left: 140 + k * 26, top: 110 + k * 26 },
+        buttons: [{ text: '⚙️', title: 'Edit buttons and tabs', onClick: () => toggleEdit() }],
+        onClose: () => closeWindow(win.id)
+      });
+      if (!view.handle) { views.delete(view); return; }
+      renderView(view);
+    }
 
-      function paint() {
-        box.innerHTML = `
-          <input type="text" class="ig-lp-title" placeholder="Button title" value="${esc(draft.title || '')}">
-          <div class="ig-lp-row ig-lp-colors"><span class="ig-lp-lbl">Color</span></div>
-          <div class="ig-lp-row"><span class="ig-lp-lbl">Text</span>
-            <div class="ig-lp-seg"><button data-t="light" class="${draft.text !== 'dark' ? 'on' : ''}">White</button><button data-t="dark" class="${draft.text === 'dark' ? 'on' : ''}">Black</button></div>
-            ${state.tabs.length > 1 ? `<span class="ig-lp-lbl" style="margin-left:auto;">Tab</span><select class="ig-lp-tabsel" style="background:#0f172a;color:#fff;border:1px solid #334155;border-radius:4px;font-size:10px;padding:2px;">${state.tabs.map(t => `<option value="${esc(t.id)}" ${t.id === draftTabId ? 'selected' : ''}>${esc(t.name)}</option>`).join('')}</select>` : ''}
-          </div>
-          <div class="ig-lp-slots"></div>
-          <button class="ig-lp-btn ghost ig-lp-addalt">＋ Add version ${LETTERS[draft.alts.length + 1] || ''}</button>
-          <div class="ig-lp-foot">
-            <button class="ig-lp-btn del ig-lp-del">🗑 Delete</button>
-            <div style="display:flex;gap:6px;"><button class="ig-lp-btn ig-lp-cancel">Cancel</button><button class="ig-lp-btn go ig-lp-save">Save</button></div>
-          </div>`;
-        const titleIn = box.querySelector('.ig-lp-title');
-        titleIn.oninput = () => { draft.title = titleIn.value; };
-
-        const colorsRow = box.querySelector('.ig-lp-colors');
-        COLORS.forEach(c => {
-          const sw = document.createElement('button');
-          sw.className = 'ig-lp-sw' + (norm(draft.color) === norm(c) ? ' on' : '');
-          sw.style.background = c; sw.title = c;
-          sw.onclick = () => { draft.color = c; paint(); };
-          colorsRow.appendChild(sw);
-        });
-        const custom = document.createElement('input');
-        custom.type = 'color'; custom.title = 'Any color';
-        custom.value = /^#[0-9a-f]{6}$/i.test(draft.color || '') ? draft.color : '#334155';
-        custom.onchange = () => { draft.color = custom.value; paint(); };
-        colorsRow.appendChild(custom);
-
-        box.querySelectorAll('.ig-lp-seg button').forEach(b => { b.onclick = () => { draft.text = b.dataset.t; paint(); }; });
-        const tabSel = box.querySelector('.ig-lp-tabsel');
-        if (tabSel) tabSel.onchange = () => { draftTabId = tabSel.value; };
-
-        const slotsEl = box.querySelector('.ig-lp-slots');
-        slotsEl.style.cssText = 'display:flex;flex-direction:column;gap:6px;';
-        slotsEl.appendChild(slotEditor('A', draft.main, s => { draft.main = s; }, null, true));
-        draft.alts.forEach((s, i) => {
-          slotsEl.appendChild(slotEditor(LETTERS[i + 1] || '·', s, ns => { draft.alts[i] = ns; }, () => { draft.alts.splice(i, 1); paint(); }));
-        });
-
-        box.querySelector('.ig-lp-addalt').onclick = () => { draft.alts.push({ kind: 'custom', text: '' }); paint(); };
-        box.querySelector('.ig-lp-cancel').onclick = close;
-        box.querySelector('.ig-lp-del').onclick = () => {
-          if (!confirm(`Delete the button "${orig.title}"?`)) return;
-          const f = findTile(orig.id);
-          if (f) f.tab.tiles.splice(f.tab.tiles.indexOf(f.tile), 1);
-          save(); close(); render();
-        };
-        box.querySelector('.ig-lp-save').onclick = () => {
-          const f = findTile(orig.id);
-          if (!f) return close();
-          const cleanSlot = s => (!s ? null : (s.kind === 'custom' && !String(s.text || '').trim()) ? null : s);
-          const updated = Object.assign(f.tile, draft, {
-            title: String(draft.title || '').trim() || 'Untitled',
-            main: cleanSlot(draft.main),
-            alts: draft.alts.map(cleanSlot).filter(Boolean)
-          });
-          if (draftTabId !== f.tab.id) {
-            const dest = state.tabs.find(t => t.id === draftTabId);
-            if (dest) { f.tab.tiles.splice(f.tab.tiles.indexOf(updated), 1); dest.tiles.push(updated); }
-          }
-          save(); close(); render();
-        };
-        titleIn.focus();
-      }
-
-      // One message slot: label + what it sends (pick from the library, or type text)
-      function slotEditor(letter, slot, setSlot, onRemove, isMain) {
-        const wrap = document.createElement('div');
-        wrap.className = 'ig-lp-slot';
-        wrap.innerHTML = `
-          <div class="ig-lp-slot-head"><b>${esc(letter)}</b>${isMain ? '<span class="ig-lp-lbl">main · sent by clicking the button</span>' : ''}
-            ${isMain ? '' : `<input type="text" class="ig-lp-slot-label" placeholder="Short name (optional)" value="${esc((slot && slot.label) || '')}">`}
-            ${onRemove ? '<button class="ig-lp-x" title="Remove this version">✕</button>' : ''}
-          </div>
-          <div class="ig-lp-pick ${slot && slot.kind !== 'custom' ? '' : 'none'}" title="Pick from your library"><span></span>🔍</div>
-          <textarea class="ig-lp-custom" placeholder="…or type the text to send"></textarea>
-          <div class="ig-lp-results" style="display:none;"></div>`;
-        const pick = wrap.querySelector('.ig-lp-pick');
-        const pickTxt = pick.querySelector('span');
-        const custom = wrap.querySelector('.ig-lp-custom');
-        const results = wrap.querySelector('.ig-lp-results');
-        const labelIn = wrap.querySelector('.ig-lp-slot-label');
-        let current = slot ? Object.assign({}, slot) : null;
-        const commit = () => setSlot(current);
-
-        function show() {
-          if (current && current.kind !== 'custom') {
-            pick.classList.remove('none');
-            pickTxt.textContent = `${ICON[current.kind] || ''} ${current.title || (current.step && current.step.title) || ''}`;
-            custom.style.display = 'none';
-          } else {
-            pick.classList.add('none');
-            pickTxt.textContent = 'Pick text, audio, image set or sequence…';
-            custom.style.display = '';
-            custom.value = (current && current.text) || '';
-          }
+    function closeWindow(id) {
+      state.windows = state.windows.filter(w => w.id !== id);
+      save();
+      Array.from(views).forEach(v => {
+        if (v.win && v.win.id === id) {
+          views.delete(v);
+          if (v.handle) v.handle.close({ forget: true });
         }
-        show();
-
-        if (labelIn) labelIn.oninput = () => {
-          current = current || { kind: 'custom', text: '' };
-          current.label = labelIn.value.trim() || undefined;
-          commit();
-        };
-        custom.oninput = () => {
-          const label = current && current.label;
-          current = { kind: 'custom', text: custom.value };
-          if (label) current.label = label;
-          commit();
-        };
-        const rm = wrap.querySelector('.ig-lp-x');
-        if (rm) rm.onclick = onRemove;
-
-        pick.onclick = () => {
-          if (results.style.display !== 'none') { results.style.display = 'none'; return; }
-          results.style.display = 'flex';
-          results.style.cssText = 'display:flex;flex-direction:column;gap:4px;';
-          results.innerHTML = `<input type="text" placeholder="Search… (audio / text / set / seq + name)"><div class="ig-lp-res"></div>
-            ${current && current.kind !== 'custom' ? '<button class="ig-lp-btn ghost ig-lp-clear" style="font-size:10px;">✍️ Type text instead</button>' : ''}`;
-          const q = results.querySelector('input');
-          const list = results.querySelector('.ig-lp-res');
-          const clearBtn = results.querySelector('.ig-lp-clear');
-          if (clearBtn) clearBtn.onclick = () => {
-            const label = current && current.label;
-            current = { kind: 'custom', text: '' };
-            if (label) current.label = label;
-            commit(); results.style.display = 'none'; show();
-          };
-          let token = 0;
-          const run = async () => {
-            const my = ++token;
-            const parsed = core.parseSearchPrefix(q.value);
-            let found = [];
-            try { found = await core.searchInventory(parsed.q, parsed.mode, { kinds: KINDS, limit: 12 }); } catch (e) { found = []; }
-            if (my !== token) return;
-            list.innerHTML = '';
-            if (!found.length) { list.innerHTML = '<div style="padding:6px;color:#64748b;">Nothing found.</div>'; return; }
-            found.forEach(m => {
-              const b = document.createElement('button');
-              const name = m.kind === 'audio' ? m.item.name : m.kind === 'sequence' ? m.item.name : m.item.title;
-              const extra = m.kind === 'audio' ? (m.item.folder || '') : m.kind === 'set' ? `${(m.item.images || []).length} img` : m.kind === 'sequence' ? `${(m.item.steps || []).length} steps` : '';
-              b.innerHTML = `<span>${ICON[m.kind]}</span><span style="flex:1;">${esc(name || '(untitled)')}</span><span style="opacity:.5;font-size:9px;">${esc(extra)}</span>`;
-              b.onclick = () => {
-                const label = current && current.label;
-                if (m.kind === 'sequence') current = { kind: 'sequence', ref: m.item.id, title: m.item.name || 'Sequence' };
-                else {
-                  const step = core.makeStep(m.kind, m.item);
-                  if (!step) return;
-                  current = { kind: m.kind, step, title: step.title };
-                }
-                if (label) current.label = label;
-                commit(); results.style.display = 'none'; show();
-              };
-              list.appendChild(b);
-            });
-          };
-          q.oninput = run;
-          q.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); const first = list.querySelector('button'); if (first) first.click(); } };
-          run(); q.focus();
-        };
-        return wrap;
-      }
-      paint();
+      });
     }
 
-    // ---------------- Keep in step ----------------
+    // Keeps the open windows in step with the saved list (after a change in another tab)
+    function syncWindows() {
+      Array.from(views).forEach(v => {
+        if (!v.win) return;
+        const w = state.windows.find(x => x.id === v.win.id);
+        if (w) v.win = w;
+        else { views.delete(v); if (v.handle) v.handle.close(); }
+      });
+      state.windows.forEach((w, i) => {
+        if (!Array.from(views).some(v => v.win && v.win.id === w.id)) openWinView(w, i + 1);
+      });
+    }
+
+    function openSavedWindows(attemptsLeft) {
+      if (!state.windows.length) return;
+      if (!floatApi()) {
+        if (attemptsLeft > 0) setTimeout(() => openSavedWindows(attemptsLeft - 1), 200);
+        return;
+      }
+      syncWindows();
+    }
+
+    // ============================================================
+    // Button editor — a normal floating window (no dark screen)
+    // ============================================================
+    let editor = null;       // { tileId, isNew, targetSub, draft, dirty, autoSearch }
+    let edHandle = null;     // floating window (Pop-out v7)
+    let edFallback = null;   // plain window (only if Pop-out is still v6)
+    const edBox = document.createElement('div');
+    edBox.className = 'ig-lp-ed';
+    edBox.setAttribute('data-seq-exempt', '1');   // Enter / Esc here never reach an active sequence
+    edBox.addEventListener('keydown', e => {
+      if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeEditor(); }
+    });
+
+    function openEditor(tileId, opts) {
+      opts = opts || {};
+      if (editor && editor.dirty && !opts.force) {
+        if (tileId && editor.tileId === tileId) { showEditorWindow(); return; }
+        askSwitch(() => openEditor(tileId, Object.assign({}, opts, { force: true })));
+        return;
+      }
+      let draft, isNew = false, targetSub;
+      if (tileId) {
+        const f = findTile(tileId);
+        if (!f) return;
+        draft = JSON.parse(JSON.stringify(f.tile));
+        targetSub = f.sub.id;
+      } else {
+        const f = findSub(opts.newIn) || { sub: state.cats[0].subs[0] };
+        isNew = true;
+        targetSub = f.sub.id;
+        draft = {
+          id: uid('tile'), title: '', autoTitle: true,
+          color: NEW_COLORS[f.sub.tiles.length % NEW_COLORS.length],
+          text: 'dark', w: 1, h: 1, main: null, alts: []
+        };
+      }
+      draft.alts = (draft.alts || []).filter(Boolean);
+      editor = { tileId: isNew ? null : tileId, isNew, targetSub, draft, dirty: false, autoSearch: isNew };
+      paintEditor(true);       // fill it first, so the window is placed at its real size
+      showEditorWindow();
+      markEditing();
+    }
+
+    function showEditorWindow() {
+      const title = editor && editor.isNew ? '＋ New button' : '✏️ Edit button';
+      const api = floatApi();
+      if (api) {
+        if (edHandle && edHandle.el.isConnected) { edHandle.front(); edHandle.setTitle(title); return; }
+        edHandle = api.open({
+          key: 'launchpad~editor',
+          title,
+          icon: '✏️',
+          label: 'Button editor',
+          content: edBox,
+          minimizable: false,
+          defaults: { width: 330, left: Math.max(16, Math.round(window.innerWidth / 2 - 165)), top: 70 },
+          onClose: () => closeEditor()
+        });
+        return;
+      }
+      // Fallback: Pop-out block still v6 → a plain movable window, still no dark screen
+      if (!edFallback) {
+        edFallback = document.createElement('div');
+        edFallback.className = 'ig-lp-edwin';
+        edFallback.innerHTML = '<div class="ig-lp-edwin-head"><span></span><button type="button" title="Close">✕</button></div>';
+        edFallback.appendChild(edBox);
+        edFallback.querySelector('button').onclick = closeEditor;
+        document.body.appendChild(edFallback);
+        let pos = null;
+        try { pos = JSON.parse(localStorage.getItem('ig_lp_editor_pos_v1')); } catch (e) { pos = null; }
+        edFallback.style.left = (pos && pos.left) || (Math.max(16, Math.round(window.innerWidth / 2 - 165)) + 'px');
+        edFallback.style.top = (pos && pos.top) || '70px';
+        core.makeIsolatedDraggable(edFallback, edFallback.querySelector('.ig-lp-edwin-head'), 'ig_lp_editor_pos_v1');
+      }
+      edFallback.querySelector('.ig-lp-edwin-head span').textContent = title;
+    }
+
+    function closeEditor() {
+      editor = null;
+      if (edHandle) { const h = edHandle; edHandle = null; h.close(); }
+      if (edFallback) { edFallback.remove(); edFallback = null; }
+      markEditing();
+    }
+
+    function askSwitch(next) {
+      showEditorWindow();
+      const ask = edBox.querySelector('.ig-lp-ask');
+      if (!ask || !editor) { next(); return; }
+      const name = editor.draft.title || itemName(editor.draft.main) || 'this button';
+      ask.innerHTML = `<span>Save changes to “${esc(name)}”?</span>
+        <div><button type="button" class="ig-lp-btn go" data-k="save">Save</button>
+        <button type="button" class="ig-lp-btn" data-k="discard">Discard</button>
+        <button type="button" class="ig-lp-btn ghost" data-k="keep">Keep editing</button></div>`;
+      ask.style.display = 'flex';
+      ask.onclick = e => {
+        const b = e.target.closest('button[data-k]');
+        if (!b) return;
+        if (b.dataset.k === 'keep') { ask.style.display = 'none'; return; }
+        if (b.dataset.k === 'save' && !saveEditor()) return;
+        renderAll();
+        next();
+      };
+    }
+
+    function subOptions(selId) {
+      const many = state.cats.length > 1;
+      const out = [];
+      state.cats.forEach(c => c.subs.forEach(s => {
+        out.push(`<option value="${esc(s.id)}" ${s.id === selId ? 'selected' : ''}>${esc(many ? c.name + ' › ' + s.name : s.name)}</option>`);
+      }));
+      return out.join('');
+    }
+
+    function paintEditor(focus) {
+      if (!editor) return;
+      const d = editor.draft;
+      const touch = () => { if (editor) editor.dirty = true; };
+      const multiSub = state.cats.length > 1 || state.cats[0].subs.length > 1;
+      edBox.innerHTML = `
+        <div class="ig-lp-ask" style="display:none;"></div>
+        <div>
+          <input type="text" class="ig-lp-title" placeholder="Button title (empty = the item's name)" value="${esc(d.title || '')}">
+          <div class="ig-lp-ed-hint"></div>
+        </div>
+        <div class="ig-lp-erow ig-lp-colors"><span class="ig-lp-lbl">Color</span></div>
+        <div class="ig-lp-erow"><span class="ig-lp-lbl">Text</span>
+          <div class="ig-lp-seg ig-lp-textseg">
+            <button type="button" data-t="dark" class="${d.text === 'dark' ? 'on' : ''}">Black</button>
+            <button type="button" data-t="light" class="${d.text !== 'dark' ? 'on' : ''}">White</button>
+          </div>
+          ${multiSub ? `<span class="ig-lp-lbl" style="margin-left:auto;">Tab</span><select class="ig-lp-tabsel">${subOptions(editor.targetSub)}</select>` : ''}
+        </div>
+        <div class="ig-lp-slots"></div>
+        <button type="button" class="ig-lp-btn ghost ig-lp-addalt">＋ Add version ${LETTERS[d.alts.length + 1] || ''}</button>
+        <div class="ig-lp-foot">
+          ${editor.isNew ? '<span></span>' : '<button type="button" class="ig-lp-btn del ig-lp-del">🗑 Delete</button>'}
+          <div style="display:flex;gap:6px;">
+            <button type="button" class="ig-lp-btn ig-lp-cancel">Cancel</button>
+            <button type="button" class="ig-lp-btn go ig-lp-save">Save</button>
+          </div>
+        </div>`;
+
+      // Title — empty = follows the item's name
+      const titleIn = edBox.querySelector('.ig-lp-title');
+      const hint = edBox.querySelector('.ig-lp-ed-hint');
+      const paintHint = () => { hint.textContent = d.autoTitle ? '🔗 Uses the item\'s name and follows it when you rename the item' : ''; };
+      paintHint();
+      titleIn.oninput = () => {
+        d.title = titleIn.value;
+        d.autoTitle = !titleIn.value.trim();
+        paintHint();
+        touch();
+      };
+
+      // Color
+      const colorsRow = edBox.querySelector('.ig-lp-colors');
+      const swatches = [];
+      const paintSwatches = () => swatches.forEach(sw => sw.classList.toggle('on', norm(d.color) === norm(sw.dataset.c)));
+      COLORS.forEach(c => {
+        const sw = document.createElement('button');
+        sw.type = 'button';
+        sw.className = 'ig-lp-sw';
+        sw.dataset.c = c;
+        sw.style.background = c;
+        sw.title = c;
+        sw.onclick = () => { d.color = c; paintSwatches(); touch(); };
+        swatches.push(sw);
+        colorsRow.appendChild(sw);
+      });
+      const custom = document.createElement('input');
+      custom.type = 'color';
+      custom.title = 'Any color';
+      custom.value = /^#[0-9a-f]{6}$/i.test(d.color || '') ? d.color : '#334155';
+      custom.oninput = () => { d.color = custom.value; paintSwatches(); touch(); };
+      colorsRow.appendChild(custom);
+      paintSwatches();
+
+      // Text color
+      const segBtns = Array.from(edBox.querySelectorAll('.ig-lp-textseg button'));
+      segBtns.forEach(b => {
+        b.onclick = () => { d.text = b.dataset.t; segBtns.forEach(x => x.classList.toggle('on', x === b)); touch(); };
+      });
+
+      // Sub-tab
+      const tabSel = edBox.querySelector('.ig-lp-tabsel');
+      if (tabSel) tabSel.onchange = () => { editor.targetSub = tabSel.value; touch(); };
+
+      // Versions A, B, C…
+      const slotsEl = edBox.querySelector('.ig-lp-slots');
+      const slotA = slotEditor('A', d.main, s => { d.main = s; touch(); }, null, true, picked => {
+        if (d.autoTitle) { d.title = itemName(picked) || d.title; titleIn.value = d.title; paintHint(); }
+      });
+      slotsEl.appendChild(slotA.wrap);
+      d.alts.forEach((s, i) => {
+        const ed = slotEditor(LETTERS[i + 1] || '·', s, ns => { d.alts[i] = ns; touch(); }, () => { d.alts.splice(i, 1); touch(); paintEditor(); }, false, null);
+        slotsEl.appendChild(ed.wrap);
+      });
+
+      edBox.querySelector('.ig-lp-addalt').onclick = () => { d.alts.push({ kind: 'custom', text: '' }); touch(); paintEditor(); };
+      edBox.querySelector('.ig-lp-cancel').onclick = closeEditor;
+      const delBtn = edBox.querySelector('.ig-lp-del');
+      if (delBtn) delBtn.onclick = () => {
+        if (!confirm(`Delete the button "${tileTitle(d)}"?`)) return;
+        const f = findTile(editor.tileId);
+        if (f) f.sub.tiles.splice(f.sub.tiles.indexOf(f.tile), 1);
+        save(); closeEditor(); renderAll();
+      };
+      edBox.querySelector('.ig-lp-save').onclick = () => {
+        if (!saveEditor()) return;
+        closeEditor(); renderAll();
+      };
+
+      if (editor.autoSearch && !d.main) { editor.autoSearch = false; slotA.openSearch(); }
+      else if (focus) setTimeout(() => { if (titleIn.isConnected) titleIn.focus(); }, 0);
+    }
+
+    function saveEditor() {
+      if (!editor) return false;
+      const d = editor.draft;
+      const cleanSlot = s => (!s ? null : (s.kind === 'custom' && !String(s.text || '').trim()) ? null : s);
+      d.main = cleanSlot(d.main);
+      d.alts = (d.alts || []).map(cleanSlot).filter(Boolean);
+      const typed = String(d.title || '').trim();
+      if (!typed) { d.autoTitle = true; d.title = itemName(d.main) || slotTitle(d.main) || 'Untitled'; }
+      else d.title = typed;
+
+      const dest = findSub(editor.targetSub) || { sub: state.cats[0].subs[0] };
+      const f = editor.tileId ? findTile(editor.tileId) : null;
+      if (f) {
+        Object.assign(f.tile, d);
+        if (f.sub.id !== dest.sub.id) {
+          f.sub.tiles.splice(f.sub.tiles.indexOf(f.tile), 1);
+          dest.sub.tiles.push(f.tile);
+        }
+      } else {
+        dest.sub.tiles.push(d);
+        editor.tileId = d.id;
+        editor.isNew = false;
+      }
+      save();
+      editor.dirty = false;
+      return true;
+    }
+
+    // One version: an optional short name + what it sends (pick from the library, or type text)
+    function slotEditor(letter, slot, setSlot, onRemove, isMain, onPicked) {
+      const wrap = document.createElement('div');
+      wrap.className = 'ig-lp-slot';
+      wrap.innerHTML = `
+        <div class="ig-lp-slot-head"><b>${esc(letter)}</b>${isMain ? '<span class="ig-lp-lbl">main · sent by clicking the button</span>' : ''}
+          ${isMain ? '' : `<input type="text" class="ig-lp-slot-label" placeholder="Short name (optional)" value="${esc((slot && slot.label) || '')}">`}
+          ${onRemove ? '<button type="button" class="ig-lp-x" title="Remove this version">✕</button>' : ''}
+        </div>
+        <div class="ig-lp-pick ${slot && slot.kind !== 'custom' ? '' : 'none'}" title="Pick from your library"><span></span>🔍</div>
+        <textarea class="ig-lp-custom" placeholder="…or type the text to send"></textarea>
+        <div class="ig-lp-results" style="display:none;"></div>`;
+      const pick = wrap.querySelector('.ig-lp-pick');
+      const pickTxt = pick.querySelector('span');
+      const custom = wrap.querySelector('.ig-lp-custom');
+      const results = wrap.querySelector('.ig-lp-results');
+      const labelIn = wrap.querySelector('.ig-lp-slot-label');
+      let current = slot ? Object.assign({}, slot) : null;
+      const commit = () => setSlot(current);
+
+      function show() {
+        if (current && current.kind !== 'custom') {
+          pick.classList.remove('none');
+          pickTxt.textContent = `${ICON[current.kind] || ''} ${itemName(current)}`;
+          custom.style.display = 'none';
+        } else {
+          pick.classList.add('none');
+          pickTxt.textContent = 'Pick text, audio, image set or sequence…';
+          custom.style.display = '';
+          custom.value = (current && current.text) || '';
+        }
+      }
+      show();
+
+      if (labelIn) labelIn.oninput = () => {
+        current = current || { kind: 'custom', text: '' };
+        current.label = labelIn.value.trim() || undefined;
+        commit();
+      };
+      custom.oninput = () => {
+        const label = current && current.label;
+        current = { kind: 'custom', text: custom.value };
+        if (label) current.label = label;
+        commit();
+      };
+      const rm = wrap.querySelector('.ig-lp-x');
+      if (rm) rm.onclick = onRemove;
+
+      function openSearch() {
+        results.style.display = 'flex';
+        results.innerHTML = `<input type="text" placeholder="Search… (audio / text / set / seq + name)"><div class="ig-lp-res"></div>
+          ${current && current.kind !== 'custom' ? '<button type="button" class="ig-lp-btn ghost ig-lp-clear" style="font-size:10px;">✍️ Type text instead</button>' : ''}`;
+        const q = results.querySelector('input');
+        const list = results.querySelector('.ig-lp-res');
+        const clearBtn = results.querySelector('.ig-lp-clear');
+        if (clearBtn) clearBtn.onclick = () => {
+          const label = current && current.label;
+          current = { kind: 'custom', text: '' };
+          if (label) current.label = label;
+          commit(); results.style.display = 'none'; show();
+        };
+        let token = 0;
+        const run = async () => {
+          const my = ++token;
+          const parsed = core.parseSearchPrefix(q.value);
+          let found = [];
+          try { found = await core.searchInventory(parsed.q, parsed.mode, { kinds: KINDS, limit: 12 }); } catch (e) { found = []; }
+          if (my !== token) return;
+          list.innerHTML = '';
+          if (!found.length) { list.innerHTML = '<div style="padding:6px;color:#64748b;">Nothing found.</div>'; return; }
+          found.forEach(m => {
+            const b = document.createElement('button');
+            b.type = 'button';
+            const name = m.kind === 'audio' || m.kind === 'sequence' ? m.item.name : m.item.title;
+            const extra = m.kind === 'audio' ? (m.item.folder || '') : m.kind === 'set' ? `${(m.item.images || []).length} img` : m.kind === 'sequence' ? `${(m.item.steps || []).length} steps` : '';
+            b.innerHTML = `<span>${ICON[m.kind]}</span><span style="flex:1;">${esc(name || '(untitled)')}</span><span style="opacity:.5;font-size:9px;">${esc(extra)}</span>`;
+            b.onclick = () => {
+              const label = current && current.label;
+              if (m.kind === 'sequence') current = { kind: 'sequence', ref: m.item.id, title: m.item.name || 'Sequence' };
+              else {
+                const step = core.makeStep(m.kind, m.item);   // exact item name + permanent link
+                if (!step) return;
+                current = { kind: m.kind, step, title: step.title };
+              }
+              if (label) current.label = label;
+              commit();
+              if (onPicked) onPicked(current);
+              results.style.display = 'none';
+              show();
+            };
+            list.appendChild(b);
+          });
+        };
+        q.oninput = run;
+        q.onkeydown = e => {
+          if (e.key === 'Enter') { e.preventDefault(); const first = list.querySelector('button'); if (first) first.click(); }
+        };
+        run();
+        setTimeout(() => { if (q.isConnected) q.focus(); }, 0);
+      }
+      pick.onclick = () => {
+        if (results.style.display !== 'none') { results.style.display = 'none'; return; }
+        openSearch();
+      };
+      return { wrap, openSearch };
+    }
+
+    // ============================================================
+    // Names follow the items (rename an audio → the button follows)
+    // ============================================================
+    let titlesBusy = false, titlesAgain = false;
+    async function refreshAutoTitles() {
+      if (titlesBusy) { titlesAgain = true; return; }
+      titlesBusy = true;
+      try {
+        const inv = await core.getSearchableInventory();
+        let changed = false;
+        const fix = slot => {
+          if (!slot || slot.kind === 'custom') return null;
+          let name = null;
+          if (slot.kind === 'sequence') {
+            const seq = findSequence(slot);
+            if (seq) {
+              name = seq.name || '';
+              if (seq.id && slot.ref !== seq.id) { slot.ref = seq.id; changed = true; }
+            }
+          } else if (slot.step) {
+            const item = core.findStepItem(slot.step, inv);
+            if (item) {
+              const fresh = core.makeStep(slot.kind, item);
+              if (fresh && (!slot.step.ref || fresh.ref === slot.step.ref)) {
+                if (JSON.stringify(fresh) !== JSON.stringify(slot.step)) { slot.step = fresh; changed = true; }
+                name = fresh.title;
+              }
+            }
+          }
+          if (name !== null && name !== slot.title) { slot.title = name; changed = true; }
+          return name;
+        };
+        state.cats.forEach(c => c.subs.forEach(s => s.tiles.forEach(t => {
+          const n = fix(t.main);
+          (t.alts || []).forEach(fix);
+          if (t.autoTitle && n && t.title !== n) { t.title = n; changed = true; }
+        })));
+        if (changed) { save(); renderAll(); }
+      } catch (e) {
+        console.warn('[Launchpad] could not refresh names:', e);
+      } finally {
+        titlesBusy = false;
+        if (titlesAgain) { titlesAgain = false; refreshAutoTitles(); }
+      }
+    }
+    core.on('inventory:changed', refreshAutoTitles);
+    core.on('sequences:updated', refreshAutoTitles);
+
+    // ============================================================
+    // Keep in step with other Instagram tabs
+    // ============================================================
     window.addEventListener('storage', e => {
       if (e.key !== KEY) return;
       state = load();
-      if (!document.querySelector('.ig-lp-overlay')) render();
+      syncWindows();
+      renderAll();
     });
 
-    render();
+    // ============================================================
+    // Start
+    // ============================================================
+    const mainView = createView(null);
+    if (migrated) save();
+    renderAll();
+
     function mountCard(attemptsLeft) {
       attemptsLeft = attemptsLeft === undefined ? 20 : attemptsLeft;
-      if (typeof core.registerMenu === 'function') core.registerMenu('left', '🚀 Launchpad', ui, '⠿', 'launchpad');
+      if (typeof core.registerMenu === 'function') core.registerMenu('left', '🚀 Launchpad', mainView.el, '⠿', 'launchpad');
       else if (attemptsLeft > 0) setTimeout(() => mountCard(attemptsLeft - 1), 200);
     }
     mountCard();
+    openSavedWindows(20);
+    setTimeout(refreshAutoTitles, 2500);
 
     core.emit('block:ready', { id: 'launchpad' });
   }
