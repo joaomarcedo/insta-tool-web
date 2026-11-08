@@ -6382,10 +6382,16 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Commands (v12)
+   BLOCK: Commands (v13)
    ============================================================ */
 /* ============================================================
-   BLOCK: Commands (v30.7 - 🪶 Image sets: pictures opened only when sent (needs Core v8)
+   BLOCK: Commands (v30.9 - 🔁 Sequences show the Sequence Manager's own icon (was 📋)
+                    v30.8 - 🎵 Drop audio files into the box → save to the Audio Library
+                        · converted to WAV mono, name = the file's name (selected, type over it),
+                          folder = General; several files at once → one name per file
+                        · images in the same drop still go to the tray
+                        · popups marked "ig-on-top" (Launchpad preview / menu) stay above 📌
+                    v30.7 - 🪶 Image sets: pictures opened only when sent (needs Core v8)
                     v30.6 - 🎙️ Mic opens only when you press 🔴, shared, auto-off (needs Core v6)
                     v30.5 - 📦 Opens a clip's sound only when you pick it (needs Core v5)
                     v30.4 - ⚡ Follows Quick Message "Delay" On/Off (Off = stop instantly; 0 ms really = 0)
@@ -6920,7 +6926,7 @@ LegoCore.registerBlock({
             : '<span class="ig-qcx-transcript-empty">Empty sequence.</span>';
 
           transcriptPanelEl.innerHTML = `
-            <div class="ig-qcx-transcript-title">📋 ${esc(m.item.name || 'Untitled')}</div>
+            <div class="ig-qcx-transcript-title">🔁 ${esc(m.item.name || 'Untitled')}</div>
             <div class="ig-qcx-transcript-body">${listHtml}</div>
           `;
         } else {
@@ -7182,7 +7188,7 @@ LegoCore.registerBlock({
           } else if (m.kind === 'sequence') {
             const titleHtml = formatTitleWithTags(m.item.name, tokens);
             const n = Array.isArray(m.item.steps) ? m.item.steps.length : 0;
-            row.innerHTML = `<div class="ig-qcx-dd-row-top"><span>📋</span><span class="ig-qcx-dd-title">${titleHtml}</span><span class="ig-qcx-dd-cmd">▶ ${n} step${n === 1 ? '' : 's'}</span>${editBtnHtml}</div>`;
+            row.innerHTML = `<div class="ig-qcx-dd-row-top"><span>🔁</span><span class="ig-qcx-dd-title">${titleHtml}</span><span class="ig-qcx-dd-cmd">▶ ${n} step${n === 1 ? '' : 's'}</span>${editBtnHtml}</div>`;
           } else if (m.kind === 'set') {
             const titleHtml = formatTitleWithTags(m.item.title, tokens);
             row.innerHTML = `<div class="ig-qcx-dd-row-top"><span>🖼️</span><span class="ig-qcx-dd-title">${titleHtml}</span>${editBtnHtml}</div>`;
@@ -7442,6 +7448,17 @@ LegoCore.registerBlock({
         const folderSel = overlay.querySelector('#ig-qcx-save-folder-select');
         const folderNewInput = overlay.querySelector('#ig-qcx-save-folder-new');
 
+        // v30.8: a dropped file opens here with its name selected — just type to rename it
+        if (prefill.selectName) {
+          const nameIn = overlay.querySelector('#ig-qcx-save-name');
+          setTimeout(() => { if (nameIn.isConnected) { nameIn.focus(); nameIn.select(); } }, 0);
+          nameIn.addEventListener('keydown', (ev) => {
+            ev.stopPropagation();
+            if (ev.key === 'Enter') { ev.preventDefault(); overlay.querySelector('#ig-qcx-save-confirm').click(); }
+            else if (ev.key === 'Escape') { ev.preventDefault(); close(); }
+          });
+        }
+
         folderSel.onchange = () => {
           if (folderSel.value === '__new__') {
             folderNewInput.style.display = 'block';
@@ -7482,7 +7499,8 @@ LegoCore.registerBlock({
               core.emit('folders:refresh');
               core.emit('library:refresh');
               previewLabel.innerText = `✅ Saved to ${finalFolder} / ${finalName}`;
-              setTimeout(() => clearPending(), 1200);
+              const savedTok = audioPickToken;   // v30.8: a clip dropped/picked meanwhile is not wiped
+              setTimeout(() => { if (savedTok === audioPickToken) clearPending(); }, 1200);
               close();
             };
           });
@@ -7799,8 +7817,191 @@ LegoCore.registerBlock({
         if (hoverEl) setHover(false);
         if (!hasFiles(e) || !inDropZone(e.target)) return;
         e.preventDefault(); e.stopImmediatePropagation();
-        addTrayFiles(e.dataTransfer.files);
+        const dropped = Array.from(e.dataTransfer.files || []);
+        const audios = dropped.filter(isAudioFile);
+        const images = dropped.filter(f => !isAudioFile(f));
+        if (images.length) addTrayFiles(images);           // images → tray (as before)
+        if (audios.length) addAudioFiles(audios);          // v30.8: audio → save to the library
       }, true);
+
+      // ================= v30.8: DROPPED AUDIO FILES → AUDIO LIBRARY =================
+      const AUDIO_EXT_RE = /\.(mp3|m4a|wav|ogg|oga|opus|aac|webm|flac|weba)$/i;
+      function isAudioFile(f) {
+        if (!f) return false;
+        if (f.type && f.type.startsWith('audio/')) return true;
+        return AUDIO_EXT_RE.test(f.name || '');
+      }
+      function baseNameOf(f) {
+        const n = String((f && f.name) || 'audio').replace(/\.[^.\/\\]+$/, '').trim();
+        return n || 'audio';
+      }
+      // WAV mono at your 24/48 kHz setting (Audio WAV Engine). Without that block the file is kept as is.
+      function wavOf(file) {
+        return (core.audio && typeof core.audio.toWav === 'function') ? core.audio.toWav(file) : Promise.resolve(file);
+      }
+
+      let audioDropBusy = false;
+      async function addAudioFiles(files) {
+        if (audioDropBusy || document.querySelector('.ig-qcx-modal-overlay')) return;
+        audioDropBusy = true;
+        try {
+          if (micStarting || isRecording || isFinishing || isProcessing) { flashNote('⚠️ Finish the recording first'); return; }
+          const ready = [];
+          for (let i = 0; i < files.length; i++) {
+            clearPending();
+            previewBar.style.display = 'flex';
+            previewLabel.innerText = files.length > 1 ? `⏳ Converting ${i + 1}/${files.length}…` : `⏳ ${baseNameOf(files[i])}`;
+            previewPlayBtn.style.display = 'none'; previewSaveBtn.style.display = 'none'; previewDiscardBtn.style.display = 'none';
+            try {
+              const blob = await wavOf(files[i]);
+              if (blob) ready.push({ name: baseNameOf(files[i]), blob });
+            } catch (err) {
+              console.warn('[Commands] could not read audio file', files[i] && files[i].name, err);
+            }
+          }
+          clearPending();
+          if (!ready.length) { flashNote('⚠️ Could not read that audio file'); return; }
+          const failed = files.length - ready.length;
+
+          if (ready.length === 1) {
+            // One file: it waits in the bar (▶️ 💾 ✕) and the save window opens right away
+            audioPickToken++; pendingAudioLoad = null;
+            pendingAudioBlob = ready[0].blob;
+            pendingAudioName = ready[0].name;
+            pendingTranscript = '';
+            recordedPending = false;
+            showAudioPreview();
+            previewDiscardBtn.style.display = '';
+            syncSeqExempt();
+            openSaveClipModal({ name: ready[0].name, folder: 'General', selectName: true });
+            if (failed) console.warn(`[Commands] ${failed} dropped file(s) could not be read`);
+            return;
+          }
+          openSaveManyClipsModal(ready, failed);
+        } finally {
+          audioDropBusy = false;
+        }
+      }
+
+      // Several files: one name per file, one folder for all
+      async function openSaveManyClipsModal(items, failed) {
+        if (document.querySelector('.ig-qcx-modal-overlay')) return;
+        const folders = await getAllFolders();
+        if (!folders.includes('General')) folders.unshift('General');
+
+        const overlay = document.createElement('div');
+        overlay.className = 'ig-qcx-modal-overlay';
+        overlay.innerHTML = `
+          <div class="ig-qcx-modal">
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+              <h3>💾 Save ${items.length} Audio Clips</h3>
+              <button type="button" class="ig-qcx-many-x" style="background:none; border:none; color:#94a3b8; cursor:pointer; font-size:14px;">✕</button>
+            </div>
+            ${failed ? `<div style="font-size:10px; color:#fbbf24;">⚠️ ${failed} file(s) could not be read and were skipped.</div>` : ''}
+            <div class="ig-qcx-modal-label">Clip names:</div>
+            <div class="ig-qcx-many-list" style="display:flex; flex-direction:column; gap:5px; overflow-y:auto; max-height:40vh;"></div>
+            <div class="ig-qcx-modal-label">Folder / Group:</div>
+            <div style="display:flex; gap:6px;">
+              <select class="ig-qcx-modal-input ig-qcx-many-folder" style="flex:1;">
+                ${folders.map(f => `<option value="${esc(f)}" ${f === 'General' ? 'selected' : ''}>${esc(f)}</option>`).join('')}
+                <option value="__new__">+ New Folder...</option>
+              </select>
+              <input type="text" class="ig-qcx-modal-input ig-qcx-many-newfolder" placeholder="New folder name" style="flex:1; display:none;">
+            </div>
+            <div style="display:flex; justify-content:flex-end; gap:8px; margin-top:8px;">
+              <button type="button" class="ig-qcx-many-cancel" style="background:transparent; color:#94a3b8; border:none; cursor:pointer; font-weight:bold;">Cancel</button>
+              <button type="button" class="ig-qcx-many-save" style="background:#10b981; color:#fff; border:none; padding:7px 14px; border-radius:4px; font-weight:bold; cursor:pointer;">💾 Save all</button>
+            </div>
+          </div>`;
+        document.body.appendChild(overlay);
+
+        // one shared player: ▶️ on a row plays that file, ▶️ again (or another row) stops it
+        let player = null, playingBtn = null;
+        function stopPlayer() {
+          if (!player) return;
+          try { player.pause(); player.removeAttribute('src'); player.load(); } catch (e) { /* noop */ }
+          URL.revokeObjectURL(player._url);
+          player = null;
+          if (playingBtn) playingBtn.textContent = '▶️';
+          playingBtn = null;
+        }
+
+        const list = overlay.querySelector('.ig-qcx-many-list');
+        const nameInputs = items.map(it => {
+          const row = document.createElement('div');
+          row.style.cssText = 'display:flex; align-items:center; gap:6px;';
+          const play = document.createElement('button');
+          play.type = 'button'; play.className = 'ig-qcx-icon-btn'; play.textContent = '▶️'; play.title = 'Listen';
+          const nameIn = document.createElement('input');
+          nameIn.type = 'text'; nameIn.className = 'ig-qcx-modal-input'; nameIn.value = it.name; nameIn.style.flex = '1';
+          play.onclick = () => {
+            const was = playingBtn === play;
+            stopPlayer();
+            if (was) return;
+            const url = URL.createObjectURL(it.blob);
+            player = new Audio(url); player._url = url; playingBtn = play;
+            play.textContent = '⏹️';
+            player.onended = stopPlayer;
+            player.play().catch(stopPlayer);
+          };
+          row.append(play, nameIn);
+          list.appendChild(row);
+          return nameIn;
+        });
+
+        const folderSel = overlay.querySelector('.ig-qcx-many-folder');
+        const folderNew = overlay.querySelector('.ig-qcx-many-newfolder');
+        folderSel.onchange = () => {
+          folderNew.style.display = folderSel.value === '__new__' ? '' : 'none';
+          if (folderSel.value === '__new__') folderNew.focus();
+        };
+
+        const close = () => { stopPlayer(); overlay.remove(); input.focus(); };
+        overlay.querySelector('.ig-qcx-many-x').onclick = close;
+        overlay.querySelector('.ig-qcx-many-cancel').onclick = close;
+        overlay.addEventListener('keydown', (ev) => {
+          ev.stopPropagation();
+          if (ev.key === 'Escape') { ev.preventDefault(); close(); }
+        });
+
+        const saveBtn = overlay.querySelector('.ig-qcx-many-save');
+        saveBtn.onclick = () => {
+          let folder = folderSel.value;
+          if (folder === '__new__') {
+            folder = folderNew.value.trim();
+            if (!folder) { folderNew.focus(); return; }
+          }
+          saveBtn.disabled = true; saveBtn.textContent = '⏳ Saving…';
+          stopPlayer();
+          withDb(db => {
+            const tx = db.transaction(['folders'].concat(core.clipStore.STORES), 'readwrite');
+            tx.objectStore('folders').put({ name: folder });
+            const countReq = tx.objectStore('clips').count();
+            countReq.onsuccess = () => {
+              items.forEach((it, i) => {
+                core.clipStore.addInTx(tx, {
+                  name: nameInputs[i].value.trim() || it.name,
+                  folder,
+                  color: '#0095f6',
+                  order: countReq.result + i,
+                  blob: it.blob,
+                  customCommand: '',
+                  transcript: ''
+                });
+              });
+            };
+            tx.oncomplete = () => {
+              core.emit('folders:refresh');
+              core.emit('library:refresh');
+              close();
+              flashNote(`✅ Saved ${items.length} clips to ${folder}`, 2200);
+            };
+            tx.onerror = () => { saveBtn.disabled = false; saveBtn.textContent = '💾 Save all'; alert('Could not save the clips.'); };
+          });
+        };
+
+        setTimeout(() => { if (nameInputs[0] && nameInputs[0].isConnected) { nameInputs[0].focus(); nameInputs[0].select(); } }, 0);
+      }
 
       // Ctrl+V a screenshot into the box → tray
       input.addEventListener('paste', (e) => {
@@ -7825,7 +8026,7 @@ LegoCore.registerBlock({
 
       // Anything with max z-index added to <body> after us would paint on top (equal z → later wins).
       // Slide such elements in *before* the float instead of moving the float (moving it would steal focus).
-      const ALLOW_ABOVE = /ig-qcx-|ig-seq-|modal-overlay/;
+      const ALLOW_ABOVE = /ig-qcx-|ig-seq-|modal-overlay|ig-on-top/;
       const topWatcher = new MutationObserver((muts) => {
         if (!floatShell || !floatShell.isConnected) return;
         for (const m of muts) for (const n of m.addedNodes) {
@@ -10065,11 +10266,18 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Sequence Manager (v7)
+   BLOCK: Sequence Manager (v8)
    ============================================================ */
 /* ============================================================
-   BLOCK: Sequence Manager (v5.2 - 🔗 Permanent IDs + Fix missing steps)
+   BLOCK: Sequence Manager (v6 - ⧉ Duplicate sequences)
    Built for: LegoCore v4 + Commands v29 (from v28.1) + Quick Chat Box v2
+   v6:
+   - ⧉ on each saved sequence makes an exact copy (same steps, same folder)
+     right under the original, with its own ID — editing it never touches
+     the original. Name: "Intro copy 1", then "copy 2"… (lowest free number;
+     copying "Intro copy 1" gives "Intro copy 2", never "copy 1 copy 1").
+   - The copy opens in the builder with its name selected: type to rename,
+     Enter saves. It's already saved, so Esc / leaving it keeps the copy.
    v5.2:
    - 🧠 Memory: reloads ONCE per change (LegoCore's 'inventory:changed') using
      the shared item copy, instead of re-loading every audio + image 2–3 times
@@ -10895,6 +11103,43 @@ LegoCore.registerBlock({
       core.setActiveSequence(seq);
     }
 
+    // v6: "Intro" → "Intro copy 1", then "copy 2"… (always the lowest free number).
+    // A copy of a copy counts from the original name: "Intro copy 1" → "Intro copy 2".
+    function copyName(name, list) {
+      const base = String(name || 'Untitled').replace(/\s+copy\s+\d+\s*$/i, '').trim() || 'Untitled';
+      const taken = new Set(list.map(s => String(s.name || '').trim().toLowerCase()));
+      let n = 1;
+      while (taken.has(`${base} copy ${n}`.toLowerCase())) n++;
+      return `${base} copy ${n}`;
+    }
+
+    function duplicateSequence(seq) {
+      const list = core.getSequences();
+      const i = list.findIndex(s => s.id === seq.id);
+      if (i < 0) return;
+      const src = list[i];
+      const now = Date.now();
+      const copy = JSON.parse(JSON.stringify(src));            // same steps (same permanent links), same folder
+      copy.id = 'seq_' + now + '_' + Math.random().toString(36).slice(2, 6);
+      copy.name = copyName(src.name, list);
+      copy.createdAt = now;
+      copy.updatedAt = now;
+      list.splice(i + 1, 0, copy);                              // right under the original
+      core.saveSequences(list);                                 // emits 'sequences:updated' -> renderList()
+
+      // A copy hidden in a collapsed folder would be invisible — open that folder
+      const folder = folderOf(copy);
+      if (folder) {
+        const c = getCollapsed();
+        if (c.delete(folder)) { saveCollapsed(c); renderList(); }
+      }
+
+      startEditing(copy);
+      nameInput.focus();
+      nameInput.select();
+      setBuilderStatus(`⧉ Copy created — type a new name · Enter saves`, 'ok', 4000);
+    }
+
     function deleteSequence(seq) {
       if (!confirm(`Delete sequence "${seq.name || 'Untitled'}"?`)) return;
       const active = core.getActiveSequence();
@@ -11146,8 +11391,9 @@ LegoCore.registerBlock({
       const playBtn = el('button', 'ig-seq-btn', '▶️'); playBtn.type = 'button'; playBtn.title = 'Load sequence (Enter sends each step)';
       const previewBtn = el('button', 'ig-seq-btn', '👁️'); previewBtn.type = 'button'; previewBtn.title = 'Toggle step list';
       const editBtn = el('button', 'ig-seq-btn', '✏️'); editBtn.type = 'button'; editBtn.title = 'Edit steps or rename';
+      const dupBtn = el('button', 'ig-seq-btn', '⧉'); dupBtn.type = 'button'; dupBtn.title = 'Duplicate (opens the copy in the builder)';
       const delBtn = el('button', 'ig-seq-btn', '🗑️'); delBtn.type = 'button'; delBtn.title = 'Delete sequence';
-      actions.append(playBtn, previewBtn, editBtn, delBtn);
+      actions.append(playBtn, previewBtn, editBtn, dupBtn, delBtn);
 
       row.append(grip, titleCol, resizer, meta, actions);
 
@@ -11163,6 +11409,7 @@ LegoCore.registerBlock({
       playBtn.onclick = (e) => { e.stopPropagation(); loadSequence(seq); };
       previewBtn.onclick = (e) => { e.stopPropagation(); preview.classList.toggle('visible'); };
       editBtn.onclick = (e) => { e.stopPropagation(); startEditing(seq); };
+      dupBtn.onclick = (e) => { e.stopPropagation(); duplicateSequence(seq); };
       delBtn.onclick = (e) => { e.stopPropagation(); deleteSequence(seq); };
       item.onclick = (e) => {
         if (e.target.closest('button') || e.target.classList.contains('ig-seq-drag-grip') || e.target.classList.contains('ig-seq-col-resizer')) return;
@@ -11994,11 +12241,25 @@ LegoCore.registerBlock({
 });
 
 /* ============================================================
-   BLOCK: Launchpad (v2)
+   BLOCK: Launchpad (v3)
    ============================================================ */
 /* ============================================================
-   BLOCK: Launchpad (v1.3 - 🗂️ Categories + sub-tabs · ⧉ More windows)
+   BLOCK: Launchpad (v1.5 - 🔁 Sequence icon)
    ------------------------------------------------------------
+   v1.5: sequences show 🔁 (the Sequence Manager's icon) instead of 🔗
+   v1.4 - ⚙️ Small menu · 🏷️ Names from the item · 👁️ Preview in front
+   v1.4:
+   - ⚙️ opens a small menu next to the gear instead of adding rows, so
+     a window never changes size: ✏️ Edit buttons, ＋ New button,
+     rename / delete the tab or category, ＋ Sub-tab, ＋ Category,
+     Columns, Show (extra windows) and ⧉ New window.
+     ✏️ Edit buttons only adds dashed outlines + resize corners.
+   - Picking an item fills the title with its exact name (edit it after).
+     Picking a different item replaces it, unless you changed the title.
+     Versions B, C, D… work the same way through their name field.
+   - The hover preview, the ▾ versions list and the ⚙️ menu always show
+     in front of every window. The preview opens beside the window, so it
+     never covers your buttons.
    v1.3:
    - Two levels: categories (filled pills) and their sub-tabs
      (underlined). Your old tabs become sub-tabs of a "General"
@@ -12031,10 +12292,11 @@ LegoCore.registerBlock({
   init(core) {
     const KEY = 'ig_launchpad_v1';
     const KINDS = ['text', 'audio', 'set', 'sequence'];
-    const ICON = { text: '📝', audio: '🎵', set: '🖼️', sequence: '🔗', custom: '✍️' };
+    const ICON = { text: '📝', audio: '🎵', set: '🖼️', sequence: '🔁', custom: '✍️' };
     const COLORS = ['#334155', '#16a34a', '#dc2626', '#ea580c', '#ca8a04', '#2563eb', '#7c3aed', '#db2777'];
     const NEW_COLORS = ['#ca8a04', '#ea580c', '#16a34a', '#db2777', '#2563eb', '#dc2626'];
     const LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    const PLACEHOLDER_TITLES = new Set(['New button', 'Untitled']);   // older default titles count as empty
     const esc = core.escapeHtml;
     const uid = p => p + '_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
     const norm = s => String(s || '').trim().toLowerCase();
@@ -12132,24 +12394,39 @@ LegoCore.registerBlock({
       .ig-lp-sub { flex-shrink:0; display:inline-flex; align-items:center; background:transparent; border:none; border-bottom:2px solid transparent; color:var(--igls-text-dim,#96949c); padding:3px 2px 5px; margin:0 8px -1px 0; cursor:pointer; font-size:10.5px; line-height:1.2; white-space:nowrap; transition:color .15s, border-color .15s; }
       .ig-lp-sub:hover { color:var(--igls-text,#ece9e4); }
       .ig-lp-sub.on { color:var(--igls-text,#ece9e4); border-bottom-color:var(--igls-accent,#c9a876); font-weight:600; }
-      .ig-lp-addpill { flex-shrink:0; background:transparent; border:1px dashed var(--igls-border-strong, rgba(255,255,255,0.14)); color:var(--igls-text-dim,#96949c); border-radius:999px; padding:2px 9px; cursor:pointer; font-size:10px; line-height:1.3; }
-      .ig-lp-addpill:hover { color:var(--igls-accent,#c9a876); border-color:var(--igls-accent,#c9a876); }
-      .ig-lp-subs .ig-lp-addpill { border-radius:4px; margin-bottom:2px; }
-      .ig-lp-xmini { margin-left:6px; font-size:9px; opacity:.55; cursor:pointer; }
-      .ig-lp-xmini:hover { opacity:1; color:#f87171; }
-      .ig-lp-cat.on .ig-lp-xmini:hover { color:#7f1d1d; }
       .ig-lp-cat.drop, .ig-lp-sub.drop { box-shadow:0 0 0 2px var(--igls-accent,#c9a876); border-radius:6px; }
       .ig-lp-cat.dragging, .ig-lp-sub.dragging { opacity:.35; }
 
       .ig-lp-icon { background:transparent; border:none; color:var(--igls-text-dim,#96949c); cursor:pointer; font-size:12px; padding:2px 4px; border-radius:4px; flex-shrink:0; margin-left:auto; }
       .ig-lp-icon:hover, .ig-lp-icon.on { color:var(--igls-accent,#c9a876); background:rgba(255,255,255,0.08); }
 
-      .ig-lp-tools { display:none; align-items:center; gap:6px; flex-wrap:wrap; font-size:10px; color:var(--igls-text-dim,#96949c); padding:5px 6px; background:rgba(255,255,255,0.03); border:1px solid var(--igls-border, rgba(255,255,255,0.07)); border-radius:6px; }
-      .ig-lp.edit .ig-lp-tools { display:flex; }
-      .ig-lp-tools > button { background:transparent; border:1px solid var(--igls-border-strong, rgba(255,255,255,0.14)); color:inherit; border-radius:4px; padding:2px 7px; cursor:pointer; font-size:10px; }
-      .ig-lp-tools > button:hover { color:var(--igls-accent,#c9a876); border-color:var(--igls-accent,#c9a876); }
-      .ig-lp-cols { min-width:10px; text-align:center; color:var(--igls-text,#ece9e4); font-weight:600; }
-      .ig-lp-sp { flex:1; }
+      /* ---- ⚙️ menu (floats next to the gear; never changes the window size) ---- */
+      .ig-lp-menu { position:fixed; z-index:2147483647; width:212px; max-height:80vh; overflow-y:auto; box-sizing:border-box; background:var(--igls-surface,#17171d); border:1px solid var(--igls-border-strong, rgba(255,255,255,0.14)); border-radius:10px; box-shadow:0 12px 32px rgba(0,0,0,0.6); padding:5px; display:flex; flex-direction:column; gap:1px; font-size:11px; color:var(--igls-text,#ece9e4); font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      .ig-lp-mi { display:flex; align-items:center; gap:8px; width:100%; box-sizing:border-box; background:transparent; border:none; color:inherit; text-align:left; padding:6px 8px; border-radius:6px; cursor:pointer; font:inherit; }
+      .ig-lp-mi:hover { background:rgba(255,255,255,0.07); }
+      .ig-lp-mi .ic { width:16px; text-align:center; flex-shrink:0; }
+      .ig-lp-mi .lb { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+      .ig-lp-sw2 { width:26px; height:14px; border-radius:999px; background:rgba(255,255,255,0.14); position:relative; flex-shrink:0; transition:background .15s; }
+      .ig-lp-sw2::after { content:''; position:absolute; top:2px; left:2px; width:10px; height:10px; border-radius:50%; background:#ece9e4; transition:left .15s; }
+      .ig-lp-mi.on .ig-lp-sw2 { background:var(--igls-accent,#c9a876); }
+      .ig-lp-mi.on .ig-lp-sw2::after { left:14px; background:#171208; }
+      .ig-lp-msep { height:1px; background:var(--igls-border, rgba(255,255,255,0.07)); margin:4px 2px; }
+      .ig-lp-mrow { display:flex; align-items:center; gap:6px; padding:4px 4px 4px 8px; min-height:24px; }
+      .ig-lp-mrow .lb { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--igls-text-dim,#96949c); }
+      .ig-lp-mrow .lb b { color:var(--igls-text,#ece9e4); font-weight:600; }
+      .ig-lp-mbtn { background:transparent; border:none; color:var(--igls-text-dim,#96949c); cursor:pointer; font-size:11px; line-height:1; padding:4px 6px; border-radius:5px; flex-shrink:0; }
+      .ig-lp-mbtn:hover { color:var(--igls-accent,#c9a876); background:rgba(255,255,255,0.08); }
+      .ig-lp-mbtn.del:hover { color:#f87171; }
+      .ig-lp-mbtn:disabled { opacity:.3; cursor:default; background:transparent; color:var(--igls-text-dim,#96949c); }
+      .ig-lp-mpair { display:flex; gap:4px; padding:2px 4px; }
+      .ig-lp-mpair .ig-lp-mi { justify-content:center; border:1px dashed var(--igls-border-strong, rgba(255,255,255,0.14)); padding:5px 4px; color:var(--igls-text-dim,#96949c); }
+      .ig-lp-mpair .ig-lp-mi:hover { color:var(--igls-accent,#c9a876); border-color:var(--igls-accent,#c9a876); background:transparent; }
+      .ig-lp-cols { min-width:12px; text-align:center; color:var(--igls-text,#ece9e4); font-weight:600; }
+      .ig-lp-mseg { display:flex; border:1px solid var(--igls-border-strong, rgba(255,255,255,0.14)); border-radius:6px; overflow:hidden; flex-shrink:0; }
+      .ig-lp-mseg button { background:transparent; border:none; color:var(--igls-text-dim,#96949c); padding:3px 7px; cursor:pointer; font-size:10px; }
+      .ig-lp-mseg button + button { border-left:1px solid var(--igls-border, rgba(255,255,255,0.08)); }
+      .ig-lp-mseg button:hover { color:var(--igls-text,#ece9e4); }
+      .ig-lp-mseg button.on { background:var(--igls-accent,#c9a876); color:#171208; font-weight:600; }
 
       .ig-lp-grid { display:grid; gap:6px; grid-auto-rows:44px; }
       .ig-lp-tile { position:relative; display:flex; border-radius:8px; overflow:hidden; user-select:none; box-shadow:0 1px 2px rgba(0,0,0,0.3); transition:transform .08s, filter .15s; }
@@ -12169,8 +12446,6 @@ LegoCore.registerBlock({
       .ig-lp.edit .ig-lp-tile { cursor:grab; outline:1px dashed rgba(255,255,255,0.35); outline-offset:-1px; }
       .ig-lp.edit .ig-lp-main, .ig-lp.edit .ig-lp-tog { cursor:pointer; }
       .ig-lp .ig-lp-tile.editing { outline:2px solid var(--igls-accent,#c9a876) !important; outline-offset:1px !important; }
-      .ig-lp-add { border:1px dashed var(--igls-border-strong, rgba(255,255,255,0.14)); background:transparent; color:var(--igls-text-dim,#96949c); border-radius:8px; cursor:pointer; font-size:16px; }
-      .ig-lp-add:hover { color:var(--igls-accent,#c9a876); border-color:var(--igls-accent,#c9a876); }
       .ig-lp-empty { color:var(--igls-text-dim,#96949c); font-size:10px; padding:6px 2px; }
       .ig-lp-toast { font-size:10px; color:#fbbf24; }
       .ig-lp-toast:empty { display:none; }
@@ -12194,8 +12469,6 @@ LegoCore.registerBlock({
       .ig-lp-ed input[type=text], .ig-lp-ed textarea { width:100%; box-sizing:border-box; background:#0f172a; color:#fff; border:1px solid #334155; border-radius:5px; padding:6px; font:inherit; outline:none; }
       .ig-lp-ed input[type=text]:focus, .ig-lp-ed textarea:focus { border-color:var(--igls-accent,#c9a876); }
       .ig-lp-ed textarea { min-height:44px; resize:vertical; }
-      .ig-lp-ed-hint { font-size:9.5px; color:var(--igls-text-dim,#96949c); margin-top:3px; }
-      .ig-lp-ed-hint:empty { display:none; }
       .ig-lp-erow { display:flex; align-items:center; gap:6px; flex-wrap:wrap; }
       .ig-lp-lbl { color:var(--igls-text-dim,#96949c); font-size:10px; }
       .ig-lp-sw { width:20px; height:20px; border-radius:50%; border:2px solid transparent; cursor:pointer; padding:0; }
@@ -12260,24 +12533,6 @@ LegoCore.registerBlock({
       if (msg) v.toastTimer = setTimeout(() => { v.toastEl.textContent = ''; }, ms || 2200);
     }
 
-    function miniX(title, fn) {
-      const x = document.createElement('span');
-      x.className = 'ig-lp-xmini';
-      x.textContent = '✕';
-      x.title = title;
-      x.addEventListener('click', e => { e.stopPropagation(); fn(); });
-      return x;
-    }
-    function addPill(title, fn) {
-      const b = document.createElement('button');
-      b.type = 'button';
-      b.className = 'ig-lp-addpill';
-      b.textContent = '＋';
-      b.title = title;
-      b.onclick = fn;
-      return b;
-    }
-
     // ============================================================
     // Views (the side-panel card + every extra window)
     // ============================================================
@@ -12287,23 +12542,22 @@ LegoCore.registerBlock({
       el.innerHTML = `
         <div class="ig-lp-row ig-lp-row1"><div class="ig-lp-cats"></div></div>
         <div class="ig-lp-row ig-lp-row2"><div class="ig-lp-subs"></div></div>
-        <div class="ig-lp-tools"></div>
         <div class="ig-lp-grid"></div>
         <div class="ig-lp-toast"></div>`;
       const view = {
         win: win || null, el, handle: null, toastTimer: null,
         row1: el.querySelector('.ig-lp-row1'), row2: el.querySelector('.ig-lp-row2'),
         catsEl: el.querySelector('.ig-lp-cats'), subsEl: el.querySelector('.ig-lp-subs'),
-        toolsEl: el.querySelector('.ig-lp-tools'), gridEl: el.querySelector('.ig-lp-grid'),
+        gridEl: el.querySelector('.ig-lp-grid'),
         toastEl: el.querySelector('.ig-lp-toast'), gearBtn: null
       };
       if (!win) {
         const g = document.createElement('button');
         g.type = 'button';
         g.className = 'ig-lp-icon ig-lp-gear';
-        g.title = 'Edit buttons and tabs';
+        g.title = 'Menu';
         g.textContent = '⚙️';
-        g.onclick = toggleEdit;
+        g.onclick = e => { e.stopPropagation(); toggleMenu(view, g); };
         view.gearBtn = g;
       }
       views.add(view);
@@ -12313,8 +12567,10 @@ LegoCore.registerBlock({
     function renderAll() {
       closeTree();
       views.forEach(renderView);
+      if (menuState) paintMenu();
     }
 
+    // v1.4: edit mode adds NOTHING to the layout (only outlines), so a window keeps its size
     function renderView(view) {
       const { cat, sub } = viewSel(view);
       const lock = view.win ? (view.win.lock || 'none') : 'none';
@@ -12322,8 +12578,8 @@ LegoCore.registerBlock({
       if (view.gearBtn) view.gearBtn.classList.toggle('on', editMode);
       if (view.handle && view.handle.buttons && view.handle.buttons[0]) view.handle.buttons[0].classList.toggle('on', editMode);
 
-      const showCats = editMode || (lock === 'none' && state.cats.length > 1);
-      const showSubs = editMode || (lock !== 'sub' && cat.subs.length > 1);
+      const showCats = lock === 'none' && state.cats.length > 1;
+      const showSubs = lock !== 'sub' && cat.subs.length > 1;
 
       // Row 1 — categories
       view.catsEl.innerHTML = '';
@@ -12332,17 +12588,12 @@ LegoCore.registerBlock({
           const b = document.createElement('button');
           b.type = 'button';
           b.className = 'ig-lp-cat' + (c.id === cat.id ? ' on' : '');
-          b.appendChild(document.createTextNode(c.name));
-          b.title = editMode ? 'Double-click to rename · drag to reorder' : c.name;
+          b.textContent = c.name;
+          b.title = editMode ? c.name + ' · drag to reorder' : c.name;
           b.onclick = () => { if (c.id !== cat.id) selectCat(view, c.id); };
-          if (editMode) {
-            b.ondblclick = () => renameCat(c);
-            if (c.id === cat.id && state.cats.length > 1) b.appendChild(miniX('Delete this category', () => deleteCat(c)));
-            pillDrag(b, 'cat', c.id, null);
-          }
+          if (editMode) pillDrag(b, 'cat', c.id, null);
           view.catsEl.appendChild(b);
         });
-        if (editMode) view.catsEl.appendChild(addPill('New category', () => addCat(view)));
       }
 
       // Row 2 — sub-tabs
@@ -12352,17 +12603,12 @@ LegoCore.registerBlock({
           const b = document.createElement('button');
           b.type = 'button';
           b.className = 'ig-lp-sub' + (s.id === sub.id ? ' on' : '');
-          b.appendChild(document.createTextNode(s.name));
-          b.title = editMode ? 'Double-click to rename · drag to reorder · drop a button here to move it' : s.name;
+          b.textContent = s.name;
+          b.title = editMode ? s.name + ' · drag to reorder · drop a button here to move it' : s.name;
           b.onclick = () => { if (s.id !== sub.id) selectSub(view, cat, s.id); };
-          if (editMode) {
-            b.ondblclick = () => renameSub(s);
-            if (s.id === sub.id && cat.subs.length > 1) b.appendChild(miniX('Delete this sub-tab', () => deleteSub(cat, s)));
-            pillDrag(b, 'sub', s.id, cat);
-          }
+          if (editMode) pillDrag(b, 'sub', s.id, cat);
           view.subsEl.appendChild(b);
         });
-        if (editMode) view.subsEl.appendChild(addPill('New sub-tab', () => addSub(view, cat)));
       }
 
       // ⚙️ (side-panel card) sits in the top-most visible row
@@ -12374,7 +12620,6 @@ LegoCore.registerBlock({
       view.row1.style.display = (showCats || (view.gearBtn && view.gearBtn.parentNode === view.row1)) ? '' : 'none';
       view.row2.style.display = (showSubs || (view.gearBtn && view.gearBtn.parentNode === view.row2)) ? '' : 'none';
 
-      renderTools(view, sub);
       renderGrid(view, sub);
 
       if (view.handle) {
@@ -12383,53 +12628,192 @@ LegoCore.registerBlock({
       }
     }
 
-    function renderTools(view, sub) {
-      const t = view.toolsEl;
-      if (!editMode) { t.innerHTML = ''; t.onclick = null; return; }
-      const lock = view.win ? (view.win.lock || 'none') : null;
-      t.innerHTML = `
-        <span>Columns</span>
-        <button type="button" data-a="cols-" title="Fewer columns">−</button>
-        <span class="ig-lp-cols">${sub.cols}</span>
-        <button type="button" data-a="cols+" title="More columns">＋</button>
-        <span class="ig-lp-sp"></span>
-        ${lock ? `<span>Show</span><div class="ig-lp-seg" title="What this window shows when ⚙️ is off">
-          <button type="button" data-lock="none" class="${lock === 'none' ? 'on' : ''}">All</button>
-          <button type="button" data-lock="cat" class="${lock === 'cat' ? 'on' : ''}">Category</button>
-          <button type="button" data-lock="sub" class="${lock === 'sub' ? 'on' : ''}">Tab</button>
-        </div>` : ''}
-        <button type="button" data-a="win" title="Open another Launchpad window">⧉ Window</button>`;
-      t.onclick = e => {
-        const b = e.target.closest('button');
-        if (!b) return;
-        if (b.dataset.lock && view.win) { view.win.lock = b.dataset.lock; save(); renderAll(); return; }
-        const a = b.dataset.a;
-        if (a === 'cols-' || a === 'cols+') { sub.cols = clamp(sub.cols + (a === 'cols+' ? 1 : -1), 2, 6); save(); renderAll(); }
-        else if (a === 'win') newWindow(view);
-      };
-    }
-
     function renderGrid(view, sub) {
       const g = view.gridEl;
       g.style.gridTemplateColumns = `repeat(${sub.cols}, minmax(0, 1fr))`;
       g.innerHTML = '';
       sub.tiles.forEach(tile => g.appendChild(tileEl(tile, sub, view)));
-      if (!sub.tiles.length && !editMode) {
+      if (!sub.tiles.length) {
         const e = document.createElement('div');
         e.className = 'ig-lp-empty';
         e.style.gridColumn = '1 / -1';
-        e.textContent = 'No buttons yet — press ⚙️ to add some.';
+        e.textContent = 'No buttons yet — ⚙️ → ＋ New button';
         g.appendChild(e);
       }
-      if (editMode) {
-        const add = document.createElement('button');
-        add.type = 'button';
-        add.className = 'ig-lp-add';
-        add.textContent = '＋';
-        add.title = 'New button';
-        add.onclick = () => openEditor(null, { newIn: sub.id });
-        g.appendChild(add);
+    }
+
+    // ============================================================
+    // ⚙️ Menu — floats next to the gear, in front of every window
+    // ============================================================
+    let menuState = null;   // { view, anchor, el }
+
+    function bringOnTop(el) {
+      // Max z-index ties are won by whoever is last in <body>: re-append = in front of every window
+      if (el.parentNode !== document.body || el.nextElementSibling) document.body.appendChild(el);
+    }
+
+    function toggleMenu(view, anchor) {
+      if (menuState && menuState.anchor === anchor) { closeMenu(); return; }
+      closeMenu();
+      closeTree();
+      hidePreview();
+      const el = document.createElement('div');
+      el.className = 'ig-lp-menu ig-on-top';
+      el.setAttribute('data-seq-exempt', '1');
+      el.addEventListener('mousedown', e => e.stopPropagation());
+      menuState = { view, anchor, el };
+      paintMenu();
+      bringOnTop(el);
+      placeMenu();
+      document.addEventListener('mousedown', onMenuOutside, true);
+      document.addEventListener('keydown', onMenuKey, true);
+      window.addEventListener('resize', closeMenu);
+    }
+
+    function closeMenu() {
+      if (!menuState) return;
+      menuState.el.remove();
+      menuState = null;
+      document.removeEventListener('mousedown', onMenuOutside, true);
+      document.removeEventListener('keydown', onMenuKey, true);
+      window.removeEventListener('resize', closeMenu);
+    }
+    function onMenuOutside(e) {
+      if (!menuState) return;
+      if (menuState.el.contains(e.target) || menuState.anchor.contains(e.target)) return;
+      closeMenu();
+    }
+    function onMenuKey(e) { if (e.key === 'Escape') { e.stopPropagation(); e.preventDefault(); closeMenu(); } }
+
+    function placeMenu() {
+      if (!menuState) return;
+      const { el, anchor } = menuState;
+      const a = anchor.getBoundingClientRect();
+      const m = el.getBoundingClientRect();
+      const gap = 6, pad = 6;
+      let left = a.right - m.width;                       // right edges line up with the gear
+      if (left < pad) left = Math.min(a.left, window.innerWidth - m.width - pad);
+      left = Math.max(pad, Math.min(left, window.innerWidth - m.width - pad));
+      let top = a.bottom + gap;
+      if (top + m.height > window.innerHeight - pad) {
+        const above = a.top - m.height - gap;
+        top = above >= pad ? above : Math.max(pad, window.innerHeight - m.height - pad);
       }
+      el.style.left = Math.round(left) + 'px';
+      el.style.top = Math.round(top) + 'px';
+    }
+
+    // Runs a menu action. keep = leave the menu open (Columns, Show)
+    function menuAct(fn, keep) {
+      return e => {
+        e.stopPropagation();
+        if (!keep) closeMenu();
+        fn();
+      };
+    }
+
+    function paintMenu() {
+      if (!menuState) return;
+      const { view, el } = menuState;
+      if (!views.has(view)) { closeMenu(); return; }
+      const { cat, sub } = viewSel(view);
+      const lock = view.win ? (view.win.lock || 'none') : null;
+      el.innerHTML = '';
+
+      const item = (icon, label, fn, opts) => {
+        opts = opts || {};
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'ig-lp-mi' + (opts.on ? ' on' : '');
+        b.innerHTML = `<span class="ic">${icon}</span><span class="lb">${esc(label)}</span>${opts.toggle ? '<span class="ig-lp-sw2"></span>' : ''}`;
+        if (opts.title) b.title = opts.title;
+        b.onclick = menuAct(fn, opts.keep);
+        return b;
+      };
+      const sep = () => { const d = document.createElement('div'); d.className = 'ig-lp-msep'; return d; };
+      const iconBtn = (text, title, fn, cls, disabled) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'ig-lp-mbtn' + (cls ? ' ' + cls : '');
+        b.textContent = text;
+        b.title = title;
+        b.disabled = !!disabled;
+        b.onclick = menuAct(fn, false);
+        return b;
+      };
+      const nameRow = (kind, name, onRename, onDelete, canDelete, delTitle) => {
+        const r = document.createElement('div');
+        r.className = 'ig-lp-mrow';
+        r.innerHTML = `<span class="lb">${kind} · <b>${esc(name)}</b></span>`;
+        r.append(
+          iconBtn('✏️', 'Rename', onRename),
+          iconBtn('🗑', canDelete ? 'Delete' : delTitle, onDelete, 'del', !canDelete)
+        );
+        return r;
+      };
+
+      // Editing
+      el.appendChild(item('✏️', 'Edit buttons', toggleEdit, { toggle: true, on: editMode, keep: true,
+        title: 'Click a button to edit it · drag to reorder · drag the corner to resize' }));
+      el.appendChild(item('＋', 'New button', () => openEditor(null, { newIn: sub.id }),
+        { title: `New button in “${sub.name}”` }));
+      el.appendChild(sep());
+
+      // Tab + category
+      el.appendChild(nameRow('Tab', sub.name, () => renameSub(sub), () => deleteSub(cat, sub),
+        cat.subs.length > 1, 'A category needs at least one tab'));
+      el.appendChild(nameRow('Category', cat.name, () => renameCat(cat), () => deleteCat(cat),
+        state.cats.length > 1, 'You need at least one category'));
+      const pair = document.createElement('div');
+      pair.className = 'ig-lp-mpair';
+      pair.append(
+        item('', '＋ Tab', () => addSub(view, cat), { title: `New tab in “${cat.name}”` }),
+        item('', '＋ Category', () => addCat(view), { title: 'New category (e.g. a course)' })
+      );
+      pair.querySelectorAll('.ic').forEach(n => n.remove());
+      el.appendChild(pair);
+      el.appendChild(sep());
+
+      // Columns (stays open)
+      const cols = document.createElement('div');
+      cols.className = 'ig-lp-mrow';
+      cols.innerHTML = `<span class="lb">Columns</span>`;
+      const minus = document.createElement('button');
+      minus.type = 'button'; minus.className = 'ig-lp-mbtn'; minus.textContent = '−'; minus.title = 'Fewer columns';
+      const num = document.createElement('span');
+      num.className = 'ig-lp-cols'; num.textContent = String(sub.cols);
+      const plus = document.createElement('button');
+      plus.type = 'button'; plus.className = 'ig-lp-mbtn'; plus.textContent = '＋'; plus.title = 'More columns';
+      minus.disabled = sub.cols <= 2; plus.disabled = sub.cols >= 6;
+      const setCols = d => menuAct(() => { sub.cols = clamp(sub.cols + d, 2, 6); save(); renderAll(); }, true);
+      minus.onclick = setCols(-1); plus.onclick = setCols(1);
+      cols.append(minus, num, plus);
+      el.appendChild(cols);
+
+      // Show (extra windows only, stays open)
+      if (lock) {
+        const show = document.createElement('div');
+        show.className = 'ig-lp-mrow';
+        show.innerHTML = `<span class="lb">Show</span>`;
+        const seg = document.createElement('div');
+        seg.className = 'ig-lp-mseg';
+        seg.title = 'What this window shows';
+        [['none', 'All'], ['cat', 'Category'], ['sub', 'Tab']].forEach(([v, t]) => {
+          const b = document.createElement('button');
+          b.type = 'button';
+          b.textContent = t;
+          if (v === lock) b.className = 'on';
+          b.onclick = menuAct(() => { view.win.lock = v; save(); renderAll(); }, true);
+          seg.appendChild(b);
+        });
+        show.appendChild(seg);
+        el.appendChild(show);
+      }
+      el.appendChild(sep());
+
+      el.appendChild(item('⧉', 'New window', () => newWindow(view), { title: 'Open another Launchpad window' }));
+
+      if (el.isConnected) placeMenu();
     }
 
     // ============================================================
@@ -12642,7 +13026,7 @@ LegoCore.registerBlock({
     function openTree(tile, anchor, view) {
       closeTree();
       treeEl = document.createElement('div');
-      treeEl.className = 'ig-lp-tree';
+      treeEl.className = 'ig-lp-tree ig-on-top';
       treeEl.dataset.tile = tile.id;
       const rows = [{ letter: 'A', main: true, slot: tile.main }]
         .concat((tile.alts || []).filter(Boolean).map((s, i) => ({ letter: LETTERS[i + 1] || '·', slot: s })));
@@ -12655,7 +13039,7 @@ LegoCore.registerBlock({
         attachPreview(b, () => r.slot, () => treeEl || anchor);
         treeEl.appendChild(b);
       });
-      document.body.appendChild(treeEl);
+      bringOnTop(treeEl);
       const a = anchor.getBoundingClientRect();
       const t = treeEl.getBoundingClientRect();
       let left = a.right - t.width, top = a.bottom + 4;
@@ -12675,7 +13059,7 @@ LegoCore.registerBlock({
       target.addEventListener('mouseenter', () => {
         if (editMode) return;
         clearTimeout(hoverTimer);
-        hoverTimer = setTimeout(() => showPreview(getSlot(), getAnchor()), 250);
+        hoverTimer = setTimeout(() => showPreview(getSlot(), getAnchor(), target), 250);
       });
       target.addEventListener('mouseleave', hidePreview);
     }
@@ -12723,28 +13107,43 @@ LegoCore.registerBlock({
       }
       return pvEmpty('Nothing to preview.');
     }
-    async function showPreview(slot, anchor) {
+    async function showPreview(slot, anchor, row) {
       const my = ++hoverToken;
       let html;
       try { html = await previewHtml(slot); } catch (e) { html = pvEmpty('Preview not available.'); }
       if (my !== hoverToken || !anchor || !anchor.isConnected) return;
       if (!previewEl) {
         previewEl = document.createElement('div');
-        previewEl.className = 'ig-lp-preview';
-        document.body.appendChild(previewEl);
+        previewEl.className = 'ig-lp-preview ig-on-top';
       }
       previewEl.innerHTML = html;
       previewEl.style.display = 'flex';
-      const a = anchor.getBoundingClientRect();
-      const p = previewEl.getBoundingClientRect();
-      const gap = 8;
-      let left = a.right + gap;
-      if (left + p.width > window.innerWidth - 6) left = a.left - p.width - gap;
-      if (left < 6) left = 6;
-      let top = a.top;
-      if (top + p.height > window.innerHeight - 6) top = Math.max(6, window.innerHeight - p.height - 6);
-      previewEl.style.left = left + 'px';
-      previewEl.style.top = top + 'px';
+      bringOnTop(previewEl);             // v1.4: in front of every floating window, every time
+      placeBeside(previewEl, anchor, row || anchor);
+    }
+
+    // Opens next to the window (or side panel / ▾ list) that holds the anchor — never on top of
+    // your buttons. Right side first, left side if there is more room there; aligned with the
+    // hovered row; always fully on screen.
+    function placeBeside(el, anchor, row) {
+      const pad = 6, gap = 8;
+      const box = (anchor.closest && anchor.closest('.ig-floating-modal, #ig-modular-left-panel, #ig-modular-right-panel')) || anchor;
+      const b = box.getBoundingClientRect();
+      const r = row.getBoundingClientRect();
+      const p = el.getBoundingClientRect();
+      const vw = window.innerWidth, vh = window.innerHeight;
+      const roomRight = vw - b.right - gap - pad;
+      const roomLeft = b.left - gap - pad;
+      let left;
+      if (roomRight >= p.width) left = b.right + gap;
+      else if (roomLeft >= p.width) left = b.left - p.width - gap;
+      else left = roomRight >= roomLeft ? vw - p.width - pad : pad;   // no room either side: hug the edge
+      left = Math.max(pad, Math.min(left, vw - p.width - pad));
+      let top = r.top;
+      if (top + p.height > vh - pad) top = vh - p.height - pad;
+      top = Math.max(pad, top);
+      el.style.left = Math.round(left) + 'px';
+      el.style.top = Math.round(top) + 'px';
     }
 
     // ============================================================
@@ -12846,7 +13245,7 @@ LegoCore.registerBlock({
         label: 'Launchpad',
         content: view.el,
         defaults: { width: 300, left: 140 + k * 26, top: 110 + k * 26 },
-        buttons: [{ text: '⚙️', title: 'Edit buttons and tabs', onClick: () => toggleEdit() }],
+        buttons: [{ text: '⚙️', title: 'Menu', onClick: (btn) => toggleMenu(view, btn) }],
         onClose: () => closeWindow(win.id)
       });
       if (!view.handle) { views.delete(view); return; }
@@ -12858,6 +13257,7 @@ LegoCore.registerBlock({
       save();
       Array.from(views).forEach(v => {
         if (v.win && v.win.id === id) {
+          if (menuState && menuState.view === v) closeMenu();
           views.delete(v);
           if (v.handle) v.handle.close({ forget: true });
         }
@@ -12870,7 +13270,11 @@ LegoCore.registerBlock({
         if (!v.win) return;
         const w = state.windows.find(x => x.id === v.win.id);
         if (w) v.win = w;
-        else { views.delete(v); if (v.handle) v.handle.close(); }
+        else {
+          if (menuState && menuState.view === v) closeMenu();
+          views.delete(v);
+          if (v.handle) v.handle.close();
+        }
       });
       state.windows.forEach((w, i) => {
         if (!Array.from(views).some(v => v.win && v.win.id === w.id)) openWinView(w, i + 1);
@@ -13006,10 +13410,7 @@ LegoCore.registerBlock({
       const multiSub = state.cats.length > 1 || state.cats[0].subs.length > 1;
       edBox.innerHTML = `
         <div class="ig-lp-ask" style="display:none;"></div>
-        <div>
-          <input type="text" class="ig-lp-title" placeholder="Button title (empty = the item's name)" value="${esc(d.title || '')}">
-          <div class="ig-lp-ed-hint"></div>
-        </div>
+        <input type="text" class="ig-lp-title" placeholder="Button title — filled from the item you pick" value="${esc(d.title || '')}">
         <div class="ig-lp-erow ig-lp-colors"><span class="ig-lp-lbl">Color</span></div>
         <div class="ig-lp-erow"><span class="ig-lp-lbl">Text</span>
           <div class="ig-lp-seg ig-lp-textseg">
@@ -13028,15 +13429,13 @@ LegoCore.registerBlock({
           </div>
         </div>`;
 
-      // Title — empty = follows the item's name
+      // Title — the picked item's exact name; it stays "the item's name" (and follows renames)
+      // until you type something different
       const titleIn = edBox.querySelector('.ig-lp-title');
-      const hint = edBox.querySelector('.ig-lp-ed-hint');
-      const paintHint = () => { hint.textContent = d.autoTitle ? '🔗 Uses the item\'s name and follows it when you rename the item' : ''; };
-      paintHint();
       titleIn.oninput = () => {
         d.title = titleIn.value;
-        d.autoTitle = !titleIn.value.trim();
-        paintHint();
+        const t = titleIn.value.trim();
+        d.autoTitle = !t || t === itemName(d.main);
         touch();
       };
 
@@ -13075,8 +13474,15 @@ LegoCore.registerBlock({
 
       // Versions A, B, C…
       const slotsEl = edBox.querySelector('.ig-lp-slots');
-      const slotA = slotEditor('A', d.main, s => { d.main = s; touch(); }, null, true, picked => {
-        if (d.autoTitle) { d.title = itemName(picked) || d.title; titleIn.value = d.title; paintHint(); }
+      const slotA = slotEditor('A', d.main, s => { d.main = s; touch(); }, null, true, (picked, prev) => {
+        const cur = String(d.title || '').trim();
+        const untouched = d.autoTitle || !cur || PLACEHOLDER_TITLES.has(cur) || (!!prev && cur === itemName(prev));
+        const name = itemName(picked);
+        if (untouched && name) {
+          d.title = name;
+          d.autoTitle = true;
+          titleIn.value = name;
+        }
       });
       slotsEl.appendChild(slotA.wrap);
       d.alts.forEach((s, i) => {
@@ -13164,9 +13570,13 @@ LegoCore.registerBlock({
       }
       show();
 
+      // Version name: filled from the picked item; typing something else makes it yours
       if (labelIn) labelIn.oninput = () => {
         current = current || { kind: 'custom', text: '' };
-        current.label = labelIn.value.trim() || undefined;
+        const v = labelIn.value.trim();
+        current.label = v || undefined;
+        if (v && v === itemName(current)) current.autoLabel = true;
+        else delete current.autoLabel;
         commit();
       };
       custom.oninput = () => {
@@ -13186,9 +13596,10 @@ LegoCore.registerBlock({
         const list = results.querySelector('.ig-lp-res');
         const clearBtn = results.querySelector('.ig-lp-clear');
         if (clearBtn) clearBtn.onclick = () => {
-          const label = current && current.label;
+          const label = current && !current.autoLabel ? current.label : '';
           current = { kind: 'custom', text: '' };
           if (label) current.label = label;
+          if (labelIn) labelIn.value = label || '';
           commit(); results.style.display = 'none'; show();
         };
         let token = 0;
@@ -13207,16 +13618,29 @@ LegoCore.registerBlock({
             const extra = m.kind === 'audio' ? (m.item.folder || '') : m.kind === 'set' ? `${(m.item.images || []).length} img` : m.kind === 'sequence' ? `${(m.item.steps || []).length} steps` : '';
             b.innerHTML = `<span>${ICON[m.kind]}</span><span style="flex:1;">${esc(name || '(untitled)')}</span><span style="opacity:.5;font-size:9px;">${esc(extra)}</span>`;
             b.onclick = () => {
-              const label = current && current.label;
-              if (m.kind === 'sequence') current = { kind: 'sequence', ref: m.item.id, title: m.item.name || 'Sequence' };
+              const prev = current;
+              let next;
+              if (m.kind === 'sequence') next = { kind: 'sequence', ref: m.item.id, title: m.item.name || 'Sequence' };
               else {
                 const step = core.makeStep(m.kind, m.item);   // exact item name + permanent link
                 if (!step) return;
-                current = { kind: m.kind, step, title: step.title };
+                next = { kind: m.kind, step, title: step.title };
               }
-              if (label) current.label = label;
+              current = next;
+              // Versions B, C…: the name field takes the item's exact name, unless you typed your own
+              if (labelIn) {
+                const oldLabel = String((prev && prev.label) || '').trim();
+                const untouched = !oldLabel || !!(prev && prev.autoLabel) || (!!prev && oldLabel === itemName(prev));
+                if (untouched && itemName(current)) {
+                  current.label = itemName(current);
+                  current.autoLabel = true;
+                  labelIn.value = current.label;
+                } else if (oldLabel) {
+                  current.label = oldLabel;
+                }
+              }
               commit();
-              if (onPicked) onPicked(current);
+              if (onPicked) onPicked(current, prev);
               results.style.display = 'none';
               show();
             };
@@ -13267,6 +13691,7 @@ LegoCore.registerBlock({
             }
           }
           if (name !== null && name !== slot.title) { slot.title = name; changed = true; }
+          if (slot.autoLabel && name && slot.label !== name) { slot.label = name; changed = true; }
           return name;
         };
         state.cats.forEach(c => c.subs.forEach(s => s.tiles.forEach(t => {
